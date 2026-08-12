@@ -9,6 +9,7 @@ import {
   GripVertical,
   Link2,
   Loader2,
+  Play,
   Sparkles,
   Trash2,
   Video,
@@ -46,6 +47,8 @@ type RankEntry = {
   state: RankState;
   error?: string;
   clipId?: number;
+  /** Local URL for the finished selected clip, used by the in-page preview. */
+  clipUrl?: string;
 };
 
 const MODEL = "openai/gpt-4o-mini";
@@ -96,11 +99,13 @@ function RankOverlayPreview({
   entry,
   ranks,
   accent,
+  previewUrl,
   onMove,
 }: {
   entry: RankEntry;
   ranks: RankEntry[];
   accent: string;
+  previewUrl?: string;
   onMove: (kind: "number" | "title", point: Point) => void;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
@@ -132,8 +137,13 @@ function RankOverlayPreview({
       className="relative aspect-[9/16] w-full overflow-hidden rounded-[1.5rem] bg-[#070707] shadow-2xl"
       style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)" }}
     >
-      <div className="absolute inset-x-0 top-0 h-1" style={{ background: accent }} />
-      <p className="absolute left-[10%] top-[8%] z-10 text-[8px] font-black uppercase tracking-[0.2em] text-white/55">Persistent ranking overlay</p>
+      {previewUrl ? (
+        <video key={previewUrl} src={previewUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" />
+      ) : (
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_78%_16%,rgba(255,255,255,0.13),transparent_24%),linear-gradient(180deg,#161616_0%,#050505_78%)]" />
+      )}
+      <div className="absolute inset-x-0 top-0 z-10 h-1" style={{ background: accent }} />
+      <p className="absolute left-[10%] top-[8%] z-20 text-[8px] font-black uppercase tracking-[0.2em] text-white/55">{previewUrl ? `Rank ${entry.rank} selected clip preview` : "Persistent ranking overlay"}</p>
 
       {ranks.map((rankEntry) => {
         const activeNumber = rankEntry.rank === entry.rank;
@@ -182,6 +192,8 @@ export default function Top5ReelsPage() {
   const [accent, setAccent] = useState(ACCENTS[0]);
   const [finalUrl, setFinalUrl] = useState<string | null>(null);
   const [isRenderingFinal, setIsRenderingFinal] = useState(false);
+  const [isPreviewingClip, setIsPreviewingClip] = useState(false);
+  const [renderStage, setRenderStage] = useState<string | null>(null);
   const utils = trpc.useUtils();
 
   const extract = trpc.extract.transcribe.useMutation();
@@ -208,7 +220,7 @@ export default function Top5ReelsPage() {
     }
 
     setFinalUrl(null);
-    patchRank(rank, { state: "analyzing", error: undefined, candidates: [], selectedId: undefined, clipId: undefined });
+    patchRank(rank, { state: "analyzing", error: undefined, candidates: [], selectedId: undefined, clipId: undefined, clipUrl: undefined });
     try {
       const source: any = await extract.mutateAsync({
         url: entry.url.trim(),
@@ -275,7 +287,7 @@ export default function Top5ReelsPage() {
   };
 
   const chooseCandidate = (rank: number, candidate: Candidate) => {
-    patchRank(rank, { selectedId: candidate.id, title: candidate.title, clipId: undefined, state: "ready" });
+    patchRank(rank, { selectedId: candidate.id, title: candidate.title, clipId: undefined, clipUrl: undefined, state: "ready" });
     setFinalUrl(null);
   };
 
@@ -290,6 +302,56 @@ export default function Top5ReelsPage() {
     throw new Error("Clip rendering timed out. Check the Clips page for progress.");
   };
 
+  const prepareRankClip = async (snapshot: RankEntry) => {
+    const candidate = selectedCandidate(snapshot);
+    if (!snapshot.videoId || !candidate) throw new Error(`Analyse and select a clip for rank ${snapshot.rank} first.`);
+
+    patchRank(snapshot.rank, { state: "rendering", error: undefined });
+    let clipId = snapshot.clipId;
+    if (!clipId) {
+      const created: any = await createClip.mutateAsync({
+        videoId: snapshot.videoId,
+        title: snapshot.title.trim() || candidate.title,
+        startTime: candidate.startTime,
+        endTime: candidate.endTime,
+        engagementScore: candidate.engagementScore,
+      });
+      clipId = created.id;
+      patchRank(snapshot.rank, { clipId });
+    }
+
+    const currentClips: any[] = await (utils.clips.list as any).fetch();
+    const existing = currentClips.find((clip) => clip.id === clipId);
+    if (existing?.status === "done" && existing.downloadUrl) {
+      patchRank(snapshot.rank, { clipId, clipUrl: existing.downloadUrl, state: "rendered" });
+      return { clipId, downloadUrl: existing.downloadUrl };
+    }
+
+    await renderClip.mutateAsync({ id: clipId, captionsEnabled: true });
+    const finished = await waitForClip(clipId);
+    patchRank(snapshot.rank, { clipId, clipUrl: finished.downloadUrl, state: "rendered" });
+    return { clipId, downloadUrl: finished.downloadUrl as string };
+  };
+
+  const previewActiveClip = async () => {
+    try {
+      setIsPreviewingClip(true);
+      setRenderStage(`Preparing rank ${active.rank} preview…`);
+      const result = await prepareRankClip(active);
+      patchRank(active.rank, { clipId: result.clipId, clipUrl: result.downloadUrl, state: "rendered" });
+      setRenderStage(`Rank ${active.rank} preview is ready.`);
+      toast.success(`Rank ${active.rank} preview is ready in the right panel.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not prepare this preview.";
+      patchRank(active.rank, { state: "error", error: message });
+      setRenderStage(null);
+      toast.error(message);
+    } finally {
+      setIsPreviewingClip(false);
+      await (utils.clips.list as any).invalidate();
+    }
+  };
+
   const renderFinal = async () => {
     const ordered = [...ranks].sort((a, b) => b.rank - a.rank);
     const missing = ordered.find((entry) => !entry.videoId || !selectedCandidate(entry));
@@ -302,27 +364,14 @@ export default function Top5ReelsPage() {
     setFinalUrl(null);
     try {
       const built: Array<{ entry: RankEntry; clipId: number }> = [];
-      for (const snapshot of ordered) {
-        const candidate = selectedCandidate(snapshot)!;
-        patchRank(snapshot.rank, { state: "rendering", error: undefined });
-        let clipId = snapshot.clipId;
-        if (!clipId) {
-          const created: any = await createClip.mutateAsync({
-            videoId: snapshot.videoId!,
-            title: snapshot.title.trim() || candidate.title,
-            startTime: candidate.startTime,
-            endTime: candidate.endTime,
-            engagementScore: candidate.engagementScore,
-          });
-          clipId = created.id;
-          patchRank(snapshot.rank, { clipId });
-        }
-        await renderClip.mutateAsync({ id: clipId, captionsEnabled: true });
-        await waitForClip(clipId);
-        patchRank(snapshot.rank, { clipId, state: "rendered" });
-        built.push({ entry: snapshot, clipId });
+      for (let index = 0; index < ordered.length; index += 1) {
+        const snapshot = ordered[index];
+        setRenderStage(`Rendering rank ${snapshot.rank} clip (${index + 1} of ${ordered.length})…`);
+        const result = await prepareRankClip(snapshot);
+        built.push({ entry: snapshot, clipId: result.clipId });
       }
 
+      setRenderStage("Joining the five clips and adding the ranking overlay…");
       const output: any = await composeTop5.mutateAsync({
         entries: built.map(({ entry, clipId }) => ({
           clipId,
@@ -339,9 +388,12 @@ export default function Top5ReelsPage() {
         })),
       });
       setFinalUrl(output.url);
+      setRenderStage("Top 5 video is ready.");
       toast.success("Your Top 5 video is ready to download.");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not render the Top 5 video.");
+      const message = error instanceof Error ? error.message : "Could not render the Top 5 video.";
+      setRenderStage(null);
+      toast.error(message);
     } finally {
       setIsRenderingFinal(false);
       await (utils.clips.list as any).invalidate();
@@ -486,6 +538,8 @@ export default function Top5ReelsPage() {
                   {isRenderingFinal ? "Rendering Top 5…" : "Render high-quality video"}
                 </button>
               </div>
+              {renderStage && <div className="mt-4 flex items-center gap-3 rounded-xl border border-primary/25 bg-primary/[0.07] p-4 text-sm font-semibold text-foreground"><Loader2 className={`h-4 w-4 shrink-0 ${isRenderingFinal || isPreviewingClip ? "animate-spin" : ""}`} style={{ color: accent }} /><span>{renderStage}</span></div>}
+              {(isRenderingFinal || isPreviewingClip) && <div className="mt-3 grid grid-cols-5 gap-1.5" aria-label="Top 5 render progress">{[5, 4, 3, 2, 1].map((rank) => { const item = ranks.find((entry) => entry.rank === rank); return <div key={rank} className={`h-1.5 rounded-full ${item?.state === "rendered" ? "bg-emerald-500" : item?.state === "rendering" ? "animate-pulse" : "bg-secondary"}`} style={item?.state === "rendering" ? { background: accent } : undefined} />; })}</div>}
               {finalUrl && <a href={finalUrl} download className="mt-4 flex items-center justify-between rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 text-sm font-bold text-foreground transition hover:bg-emerald-500/15"><span className="flex items-center gap-2"><CheckCircle2 className="h-5 w-5 text-emerald-500" /> Your Top 5 video is ready</span><span className="flex items-center gap-2 text-emerald-500"><Download className="h-4 w-4" /> Download MP4</span></a>}
             </div>
           </section>
@@ -496,10 +550,14 @@ export default function Top5ReelsPage() {
                 <div><p className="text-sm font-black text-foreground">Persistent ranking overlay</p><p className="mt-1 text-xs text-muted-foreground">Drag the active number or title directly in the preview.</p></div>
                 <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
               </div>
-              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
-              <div className="mt-4 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">The full rank list stays over every clip. When a clip begins, its own generated title appears beside its number, matching the ranking style in your reference.</div>
+              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <button type="button" onClick={previewActiveClip} disabled={!active.videoId || !selectedCandidate(active) || isPreviewingClip || isRenderingFinal} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground transition hover:border-primary hover:bg-primary/[0.06] disabled:cursor-not-allowed disabled:opacity-45">
+                {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}
+              </button>
+              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">Press Preview selected clip to render the chosen source clip and watch it here with your persistent number/title overlay. The final render reuses completed previews instead of rendering them twice.</div>
               <div className="mt-4 divide-y divide-border rounded-xl border border-border bg-card">
-                {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
+                {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "rendering" ? <Loader2 className="h-4 w-4 animate-spin" style={{ color: accent }} /> : entry.state === "error" ? <span className="text-xs font-black text-destructive">!</span> : entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
               </div>
             </div>
           </aside>
