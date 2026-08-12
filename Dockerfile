@@ -35,7 +35,10 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --legacy-peer-deps
+# dist/index.js statically imports the server's Vite integration, including
+# Vite and its configured plugins, even in production. Keep the full dependency
+# tree in this runtime image so Node can link the compiled server at startup.
+RUN npm ci --legacy-peer-deps
 
 # The backend is precompiled in the repository. Bring in the original bundle
 # and replace the static frontend assets with the freshly built Vite output.
