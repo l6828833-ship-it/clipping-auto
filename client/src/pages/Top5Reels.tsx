@@ -1,401 +1,354 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import AppLayout from "@/components/AppLayout";
 import { toast } from "sonner";
 import {
-  Plus, X, Play, Zap, Download, Loader2, ChevronUp, ChevronDown,
-  Palette, Type, Music, Film, CheckCircle2, Edit3, RotateCcw
+  Check,
+  Download,
+  Play,
+  RotateCcw,
+  Sparkles,
+  TimerReset,
 } from "lucide-react";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-interface Slot {
+interface RankItem {
   id: number;
-  title: string;
-  url: string;
-  duration: string;
-  active: boolean;
+  rank: number;
+  text: string;
 }
 
-const DEFAULT_SLOTS: Slot[] = [
-  { id: 1, title: "Slot 1 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 2, title: "Slot 2 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 3, title: "Slot 3 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 4, title: "Slot 4 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 5, title: "Slot 5 — Add clip", url: "", duration: "0:00", active: false },
+const DEFAULT_RANKS: RankItem[] = [
+  { id: 5, rank: 5, text: "Fifth moment" },
+  { id: 4, rank: 4, text: "Fourth moment" },
+  { id: 3, rank: 3, text: "Third moment" },
+  { id: 2, rank: 2, text: "Second moment" },
+  { id: 1, rank: 1, text: "Best moment" },
 ];
 
 const ACCENT_COLORS = [
-  { label: "Electric Blue", value: "#00B4FF" },
-  { label: "Neon Green",    value: "#39FF14" },
-  { label: "Hot Pink",      value: "#FF2D78" },
-  { label: "Gold",          value: "#FFE600" },
-  { label: "Purple",        value: "#A855F7" },
+  { name: "Signal red", value: "#ef4444" },
+  { name: "Acid green", value: "#a3e635" },
+  { name: "Electric blue", value: "#38bdf8" },
+  { name: "Gold", value: "#facc15" },
+  { name: "Violet", value: "#a78bfa" },
 ];
 
-const BG_GRADIENTS = [
-  { label: "Deep Space",  value: "linear-gradient(180deg, #0a0a1a 0%, #1a0a2e 100%)" },
-  { label: "Midnight",    value: "linear-gradient(180deg, #000000 0%, #0d1117 100%)" },
-  { label: "Dark Ocean",  value: "linear-gradient(180deg, #0a1628 0%, #0d2137 100%)" },
-  { label: "Dark Forest", value: "linear-gradient(180deg, #0a1a0a 0%, #0d2a0d 100%)" },
-];
+function splitHeadline(title: string, accentWord: string) {
+  const cleanTitle = title.trim() || "YOUR TOP 5";
+  const cleanAccent = accentWord.trim();
 
-const TITLE_FONTS = ["Montserrat", "Impact", "Arial Black", "Oswald", "Inter"];
+  if (!cleanAccent) {
+    return <span>{cleanTitle}</span>;
+  }
 
-// ─── 9:16 Preview ─────────────────────────────────────────────────────────────
-function ReelPreview({
-  slots, title, accentColor, bgGradient, titleFont, activeSlot
+  const expression = new RegExp(`(${cleanAccent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "ig");
+  return cleanTitle.split(expression).map((part, index) =>
+    part.toLowerCase() === cleanAccent.toLowerCase() ? (
+      <span key={`${part}-${index}`} className="text-[var(--rank-accent)]">{part}</span>
+    ) : (
+      <span key={`${part}-${index}`}>{part}</span>
+    ),
+  );
+}
+
+function TextOnlyPreview({
+  title,
+  accentWord,
+  accentColor,
+  ranks,
+  activeRank,
 }: {
-  slots: Slot[]; title: string; accentColor: string; bgGradient: string; titleFont: string; activeSlot: number;
+  title: string;
+  accentWord: string;
+  accentColor: string;
+  ranks: RankItem[];
+  activeRank: number | null;
 }) {
   return (
-    <div className="relative rounded-2xl overflow-hidden mx-auto shadow-2xl"
-      style={{ width: "200px", height: "356px", background: bgGradient, border: "1px solid var(--border)" }}>
-      {/* Top header */}
-      <div className="absolute top-0 left-0 right-0 px-3 pt-3 pb-2 z-10"
-        style={{ background: "linear-gradient(180deg, rgba(0,0,0,0.8) 0%, transparent 100%)" }}>
-        <div className="text-center">
-          <div className="text-[9px] font-black uppercase tracking-widest mb-0.5" style={{ color: accentColor }}>
-            ★ TOP 5 ★
-          </div>
-          <div className="text-[11px] font-black uppercase leading-tight text-white" style={{ fontFamily: titleFont }}>
-            {title || "YOUR TITLE HERE"}
-          </div>
+    <div
+      className="relative isolate aspect-[9/16] w-full max-w-[280px] overflow-hidden rounded-[1.75rem] bg-black text-white shadow-2xl"
+      style={{ "--rank-accent": accentColor } as React.CSSProperties}
+    >
+      <div className="absolute inset-x-0 top-0 h-1 bg-[var(--rank-accent)]" />
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_83%_16%,rgba(255,255,255,0.10),transparent_26%),linear-gradient(180deg,#090909_0%,#000_74%)]" />
+
+      <div className="relative flex h-full flex-col px-[10%] pb-[9%] pt-[12%]">
+        <p className="mb-2 font-mono text-[8px] font-semibold uppercase tracking-[0.28em] text-white/55">
+          COUNTDOWN
+        </p>
+        <h3 className="max-w-full text-[25px] font-black uppercase leading-[0.91] tracking-[-0.075em]">
+          {splitHeadline(title, accentWord)}
+        </h3>
+
+        <div className="mt-auto space-y-3.5">
+          {ranks.map((item) => {
+            const active = activeRank === item.rank;
+            return (
+              <div
+                key={item.id}
+                className="group flex items-center gap-3 transition-all duration-300"
+                style={{
+                  opacity: activeRank === null || active ? 1 : 0.42,
+                  transform: active ? "translateX(4px)" : "translateX(0)",
+                }}
+              >
+                <span
+                  className="w-[29px] shrink-0 text-center text-[42px] font-black leading-none tracking-[-0.12em]"
+                  style={{
+                    color: active ? accentColor : "transparent",
+                    WebkitTextStroke: active ? "0" : "1.5px rgba(255,255,255,0.96)",
+                    textShadow: active ? `0 0 20px ${accentColor}75` : "none",
+                  }}
+                >
+                  {item.rank}
+                </span>
+                <span className="min-w-0 text-[16px] font-extrabold uppercase leading-tight tracking-[-0.04em] text-white">
+                  {item.text.trim() || `Rank ${item.rank}`}
+                </span>
+              </div>
+            );
+          })}
         </div>
-      </div>
 
-      {/* Slot list */}
-      <div className="absolute inset-0 flex flex-col justify-center px-2 gap-1 mt-10">
-        {slots.map((slot, i) => {
-          const isActive = i + 1 === activeSlot;
-          const isFilled = slot.active;
-          return (
-            <div key={slot.id}
-              className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg transition-all duration-300"
-              style={{
-                background: isActive ? `${accentColor}25` : "rgba(255,255,255,0.05)",
-                border: isActive ? `1px solid ${accentColor}60` : "1px solid rgba(255,255,255,0.08)",
-                transform: isActive ? "scale(1.03)" : "scale(1)",
-              }}>
-              {/* Number badge */}
-              <div className="w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-black shrink-0"
-                style={{ background: isActive ? accentColor : "rgba(255,255,255,0.15)", color: isActive ? "#000" : "#fff" }}>
-                {i + 1}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-[9px] font-bold text-white truncate leading-tight" style={{ fontFamily: titleFont }}>
-                  {isFilled ? slot.title : `Clip ${i + 1}`}
-                </div>
-                {isFilled && (
-                  <div className="text-[8px] text-white/50">{slot.duration}</div>
-                )}
-              </div>
-              {isActive && (
-                <div className="w-1.5 h-1.5 rounded-full shrink-0 animate-pulse" style={{ background: accentColor }} />
-              )}
-              {isFilled && !isActive && (
-                <CheckCircle2 className="w-3 h-3 shrink-0" style={{ color: accentColor }} />
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      {/* Bottom watermark */}
-      <div className="absolute bottom-2 left-0 right-0 text-center">
-        <span className="text-[8px] font-bold uppercase tracking-widest" style={{ color: `${accentColor}80` }}>
-          ShortsPro AI
-        </span>
+        <div className="mt-7 flex items-center gap-2 font-mono text-[7px] font-medium uppercase tracking-[0.2em] text-white/38">
+          <span className="h-px flex-1 bg-white/15" />
+          TEXT ONLY TEMPLATE
+          <span className="h-px flex-1 bg-white/15" />
+        </div>
       </div>
     </div>
   );
 }
 
-// ─── Slot Editor Row ──────────────────────────────────────────────────────────
-function SlotRow({
-  slot, index, accentColor, onUpdate, onMoveUp, onMoveDown, isFirst, isLast
-}: {
-  slot: Slot; index: number; accentColor: string;
-  onUpdate: (id: number, data: Partial<Slot>) => void;
-  onMoveUp: (id: number) => void; onMoveDown: (id: number) => void;
-  isFirst: boolean; isLast: boolean;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [localTitle, setLocalTitle] = useState(slot.title);
-  const [localUrl, setLocalUrl] = useState(slot.url);
-
-  const save = () => {
-    onUpdate(slot.id, { title: localTitle, url: localUrl, active: localTitle.trim() !== "" && localTitle !== `Slot ${index + 1} — Add clip` });
-    setEditing(false);
-    toast.success(`Slot ${index + 1} updated`);
-  };
-
-  const clear = () => {
-    const def = `Slot ${index + 1} — Add clip`;
-    setLocalTitle(def);
-    setLocalUrl("");
-    onUpdate(slot.id, { title: def, url: "", active: false });
-    setEditing(false);
-  };
-
-  return (
-    <div className="glass rounded-xl overflow-hidden transition-all duration-200 hover:border-primary/20">
-      <div className="flex items-center gap-3 px-4 py-3">
-        {/* Number */}
-        <div className="w-8 h-8 rounded-lg flex items-center justify-center text-sm font-black shrink-0"
-          style={{ background: `${accentColor}22`, color: accentColor }}>
-          {index + 1}
-        </div>
-        {/* Info */}
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-semibold text-foreground truncate">
-            {slot.active ? slot.title : <span className="text-muted-foreground italic">Empty slot — click Edit to add</span>}
-          </div>
-          {slot.url && <div className="text-xs text-muted-foreground truncate">{slot.url}</div>}
-        </div>
-        {/* Status */}
-        {slot.active && <CheckCircle2 className="w-4 h-4 shrink-0" style={{ color: "var(--mint)" }} />}
-        {/* Actions */}
-        <div className="flex items-center gap-1 shrink-0">
-          <button onClick={() => onMoveUp(slot.id)} disabled={isFirst}
-            className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors disabled:opacity-30">
-            <ChevronUp className="w-3.5 h-3.5" />
-          </button>
-          <button onClick={() => onMoveDown(slot.id)} disabled={isLast}
-            className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors disabled:opacity-30">
-            <ChevronDown className="w-3.5 h-3.5" />
-          </button>
-          <button onClick={() => setEditing(v => !v)}
-            className="p-1.5 rounded-lg transition-colors hover:bg-secondary/60"
-            style={{ color: editing ? accentColor : "var(--muted-foreground)" }}>
-            <Edit3 className="w-3.5 h-3.5" />
-          </button>
-          {slot.active && (
-            <button onClick={clear}
-              className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          )}
-        </div>
-      </div>
-      {/* Inline editor */}
-      {editing && (
-        <div className="px-4 pb-4 pt-1 border-t border-border space-y-3 animate-slide-up">
-          <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Clip Title</label>
-            <input type="text" value={localTitle} onChange={e => setLocalTitle(e.target.value)}
-              placeholder="e.g. The Most Shocking Moment"
-              className="w-full px-3 py-2 rounded-lg bg-input border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all" />
-          </div>
-          <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Video URL or file path</label>
-            <input type="text" value={localUrl} onChange={e => setLocalUrl(e.target.value)}
-              placeholder="https://... or leave blank for placeholder"
-              className="w-full px-3 py-2 rounded-lg bg-input border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all" />
-          </div>
-          <div className="flex gap-2">
-            <button onClick={save}
-              className="flex-1 py-2 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80"
-              style={{ background: accentColor }}>
-              Save
-            </button>
-            <button onClick={() => setEditing(false)}
-              className="px-4 py-2 rounded-lg text-xs font-semibold text-muted-foreground bg-secondary/60 hover:text-foreground transition-colors">
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Main Page ────────────────────────────────────────────────────────────────
 export default function Top5ReelsPage() {
-  const [slots, setSlots] = useState<Slot[]>(DEFAULT_SLOTS);
-  const [reelTitle, setReelTitle] = useState("TOP 5 INSANE MOMENTS");
-  const [accentColor, setAccentColor] = useState("#00B4FF");
-  const [bgGradient, setBgGradient] = useState(BG_GRADIENTS[0].value);
-  const [titleFont, setTitleFont] = useState("Montserrat");
-  const [activeSlot, setActiveSlot] = useState(1);
-  const [rendering, setRendering] = useState(false);
-  const [rendered, setRendered] = useState(false);
+  const [ranks, setRanks] = useState<RankItem[]>(DEFAULT_RANKS);
+  const [title, setTitle] = useState("TOP 5 INSANE MOMENTS");
+  const [accentWord, setAccentWord] = useState("INSANE");
+  const [accentColor, setAccentColor] = useState("#a3e635");
+  const [activeRank, setActiveRank] = useState<number | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
 
-  // Auto-cycle active slot for preview animation
-  const cycleSlot = () => setActiveSlot(prev => prev >= 5 ? 1 : prev + 1);
+  const completedCount = useMemo(
+    () => ranks.filter((item) => item.text.trim().length > 0).length,
+    [ranks],
+  );
 
-  const updateSlot = (id: number, data: Partial<Slot>) => {
-    setSlots(prev => prev.map(s => s.id === id ? { ...s, ...data } : s));
+  useEffect(() => {
+    if (!isPlaying) return;
+
+    let step = 0;
+    const orderedRanks = ranks.map((item) => item.rank);
+    setActiveRank(orderedRanks[0] ?? null);
+
+    const interval = window.setInterval(() => {
+      step += 1;
+      if (step >= orderedRanks.length) {
+        window.clearInterval(interval);
+        setIsPlaying(false);
+        setActiveRank(null);
+        return;
+      }
+      setActiveRank(orderedRanks[step]);
+    }, 950);
+
+    return () => window.clearInterval(interval);
+  }, [isPlaying, ranks]);
+
+  const updateRank = (id: number, text: string) => {
+    setRanks((current) => current.map((item) => (item.id === id ? { ...item, text } : item)));
   };
 
-  const moveUp = (id: number) => {
-    setSlots(prev => {
-      const idx = prev.findIndex(s => s.id === id);
-      if (idx <= 0) return prev;
-      const next = [...prev];
-      [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
-      return next;
-    });
+  const reset = () => {
+    setRanks(DEFAULT_RANKS);
+    setTitle("TOP 5 INSANE MOMENTS");
+    setAccentWord("INSANE");
+    setAccentColor("#a3e635");
+    setActiveRank(null);
+    setIsPlaying(false);
+    toast.info("The Top 5 layout has been reset.");
   };
 
-  const moveDown = (id: number) => {
-    setSlots(prev => {
-      const idx = prev.findIndex(s => s.id === id);
-      if (idx >= prev.length - 1) return prev;
-      const next = [...prev];
-      [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
-      return next;
-    });
+  const downloadLayout = () => {
+    const layout = {
+      template: "minimal-text-top-5",
+      aspectRatio: "9:16",
+      title,
+      accentWord,
+      accentColor,
+      order: ranks.map(({ rank, text }) => ({ rank, text })),
+    };
+    const blob = new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "top-5-text-layout.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+    toast.success("Top 5 text layout saved.");
   };
-
-  const handleRender = () => {
-    setRendering(true);
-    setTimeout(() => { setRendering(false); setRendered(true); toast.success("Top 5 Reel rendered and ready!"); }, 3000);
-  };
-
-  const reset = () => { setSlots(DEFAULT_SLOTS); setRendered(false); toast.info("Reset to defaults"); };
-
-  const filledCount = slots.filter(s => s.active).length;
 
   return (
     <AppLayout title="Top 5 Reels">
-      <div className="max-w-5xl mx-auto">
-        {/* Header */}
-        <div className="mb-6 flex items-center justify-between flex-wrap gap-3">
+      <div className="mx-auto max-w-6xl">
+        <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
           <div>
-            <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>
-              Top 5 Reels Template
+            <div className="mb-2 flex items-center gap-2 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+              <Sparkles className="h-3.5 w-3.5" style={{ color: accentColor }} />
+              Minimal text template
+            </div>
+            <h2 className="text-3xl font-black tracking-[-0.06em] text-foreground sm:text-4xl">
+              Top 5 Countdown
             </h2>
-            <p className="text-sm text-muted-foreground">Build a viral "Top 5" countdown reel with a 9:16 vertical format.</p>
+            <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
+              Create a clean 5-to-1 ranking overlay with only headline text, numbered rows, and one accent color.
+            </p>
           </div>
+
           <div className="flex items-center gap-2">
-            <button onClick={reset} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors">
-              <RotateCcw className="w-3.5 h-3.5" /> Reset
+            <button
+              type="button"
+              onClick={reset}
+              className="inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Reset
             </button>
-            {rendered ? (
-              <a href="#" onClick={e => { e.preventDefault(); toast.info("In production, this downloads the rendered Top 5 Reel."); }}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold transition-all hover:opacity-80 glow-green"
-                style={{ background: "rgba(89, 164, 133, 0.1)", color: "var(--mint)" }}>
-                <Download className="w-4 h-4" /> Download Reel
-              </a>
-            ) : (
-              <button onClick={handleRender} disabled={rendering || filledCount === 0}
-                className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed glow-blue"
-                style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
-                {rendering ? <><Loader2 className="w-4 h-4 animate-spin" /> Rendering…</> : <><Zap className="w-4 h-4" /> Render Reel</>}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={downloadLayout}
+              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2.5 text-sm font-bold text-foreground transition-colors hover:border-foreground/25"
+            >
+              <Download className="h-4 w-4" />
+              Save layout
+            </button>
           </div>
-        </div>
+        </header>
 
-        <div className="grid lg:grid-cols-3 gap-6">
-          {/* Left: Slot editor */}
-          <div className="lg:col-span-2 space-y-4">
-            {/* Reel title */}
+        <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
+          <section className="space-y-5">
+            <div className="glass rounded-2xl p-5 sm:p-6">
+              <div className="mb-5 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-bold text-foreground">Copy</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Keep every line short so it stays legible in a vertical short.</p>
+                </div>
+                <span className="rounded-full bg-secondary px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                  {completedCount}/5 rows
+                </span>
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_180px]">
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold text-foreground">Headline</span>
+                  <input
+                    value={title}
+                    onChange={(event) => setTitle(event.target.value.toUpperCase())}
+                    maxLength={56}
+                    placeholder="TOP 5 INSANE MOMENTS"
+                    className="w-full rounded-xl border border-border bg-input px-3.5 py-3 text-sm font-bold uppercase tracking-[-0.02em] text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold text-foreground">Accent word</span>
+                  <input
+                    value={accentWord}
+                    onChange={(event) => setAccentWord(event.target.value.toUpperCase())}
+                    maxLength={18}
+                    placeholder="INSANE"
+                    className="w-full rounded-xl border border-border bg-input px-3.5 py-3 text-sm font-bold uppercase tracking-[-0.02em] text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="glass rounded-2xl p-5 sm:p-6">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-bold text-foreground">Countdown lines</p>
+                  <p className="mt-1 text-xs text-muted-foreground">The order is locked from 5 down to 1 for a natural reveal.</p>
+                </div>
+                <TimerReset className="h-4 w-4" style={{ color: accentColor }} />
+              </div>
+
+              <div className="divide-y divide-border rounded-xl border border-border bg-card">
+                {ranks.map((item) => (
+                  <label key={item.id} className="flex items-center gap-4 px-4 py-3.5 transition-colors focus-within:bg-secondary/35">
+                    <span
+                      className="w-9 text-center text-3xl font-black leading-none tracking-[-0.12em]"
+                      style={{ color: item.rank === 1 ? accentColor : "var(--foreground)" }}
+                    >
+                      {item.rank}
+                    </span>
+                    <input
+                      value={item.text}
+                      onChange={(event) => updateRank(item.id, event.target.value)}
+                      maxLength={42}
+                      placeholder={`Rank ${item.rank} text`}
+                      className="min-w-0 flex-1 bg-transparent py-1 text-sm font-bold uppercase tracking-[-0.02em] text-foreground outline-none placeholder:text-muted-foreground/55"
+                    />
+                    {item.text.trim() && <Check className="h-4 w-4 shrink-0" style={{ color: accentColor }} />}
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="glass rounded-2xl p-5 sm:p-6">
+              <p className="mb-3 text-sm font-bold text-foreground">Accent</p>
+              <div className="flex flex-wrap gap-2.5">
+                {ACCENT_COLORS.map((color) => (
+                  <button
+                    key={color.value}
+                    type="button"
+                    onClick={() => setAccentColor(color.value)}
+                    title={color.name}
+                    aria-label={`Use ${color.name} accent`}
+                    className="flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold transition-all"
+                    style={{
+                      borderColor: accentColor === color.value ? color.value : "var(--border)",
+                      background: accentColor === color.value ? `${color.value}18` : "transparent",
+                      color: accentColor === color.value ? color.value : "var(--muted-foreground)",
+                    }}
+                  >
+                    <span className="h-3 w-3 rounded-full" style={{ background: color.value }} />
+                    {color.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
+
+          <aside className="lg:sticky lg:top-6 lg:h-fit">
             <div className="glass rounded-2xl p-5">
-              <label className="text-sm font-medium text-foreground mb-2 block">Reel Title</label>
-              <input type="text" value={reelTitle} onChange={e => setReelTitle(e.target.value)}
-                placeholder="TOP 5 INSANE MOMENTS"
-                className="w-full px-4 py-3 rounded-xl bg-input border border-border text-foreground text-sm font-bold uppercase focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all" />
-            </div>
-
-            {/* Slots */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between px-1">
-                <span className="text-sm font-semibold text-foreground">Clip Slots</span>
-                <span className="text-xs text-muted-foreground">{filledCount}/5 filled</span>
-              </div>
-              {slots.map((slot, i) => (
-                <SlotRow key={slot.id} slot={slot} index={i} accentColor={accentColor}
-                  onUpdate={updateSlot} onMoveUp={moveUp} onMoveDown={moveDown}
-                  isFirst={i === 0} isLast={i === slots.length - 1} />
-              ))}
-            </div>
-
-            {/* Style controls */}
-            <div className="glass rounded-2xl p-5 space-y-5">
-              <span className="text-sm font-semibold text-foreground flex items-center gap-2">
-                <Palette className="w-4 h-4" style={{ color: "var(--coral)" }} /> Style
-              </span>
-              {/* Accent color */}
-              <div>
-                <label className="text-xs text-muted-foreground mb-2 block">Accent Color</label>
-                <div className="flex gap-2 flex-wrap">
-                  {ACCENT_COLORS.map(c => (
-                    <button key={c.value} onClick={() => setAccentColor(c.value)} title={c.label}
-                      className={`w-8 h-8 rounded-full border-2 transition-all ${accentColor === c.value ? "scale-110 border-white shadow-lg" : "border-transparent hover:scale-105"}`}
-                      style={{ background: c.value }} />
-                  ))}
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-bold text-foreground">Live preview</p>
+                  <p className="mt-1 text-xs text-muted-foreground">1080 × 1920 composition</p>
                 </div>
-              </div>
-              {/* Background */}
-              <div>
-                <label className="text-xs text-muted-foreground mb-2 block">Background</label>
-                <div className="grid grid-cols-4 gap-2">
-                  {BG_GRADIENTS.map(g => (
-                    <button key={g.label} onClick={() => setBgGradient(g.value)}
-                      className={`h-10 rounded-lg border-2 transition-all ${bgGradient === g.value ? "border-white scale-105" : "border-transparent hover:border-border"}`}
-                      style={{ background: g.value }} title={g.label} />
-                  ))}
-                </div>
-              </div>
-              {/* Title font */}
-              <div>
-                <label className="text-xs text-muted-foreground mb-2 block flex items-center gap-1"><Type className="w-3 h-3" /> Title Font</label>
-                <div className="flex flex-wrap gap-2">
-                  {TITLE_FONTS.map(f => (
-                    <button key={f} onClick={() => setTitleFont(f)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${titleFont === f ? "text-white" : "text-muted-foreground bg-secondary/60 hover:text-foreground"}`}
-                      style={titleFont === f ? { background: accentColor } : {}}>{f}</button>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Right: Preview */}
-          <div className="space-y-4">
-            <div className="glass rounded-2xl p-5 flex flex-col items-center gap-4">
-              <div className="flex items-center justify-between w-full">
-                <span className="text-sm font-semibold text-foreground">9:16 Preview</span>
-                <button onClick={cycleSlot}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors hover:bg-secondary/60"
-                  style={{ color: accentColor }}>
-                  <Play className="w-3 h-3" /> Animate
+                <button
+                  type="button"
+                  onClick={() => setIsPlaying((current) => !current)}
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold text-black transition-transform hover:scale-[1.02]"
+                  style={{ background: accentColor }}
+                >
+                  <Play className="h-3.5 w-3.5 fill-current" />
+                  {isPlaying ? "Playing" : "Preview"}
                 </button>
               </div>
-              <ReelPreview slots={slots} title={reelTitle} accentColor={accentColor} bgGradient={bgGradient} titleFont={titleFont} activeSlot={activeSlot} />
-              <p className="text-xs text-muted-foreground text-center">Click Animate to cycle through slots</p>
-            </div>
 
-            {/* Info card */}
-            <div className="glass rounded-2xl p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <Film className="w-4 h-4" style={{ color: "var(--cobalt)" }} />
-                <span className="text-sm font-semibold text-foreground">Format Info</span>
+              <div className="mx-auto flex justify-center">
+                <TextOnlyPreview
+                  title={title}
+                  accentWord={accentWord}
+                  accentColor={accentColor}
+                  ranks={ranks}
+                  activeRank={activeRank}
+                />
               </div>
-              {[
-                { label: "Aspect Ratio", value: "9:16 (Vertical)" },
-                { label: "Resolution",  value: "1080 × 1920" },
-                { label: "Format",      value: "MP4 / H.264" },
-                { label: "Platforms",   value: "TikTok, Reels, Shorts" },
-              ].map(r => (
-                <div key={r.label} className="flex justify-between text-xs">
-                  <span className="text-muted-foreground">{r.label}</span>
-                  <span className="text-foreground font-medium">{r.value}</span>
-                </div>
-              ))}
-            </div>
 
-            {/* Render status */}
-            {rendered && (
-              <div className="glass rounded-2xl p-4 animate-scale-in" style={{ border: "1px solid oklch(0.75 0.20 145 / 0.4)" }}>
-                <div className="flex items-center gap-2 mb-2">
-                  <CheckCircle2 className="w-4 h-4" style={{ color: "var(--mint)" }} />
-                  <span className="text-sm font-semibold" style={{ color: "var(--mint)" }}>Ready to download</span>
-                </div>
-                <p className="text-xs text-muted-foreground">Your Top 5 Reel has been rendered with all {filledCount} clips and your custom style.</p>
+              <div className="mt-4 rounded-xl border border-border bg-secondary/35 p-3 text-xs leading-relaxed text-muted-foreground">
+                <strong className="font-semibold text-foreground">Text-only by design.</strong> This template leaves the video fully visible and adds no image card, background image, or decorative clip panel.
               </div>
-            )}
-          </div>
+            </div>
+          </aside>
         </div>
       </div>
     </AppLayout>
