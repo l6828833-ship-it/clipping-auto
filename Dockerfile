@@ -45,6 +45,10 @@ RUN npm ci --include=dev --legacy-peer-deps
 COPY dist/index.js ./dist/index.js
 COPY --from=frontend-build /app/dist/public ./dist/public
 COPY assets ./assets
+# Keep the schema tooling available for one-time production database setup:
+# fly ssh console -a clipping-auto -C "npx drizzle-kit push"
+COPY drizzle ./drizzle
+COPY drizzle.config.ts ./drizzle.config.ts
 
 RUN mkdir -p /app/.data/videos /app/.data/clips /app/.data/render \
     && chown -R node:node /app
