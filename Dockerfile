@@ -45,8 +45,8 @@ RUN npm ci --include=dev --legacy-peer-deps
 COPY dist/index.js ./dist/index.js
 COPY --from=frontend-build /app/dist/public ./dist/public
 COPY assets ./assets
-# Keep the schema tooling available for one-time production database setup:
-# fly ssh console -a clipping-auto -C "npx drizzle-kit push"
+# Keep the schema tooling available for Supabase database setup:
+# fly ssh console -a clipping-auto -C "npx drizzle-kit migrate"
 COPY drizzle ./drizzle
 COPY drizzle.config.ts ./drizzle.config.ts
 
