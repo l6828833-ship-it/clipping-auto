@@ -37,11 +37,12 @@ type RankEntry = {
   candidates: Candidate[];
   selectedId?: number;
   title: string;
-  showNumber: boolean;
   showTitle: boolean;
   numberPosition: Point;
   titlePosition: Point;
-  cardSeconds: number;
+  /** Full-resolution font sizes used by the final 1080×1920 render. */
+  numberSize: number;
+  titleSize: number;
   state: RankState;
   error?: string;
   clipId?: number;
@@ -58,11 +59,11 @@ const createRank = (rank: number): RankEntry => ({
   sourceTitle: "",
   candidates: [],
   title: "",
-  showNumber: true,
   showTitle: true,
-  numberPosition: { x: 0.5, y: 0.34 },
-  titlePosition: { x: 0.5, y: 0.62 },
-  cardSeconds: 1.2,
+  numberPosition: { x: 0.12, y: 0.31 + (5 - rank) * 0.115 },
+  titlePosition: { x: 0.43, y: 0.31 + (5 - rank) * 0.115 },
+  numberSize: 96,
+  titleSize: 56,
   state: "idle",
 });
 
@@ -91,12 +92,14 @@ function stateCopy(state: RankState) {
   return "Add a source";
 }
 
-function RankIntroPreview({
+function RankOverlayPreview({
   entry,
+  ranks,
   accent,
   onMove,
 }: {
   entry: RankEntry;
+  ranks: RankEntry[];
   accent: string;
   onMove: (kind: "number" | "title", point: Point) => void;
 }) {
@@ -118,6 +121,7 @@ function RankIntroPreview({
     event.currentTarget.setPointerCapture(event.pointerId);
     setDragging(kind);
   };
+  const previewSize = (fullSize: number, min: number) => Math.max(min, Math.round(fullSize * 0.29));
 
   return (
     <div
@@ -126,42 +130,48 @@ function RankIntroPreview({
       onPointerUp={() => setDragging(null)}
       onPointerCancel={() => setDragging(null)}
       className="relative aspect-[9/16] w-full overflow-hidden rounded-[1.5rem] bg-[#070707] shadow-2xl"
-      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #111 0%, #050505 76%)" }}
+      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)" }}
     >
       <div className="absolute inset-x-0 top-0 h-1" style={{ background: accent }} />
-      <div className="absolute bottom-4 left-5 right-5 rounded-lg border border-white/10 bg-black/35 px-3 py-2 text-center font-mono text-[8px] uppercase tracking-[0.18em] text-white/45 backdrop-blur-sm">
-        Title card before rank {entry.rank} clip
-      </div>
+      <p className="absolute left-[10%] top-[8%] z-10 text-[8px] font-black uppercase tracking-[0.2em] text-white/55">Persistent ranking overlay</p>
 
-      {entry.showNumber && (
-        <button
-          type="button"
-          onPointerDown={(event) => startDrag(event, "number")}
-          className="group absolute z-10 cursor-grab touch-none select-none active:cursor-grabbing"
-          style={{ left: `${entry.numberPosition.x * 100}%`, top: `${entry.numberPosition.y * 100}%`, transform: "translate(-50%, -50%)" }}
-          aria-label="Drag rank number"
-        >
-          <span className="block rounded-xl border border-white/15 bg-black/15 px-3 py-1 text-[82px] font-black leading-none tracking-[-0.12em] shadow-2xl transition group-hover:border-white/50" style={{ color: accent }}>
-            {entry.rank}
-          </span>
-          <span className="absolute -right-5 -top-3 hidden rounded bg-white px-1 py-0.5 text-[8px] text-black group-hover:block"><GripVertical className="h-2.5 w-2.5" /></span>
-        </button>
-      )}
+      {ranks.map((rankEntry) => {
+        const activeNumber = rankEntry.rank === entry.rank;
+        const numberStyle = {
+          left: `${rankEntry.numberPosition.x * 100}%`,
+          top: `${rankEntry.numberPosition.y * 100}%`,
+          transform: "translate(-50%, -50%)",
+          fontSize: `${previewSize(rankEntry.numberSize, 18)}px`,
+          color: rankEntry.rank === 1 ? accent : "transparent",
+          WebkitTextStroke: `1.4px ${rankEntry.rank === 1 ? accent : "rgba(255,255,255,0.96)"}`,
+        } as React.CSSProperties;
+        if (!activeNumber) return <span key={rankEntry.id} className="absolute z-10 select-none font-black leading-none tracking-[-0.12em]" style={numberStyle}>{rankEntry.rank}</span>;
+        return (
+          <button key={rankEntry.id} type="button" onPointerDown={(event) => startDrag(event, "number")} className="group absolute z-20 cursor-grab touch-none select-none active:cursor-grabbing" style={numberStyle} aria-label="Drag active rank number">
+            {rankEntry.rank}
+            <span className="absolute -right-4 -top-2 hidden rounded bg-white px-1 py-0.5 text-[8px] text-black group-hover:block"><GripVertical className="h-2.5 w-2.5" /></span>
+          </button>
+        );
+      })}
 
       {entry.showTitle && (
         <button
           type="button"
           onPointerDown={(event) => startDrag(event, "title")}
-          className="group absolute z-10 max-w-[82%] cursor-grab touch-none select-none active:cursor-grabbing"
+          className="group absolute z-20 max-w-[74%] cursor-grab touch-none select-none active:cursor-grabbing"
           style={{ left: `${entry.titlePosition.x * 100}%`, top: `${entry.titlePosition.y * 100}%`, transform: "translate(-50%, -50%)" }}
-          aria-label="Drag title"
+          aria-label="Drag active clip title"
         >
-          <span className="block rounded-lg border border-white/12 bg-black/25 px-2 py-1.5 text-center text-[17px] font-black uppercase leading-[0.94] tracking-[-0.06em] text-white shadow-xl transition group-hover:border-white/50">
-            {entry.title.trim() || "AUTO TITLE"}
+          <span className="block border border-white/12 bg-black/25 px-2 py-1 text-center font-black uppercase leading-[0.94] tracking-[-0.06em] text-white shadow-xl transition group-hover:border-white/50" style={{ fontSize: `${previewSize(entry.titleSize, 11)}px` }}>
+            {entry.title.trim() || "CURRENT CLIP TITLE"}
           </span>
           <span className="absolute -right-4 -top-2 hidden rounded bg-white px-1 py-0.5 text-[8px] text-black group-hover:block"><GripVertical className="h-2.5 w-2.5" /></span>
         </button>
       )}
+
+      <div className="absolute bottom-4 left-5 right-5 rounded-lg border border-white/10 bg-black/45 px-3 py-2 text-center font-mono text-[8px] uppercase tracking-[0.16em] text-white/55 backdrop-blur-sm">
+        All rank numbers stay visible · rank {entry.rank} title appears when its clip starts
+      </div>
     </div>
   );
 }
@@ -318,11 +328,13 @@ export default function Top5ReelsPage() {
           clipId,
           rank: entry.rank,
           title: entry.title.trim(),
-          showNumber: entry.showNumber,
+          // The full 5-to-1 list is always visible over the finished video.
+          showNumber: true,
           showTitle: entry.showTitle,
           numberPosition: entry.numberPosition,
           titlePosition: entry.titlePosition,
-          cardSeconds: entry.cardSeconds,
+          numberSize: entry.numberSize,
+          titleSize: entry.titleSize,
           accentColor: accent,
         })),
       });
@@ -440,24 +452,25 @@ export default function Top5ReelsPage() {
 
             <div className="glass rounded-2xl p-5 sm:p-6">
               <div className="mb-4">
-                <h2 className="text-base font-black text-foreground">3. Intro card before rank {active.rank} plays</h2>
-                <p className="mt-1 text-xs text-muted-foreground">The card is separate from the source clip. Drag the number and generated title in the preview; each element can be removed from that rank.</p>
+                <h2 className="text-base font-black text-foreground">3. Persistent numbers and timed rank title</h2>
+                <p className="mt-1 text-xs text-muted-foreground">All five rank numbers stay on-screen for the whole video. The title for rank {active.rank} appears when that specific source clip begins, then remains visible.</p>
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="block">
-                  <span className="mb-2 block text-xs font-semibold text-foreground">Generated title</span>
+                  <span className="mb-2 block text-xs font-semibold text-foreground">Generated title for rank {active.rank}</span>
                   <input value={active.title} onChange={(event) => patchRank(active.rank, { title: event.target.value.toUpperCase(), clipId: undefined })} maxLength={72} placeholder="Generated after clip selection" className="w-full rounded-xl border border-border bg-input px-3 py-2.5 text-sm font-black uppercase text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20" />
                 </label>
                 <label className="block">
-                  <span className="mb-2 block text-xs font-semibold text-foreground">Card duration</span>
-                  <select value={active.cardSeconds} onChange={(event) => patchRank(active.rank, { cardSeconds: Number(event.target.value) })} className="w-full rounded-xl border border-border bg-input px-3 py-2.5 text-sm font-semibold text-foreground outline-none focus:border-primary">
-                    <option value={0.8}>0.8 seconds</option><option value={1.2}>1.2 seconds</option><option value={1.6}>1.6 seconds</option><option value={2}>2.0 seconds</option>
-                  </select>
+                  <span className="mb-2 block text-xs font-semibold text-foreground">Title visibility</span>
+                  <button type="button" onClick={() => patchRank(active.rank, { showTitle: !active.showTitle })} className={`flex w-full items-center justify-between rounded-xl border px-3 py-2.5 text-sm font-bold transition ${active.showTitle ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"}`}><span>{active.showTitle ? "Title will appear with clip" : "Title hidden for this clip"}</span><span>{active.showTitle ? "On" : "Off"}</span></button>
                 </label>
               </div>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <label className="block"><span className="mb-2 flex justify-between text-xs font-semibold text-foreground"><span>Rank number size</span><span className="font-mono text-muted-foreground">{active.numberSize}px</span></span><input type="range" min="42" max="220" step="2" value={active.numberSize} onChange={(event) => patchRank(active.rank, { numberSize: Number(event.target.value) })} className="w-full accent-primary" /></label>
+                <label className="block"><span className="mb-2 flex justify-between text-xs font-semibold text-foreground"><span>Clip title size</span><span className="font-mono text-muted-foreground">{active.titleSize}px</span></span><input type="range" min="24" max="112" step="2" value={active.titleSize} onChange={(event) => patchRank(active.rank, { titleSize: Number(event.target.value) })} className="w-full accent-primary" /></label>
+              </div>
               <div className="mt-4 flex flex-wrap gap-3">
-                <button type="button" onClick={() => patchRank(active.rank, { showNumber: !active.showNumber })} className={`rounded-xl border px-3 py-2 text-xs font-bold transition ${active.showNumber ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"}`}>{active.showNumber ? "Remove number" : "Add number"}</button>
-                <button type="button" onClick={() => patchRank(active.rank, { showTitle: !active.showTitle })} className={`rounded-xl border px-3 py-2 text-xs font-bold transition ${active.showTitle ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"}`}>{active.showTitle ? "Remove title" : "Add title"}</button>
+                <div className="rounded-xl border border-border bg-secondary/30 px-3 py-2 text-xs font-semibold text-muted-foreground">Drag the active rank’s number or title in the preview to reposition it.</div>
                 <div className="ml-auto flex items-center gap-2 text-xs font-semibold text-muted-foreground"><span>Accent</span>{ACCENTS.map((color) => <button key={color} type="button" onClick={() => setAccent(color)} className="h-6 w-6 rounded-full border-2 transition" style={{ background: color, borderColor: accent === color ? "white" : "transparent" }} aria-label={`Use ${color} accent`} />)}</div>
               </div>
             </div>
@@ -466,7 +479,7 @@ export default function Top5ReelsPage() {
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
                   <h2 className="text-base font-black text-foreground">4. Render the complete Top 5 video</h2>
-                  <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">The renderer downloads only the selected ranges at the best available source quality, crops each clip to 1080 × 1920, renders the title card before it, then exports one H.264 high-quality MP4.</p>
+                  <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">The renderer downloads only the selected ranges at the best available source quality, crops each clip to 1080 × 1920, keeps the full 5-to-1 ranking list visible, and reveals each title when its matching clip begins.</p>
                 </div>
                 <button type="button" onClick={renderFinal} disabled={isRenderingFinal || completed !== 5} className="inline-flex items-center gap-2 rounded-xl px-5 py-3 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: accent }}>
                   {isRenderingFinal ? <Loader2 className="h-4 w-4 animate-spin" /> : <Video className="h-4 w-4" />}
@@ -480,11 +493,11 @@ export default function Top5ReelsPage() {
           <aside className="xl:sticky xl:top-6 xl:h-fit">
             <div className="glass rounded-2xl p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
-                <div><p className="text-sm font-black text-foreground">Rank {active.rank} title card</p><p className="mt-1 text-xs text-muted-foreground">Drag text directly in the preview.</p></div>
+                <div><p className="text-sm font-black text-foreground">Persistent ranking overlay</p><p className="mt-1 text-xs text-muted-foreground">Drag the active number or title directly in the preview.</p></div>
                 <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
               </div>
-              <RankIntroPreview entry={active} accent={accent} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
-              <div className="mt-4 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">This preview represents the separate intro card shown immediately before the selected source clip. It does not cover the actual clip while it plays.</div>
+              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <div className="mt-4 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">The full rank list stays over every clip. When a clip begins, its own generated title appears beside its number, matching the ranking style in your reference.</div>
               <div className="mt-4 divide-y divide-border rounded-xl border border-border bg-card">
                 {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
               </div>

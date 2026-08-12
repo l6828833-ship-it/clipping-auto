@@ -3263,55 +3263,58 @@ async function renderTop5Countdown(entries) {
   if (!ffmpeg) throw new MediaError(FFMPEG_MISSING);
   await ensureDirs();
   const fingerprint = crypto2.createHash("sha1").update(JSON.stringify(entries)).digest("hex").slice(0, 10);
-  const fileName = clipFileName(entries[0].clipId, `top5:${fingerprint}`, 0, entries.length, 1, 0, 0);
+  const fileName = clipFileName(entries[0].clipId, `top5-overlay:${fingerprint}`, 0, entries.length, 1, 0, 0);
   const outPath = path5.join(CLIPS_DIR, fileName);
   const existing = await fs6.stat(outPath).catch(() => null);
   if (existing?.size > 0) return { url: urlFor("clip", fileName), bytes: existing.size };
 
-  const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, "top5-"));
+  const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, "top5-overlay-"));
   try {
     const font = filterRelativePath(tmpDir, path5.join(FONTS_DIR, "Montserrat-Bold.ttf"));
-    const manifest = [];
+    const timeline = [];
+    let elapsed = 0;
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
       const sourcePath = localPathFromUrl(entry.downloadUrl);
       if (!sourcePath) throw new MediaError(`Rank ${entry.rank} has no rendered clip file. Render it first.`);
       await fs6.access(sourcePath);
-      if (entry.showNumber || entry.showTitle) {
-        const rankText = path5.join(tmpDir, `rank-${index}.txt`);
-        const titleText = path5.join(tmpDir, `title-${index}.txt`);
-        await fs6.writeFile(rankText, entry.showNumber ? String(entry.rank) : "", "utf8");
-        await fs6.writeFile(titleText, entry.showTitle ? entry.title.trim().toUpperCase().slice(0, 72) : "", "utf8");
-        const number = entry.numberPosition || { x: 0.5, y: 0.35 };
-        const title = entry.titlePosition || { x: 0.5, y: 0.62 };
-        const accent = /^#[0-9a-fA-F]{6}$/.test(entry.accentColor || "") ? entry.accentColor : "#a3e635";
-        const filters = [];
-        if (entry.showNumber) filters.push(`drawtext=fontfile=${font}:textfile=${path5.basename(rankText)}:fontcolor=${accent}:fontsize=360:x=(${Math.round(number.x * 1080)})-text_w/2:y=(${Math.round(number.y * 1920)})-text_h/2`);
-        if (entry.showTitle) filters.push(`drawtext=fontfile=${font}:textfile=${path5.basename(titleText)}:fontcolor=white:fontsize=68:x=(${Math.round(title.x * 1080)})-text_w/2:y=(${Math.round(title.y * 1920)})-text_h/2:line_spacing=12`);
-        const introPath = path5.join(tmpDir, `intro-${index}.mp4`);
-        await runStreaming(ffmpeg, [
-          "-f", "lavfi", "-i", `color=c=0x070707:s=1080x1920:r=30:d=${entry.cardSeconds}`,
-          "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-          "-shortest", "-vf", filters.join(","),
-          "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p", "-r", "30",
-          "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-y", "-loglevel", "error", introPath
-        ], { timeout: 3e5, cwd: tmpDir });
-        manifest.push(introPath);
-      }
-      manifest.push(sourcePath);
+      const meta = await probeMedia(sourcePath);
+      if (!meta?.duration || meta.duration <= 0.05) throw new MediaError(`Rank ${entry.rank} rendered clip has no usable duration.`);
+      timeline.push({ ...entry, sourcePath, startAt: elapsed, duration: meta.duration });
+      elapsed += meta.duration;
     }
-    /*
-     * Each source clip can have a different native frame rate. Normalise every
-     * input in a filter graph before concatenating so a 24/30/60fps mix cannot
-     * desynchronise or fail the final countdown render.
-     */
-    const inputArgs = manifest.flatMap((mediaPath) => ["-i", mediaPath]);
-    const normalised = manifest.flatMap((_, index) => [
+
+    /* Build and normalise the video first, then burn one persistent ranking list over it. */
+    const inputArgs = timeline.flatMap((entry) => ["-i", entry.sourcePath]);
+    const normalised = timeline.flatMap((_, index) => [
       `[${index}:v]fps=30,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih),setsar=1[v${index}]`,
       `[${index}:a]aresample=48000,aformat=channel_layouts=stereo[a${index}]`
     ]);
-    const concatInputs = manifest.map((_, index) => `[v${index}][a${index}]`).join("");
-    const graph = [...normalised, `${concatInputs}concat=n=${manifest.length}:v=1:a=1[vout][aout]`].join(";");
+    const concatInputs = timeline.map((_, index) => `[v${index}][a${index}]`).join("");
+    const filters = [...normalised, `${concatInputs}concat=n=${timeline.length}:v=1:a=1[basev][aout]`];
+    let previousVideo = "[basev]";
+
+    for (let index = 0; index < timeline.length; index += 1) {
+      const entry = timeline[index];
+      const rankFile = path5.join(tmpDir, `rank-number-${index}.txt`);
+      const titleFile = path5.join(tmpDir, `rank-title-${index}.txt`);
+      await fs6.writeFile(rankFile, entry.showNumber === false ? "" : String(entry.rank), "utf8");
+      await fs6.writeFile(titleFile, entry.showTitle === false ? "" : entry.title.trim().toUpperCase().slice(0, 72), "utf8");
+      const number = entry.numberPosition || { x: 0.12, y: 0.3 + index * 0.13 };
+      const title = entry.titlePosition || { x: 0.42, y: 0.3 + index * 0.13 };
+      const accent = /^#[0-9a-fA-F]{6}$/.test(entry.accentColor || "") ? entry.accentColor : "#a3e635";
+      const numberSize = Math.max(42, Math.min(220, Math.round(entry.numberSize || 96)));
+      const titleSize = Math.max(24, Math.min(112, Math.round(entry.titleSize || 56)));
+      const numberOut = `[num${index}]`;
+      const titleOut = `[title${index}]`;
+      /* Rank numbers remain visible from the first frame. Titles reveal when their matching clip begins and remain revealed. */
+      filters.push(`${previousVideo}drawtext=fontfile=${font}:textfile=${path5.basename(rankFile)}:fontcolor=${accent}:fontsize=${numberSize}:borderw=5:bordercolor=black@0.92:x=(${Math.round(number.x * 1080)})-text_w/2:y=(${Math.round(number.y * 1920)})-text_h/2${numberOut}`);
+      filters.push(`${numberOut}drawtext=fontfile=${font}:textfile=${path5.basename(titleFile)}:fontcolor=white:fontsize=${titleSize}:borderw=4:bordercolor=black@0.92:x=(${Math.round(title.x * 1080)})-text_w/2:y=(${Math.round(title.y * 1920)})-text_h/2:enable='gte(t\,${entry.startAt.toFixed(3)})'${titleOut}`);
+      previousVideo = titleOut;
+    }
+
+    filters.push(`${previousVideo}null[vout]`);
+    const graph = filters.join(";");
     await runStreaming(ffmpeg, [
       ...inputArgs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
       "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr", "-g", "60",
@@ -4196,8 +4199,9 @@ var appRouter = router({
         showTitle: z4.boolean().default(true),
         numberPosition: z4.object({ x: z4.number().min(0).max(1), y: z4.number().min(0).max(1) }).optional(),
         titlePosition: z4.object({ x: z4.number().min(0).max(1), y: z4.number().min(0).max(1) }).optional(),
-        cardSeconds: z4.number().min(0.5).max(3).default(1.2),
-        accentColor: z4.string().max(16).default("#a3e635")
+        accentColor: z4.string().max(16).default("#a3e635"),
+        numberSize: z4.number().min(42).max(220).default(96),
+        titleSize: z4.number().min(24).max(112).default(56)
       })).min(1).max(5)
     })).mutation(async ({ input, ctx }) => {
       const owned = await getClipsByUser(ctx.user.id);
