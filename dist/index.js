@@ -2716,12 +2716,22 @@ async function hostVideo(opts) {
       [...commonArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
       { timeout: 18e5, onLine: makeProgressHandler() }
     );
-    const downloadProgressive = () => runStreaming(
+    /*
+     * Generic fallback for TikTok, X and providers where the specialised
+     * adaptive selector returns no format. It deliberately uses no YouTube
+     * client override and accepts the best public stream the provider exposes.
+     */
+    const downloadCompatible = () => runStreaming(
       ytDlp,
       [
         "--no-playlist", ...YTDLP_COOKIE_ARGS,
         "--no-warnings",
-        "-f", "18/best",
+        "-f", [
+          `bv*[height<=${maxHeight}]+ba`,
+          `bv*+ba`,
+          `b[height<=${maxHeight}]`,
+          "b"
+        ].join("/"),
         "--merge-output-format", "mp4",
         "--ffmpeg-location", ffmpegDir,
         "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
@@ -2737,13 +2747,13 @@ async function hostVideo(opts) {
         await downloadFull();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/403|Forbidden/i.test(msg)) {
-          console.warn(`[Host] Adaptive download failed (403). Falling back to progressive (lower quality)...`);
-          /* Clear any partial files from the failed attempt */
+        if (/403|Forbidden|requested format|no video formats|format is not available|no downloadable|SABR/i.test(msg)) {
+          console.warn(`[Host] Preferred download format was unavailable. Retrying with the best compatible public format...`);
+          /* Clear partial fragments before retrying with the provider-compatible selector. */
           for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
             await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
           }
-          await downloadProgressive();
+          await downloadCompatible();
         } else {
           throw err;
         }
