@@ -1,0 +1,18 @@
+# Local dependencies and development artifacts
+node_modules
+.git
+.gitignore
+
+# Runtime data and secrets must be supplied by Fly volumes and secrets.
+.data
+.env
+.env.*
+
+# Vite creates a fresh frontend bundle inside the build image.
+dist/public
+
+# Logs and editor/system files
+*.log
+.DS_Store
+.vscode
+.idea
