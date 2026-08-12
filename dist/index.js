@@ -108,7 +108,9 @@ var subtitles = pgTable("subtitles", {
 
 // server/_core/env.ts
 var ENV = {
-  appId: process.env.VITE_APP_ID ?? "",
+  // Custom email/password auth runs without a Manus app ID in standalone deployments.
+  // Keep a stable non-empty identifier because the session verifier requires one.
+  appId: process.env.VITE_APP_ID || "shortspro-ai",
   cookieSecret: process.env.JWT_SECRET ?? "",
   databaseUrl: process.env.DATABASE_URL ?? "",
   oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
