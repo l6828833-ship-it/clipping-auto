@@ -938,6 +938,14 @@ var YT_CLIENT_ARGS_STR = [
   q("youtube:player_client=mweb")
 ].join(" ");
 /*
+ * Cloud containers have no browser profile. Never try to read a local Chrome,
+ * Brave, or Firefox cookie database. Private/restricted sources can optionally
+ * use an explicitly mounted Netscape cookie file via YTDLP_COOKIE_FILE.
+ */
+var YTDLP_COOKIE_FILE = (process.env.YTDLP_COOKIE_FILE ?? "").trim();
+var YTDLP_COOKIE_ARGS = YTDLP_COOKIE_FILE ? ["--cookies", YTDLP_COOKIE_FILE] : [];
+var YTDLP_COOKIE_ARGS_STR = YTDLP_COOKIE_FILE ? `--cookies ${q(YTDLP_COOKIE_FILE)}` : "";
+/*
  * Word-level timings.
  *
  * Inworld's synchronous STT returns the transcript but always an empty
@@ -1158,7 +1166,7 @@ async function whisperTranscribe(url, apiKey, language, tmpDir) {
   const audioPath = path3.join(tmpDir, "audio.mp3");
   const downloadCmd = [
     q(ytDlp),
-    "--no-playlist", "--cookies-from-browser", "brave",
+    "--no-playlist", YTDLP_COOKIE_ARGS_STR,
     YT_CLIENT_ARGS_STR,
     "--no-warnings",
     "-x",
@@ -2639,7 +2647,7 @@ async function hostVideo(opts) {
   let effectiveOffset = offset;
   try {
     const commonArgs = [
-      "--no-playlist", "--cookies-from-browser", "brave",
+      "--no-playlist", ...YTDLP_COOKIE_ARGS,
       ...YT_CLIENT_ARGS,
       "--no-warnings",
       // Parallel fragments are the single biggest speed win on YouTube DASH.
@@ -2711,7 +2719,7 @@ async function hostVideo(opts) {
     const downloadProgressive = () => runStreaming(
       ytDlp,
       [
-        "--no-playlist", "--cookies-from-browser", "brave",
+        "--no-playlist", ...YTDLP_COOKIE_ARGS,
         "--no-warnings",
         "-f", "18/best",
         "--merge-output-format", "mp4",
