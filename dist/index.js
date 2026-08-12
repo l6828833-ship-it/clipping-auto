@@ -1716,9 +1716,13 @@ var geminiRouter = router({
     transcript: z2.string().min(10, "Transcript is too short"),
     videoDuration: z2.number().optional(),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
-    apiKey: z2.string().min(1, "Inworld API key is required")
+    apiKey: z2.string().min(1, "Inworld API key is required"),
+    /** Pick candidates for one ranked source instead of five moments from one video. */
+    rankingMode: z2.boolean().default(false),
+    rank: z2.number().int().min(1).max(99).optional(),
+    sourceTitle: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
-    const systemPrompt = `You are an expert viral video editor and content strategist specializing in short-form content for TikTok, YouTube Shorts, and Instagram Reels.
+    const defaultSystemPrompt = `You are an expert viral video editor and content strategist specializing in short-form content for TikTok, YouTube Shorts, and Instagram Reels.
 
 Analyze the transcript and identify the TOP 5 most viral and engaging moments that would make excellent short clips (15-60 seconds each).
 
@@ -1730,7 +1734,7 @@ For each highlight, evaluate:
 - Audio energy and pacing
 
 Return ONLY valid JSON \u2014 no markdown, no code fences, no extra text.`;
-    const userPrompt = `Analyze this transcript and identify the 5 best moments for viral short-form clips.
+    const defaultUserPrompt = `Analyze this transcript and identify the 5 best moments for viral short-form clips.
 
 TRANSCRIPT:
 ${input.transcript}
@@ -1757,6 +1761,34 @@ Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT R
 2. Vary durations: mix short (15-25s), medium (25-40s), and long (40-60s). Do NOT make all clips the same length.
 3. Each startTime must be at least 30 seconds apart from any other clip's startTime.
 4. If the video is longer than 10 minutes, at least 2 clips MUST come from the second half.`;
+    const rankingMode = input.rankingMode === true;
+    const rank = input.rank ?? 1;
+    const systemPrompt = rankingMode
+      ? `You are an expert short-form ranking editor. Select the strongest self-contained video moments from ONE source for a ranked countdown reel. The selected moment must make sense without the surrounding video, open with a clear hook, and end on a payoff. Generate clean, short, all-caps display titles. Return only valid JSON.`
+      : defaultSystemPrompt;
+    const userPrompt = rankingMode
+      ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 15-60 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates.
+
+TRANSCRIPT:
+${input.transcript}
+${input.videoDuration ? `\nTotal video duration: ${Math.floor(input.videoDuration / 60)}m ${Math.floor(input.videoDuration % 60)}s` : ""}
+
+Return exactly this JSON:
+{
+  "highlights": [
+    {
+      "id": 1,
+      "title": "SHORT ALL-CAPS TITLE, MAX 8 WORDS",
+      "startTime": <integer seconds>,
+      "endTime": <integer seconds>,
+      "engagementScore": <integer 60-99>,
+      "reason": "One sentence explaining why this works at rank #${rank}"
+    }
+  ],
+  "reelTitle": "A SHORT ALL-CAPS LABEL FOR THIS RANK"
+}
+Rules: return exactly 3 highlights sorted from strongest to weakest.`
+      : defaultUserPrompt;
     try {
       const { response, modelUsed, substituted } = await inworldChatResilient({
         model: input.model,
@@ -1787,7 +1819,7 @@ Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT R
       const ordered = highlights.sort((a, b) => b.engagementScore - a.engagementScore).map((h, i) => ({ ...h, id: i + 1 }));
       return {
         highlights: ordered,
-        reelTitle: parsed.reelTitle?.trim() || "TOP MOMENTS",
+        reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : "TOP MOMENTS"),
         modelUsed,
         modelSubstituted: substituted,
         metadata: response.metadata
@@ -3222,6 +3254,77 @@ async function signJwt(payload, secret) {
   const key = new TextEncoder().encode(secret);
   return new SignJWT2(payload).setProtectedHeader({ alg: "HS256" }).setIssuedAt().setExpirationTime("30d").sign(key);
 }
+
+async function renderTop5Countdown(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new MediaError("Add at least one ranked clip before rendering.");
+  }
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) throw new MediaError(FFMPEG_MISSING);
+  await ensureDirs();
+  const fingerprint = crypto2.createHash("sha1").update(JSON.stringify(entries)).digest("hex").slice(0, 10);
+  const fileName = clipFileName(entries[0].clipId, `top5:${fingerprint}`, 0, entries.length, 1, 0, 0);
+  const outPath = path5.join(CLIPS_DIR, fileName);
+  const existing = await fs6.stat(outPath).catch(() => null);
+  if (existing?.size > 0) return { url: urlFor("clip", fileName), bytes: existing.size };
+
+  const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, "top5-"));
+  try {
+    const font = filterRelativePath(tmpDir, path5.join(FONTS_DIR, "Montserrat-Bold.ttf"));
+    const manifest = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const sourcePath = localPathFromUrl(entry.downloadUrl);
+      if (!sourcePath) throw new MediaError(`Rank ${entry.rank} has no rendered clip file. Render it first.`);
+      await fs6.access(sourcePath);
+      if (entry.showNumber || entry.showTitle) {
+        const rankText = path5.join(tmpDir, `rank-${index}.txt`);
+        const titleText = path5.join(tmpDir, `title-${index}.txt`);
+        await fs6.writeFile(rankText, entry.showNumber ? String(entry.rank) : "", "utf8");
+        await fs6.writeFile(titleText, entry.showTitle ? entry.title.trim().toUpperCase().slice(0, 72) : "", "utf8");
+        const number = entry.numberPosition || { x: 0.5, y: 0.35 };
+        const title = entry.titlePosition || { x: 0.5, y: 0.62 };
+        const accent = /^#[0-9a-fA-F]{6}$/.test(entry.accentColor || "") ? entry.accentColor : "#a3e635";
+        const filters = [];
+        if (entry.showNumber) filters.push(`drawtext=fontfile=${font}:textfile=${path5.basename(rankText)}:fontcolor=${accent}:fontsize=360:x=(${Math.round(number.x * 1080)})-text_w/2:y=(${Math.round(number.y * 1920)})-text_h/2`);
+        if (entry.showTitle) filters.push(`drawtext=fontfile=${font}:textfile=${path5.basename(titleText)}:fontcolor=white:fontsize=68:x=(${Math.round(title.x * 1080)})-text_w/2:y=(${Math.round(title.y * 1920)})-text_h/2:line_spacing=12`);
+        const introPath = path5.join(tmpDir, `intro-${index}.mp4`);
+        await runStreaming(ffmpeg, [
+          "-f", "lavfi", "-i", `color=c=0x070707:s=1080x1920:r=30:d=${entry.cardSeconds}`,
+          "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+          "-shortest", "-vf", filters.join(","),
+          "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p", "-r", "30",
+          "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-y", "-loglevel", "error", introPath
+        ], { timeout: 3e5, cwd: tmpDir });
+        manifest.push(introPath);
+      }
+      manifest.push(sourcePath);
+    }
+    /*
+     * Each source clip can have a different native frame rate. Normalise every
+     * input in a filter graph before concatenating so a 24/30/60fps mix cannot
+     * desynchronise or fail the final countdown render.
+     */
+    const inputArgs = manifest.flatMap((mediaPath) => ["-i", mediaPath]);
+    const normalised = manifest.flatMap((_, index) => [
+      `[${index}:v]fps=30,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih),setsar=1[v${index}]`,
+      `[${index}:a]aresample=48000,aformat=channel_layouts=stereo[a${index}]`
+    ]);
+    const concatInputs = manifest.map((_, index) => `[v${index}][a${index}]`).join("");
+    const graph = [...normalised, `${concatInputs}concat=n=${manifest.length}:v=1:a=1[vout][aout]`].join(";");
+    await runStreaming(ffmpeg, [
+      ...inputArgs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
+      "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr", "-g", "60",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-tag:v", "avc1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", "-y", "-loglevel", "error", outPath
+    ], { timeout: 18e5, cwd: tmpDir });
+    const stat = await fs6.stat(outPath).catch(() => null);
+    if (!stat || stat.size === 0) throw new MediaError("Top 5 rendering produced an empty file.");
+    return { url: urlFor("clip", fileName), bytes: stat.size };
+  } finally {
+    await fs6.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 var appRouter = router({
   system: systemRouter,
   // ─── GEMINI AI ────────────────────────────────────────────────────────────
@@ -4080,6 +4183,34 @@ var appRouter = router({
     })).mutation(async ({ input, ctx }) => {
       await updateClip(input.id, { status: input.status, downloadUrl: input.downloadUrl, thumbnailUrl: input.thumbnailUrl });
       return { success: true };
+    })
+  }),
+  // ─── TOP 5 RANKED VIDEO ─────────────────────────────────────────────────
+  top5: router({
+    compose: protectedProcedure.input(z4.object({
+      entries: z4.array(z4.object({
+        clipId: z4.number().int().positive(),
+        rank: z4.number().int().min(1).max(99),
+        title: z4.string().max(72).default(""),
+        showNumber: z4.boolean().default(true),
+        showTitle: z4.boolean().default(true),
+        numberPosition: z4.object({ x: z4.number().min(0).max(1), y: z4.number().min(0).max(1) }).optional(),
+        titlePosition: z4.object({ x: z4.number().min(0).max(1), y: z4.number().min(0).max(1) }).optional(),
+        cardSeconds: z4.number().min(0.5).max(3).default(1.2),
+        accentColor: z4.string().max(16).default("#a3e635")
+      })).min(1).max(5)
+    })).mutation(async ({ input, ctx }) => {
+      const owned = await getClipsByUser(ctx.user.id);
+      const entries = input.entries.map((entry) => {
+        const clip = owned.find((item) => item.id === entry.clipId);
+        if (!clip || clip.status !== "done" || !clip.downloadUrl) {
+          throw new TRPCError5({ code: "PRECONDITION_FAILED", message: `Rank ${entry.rank} is not rendered yet. Render each selected clip before creating the Top 5 video.` });
+        }
+        return { ...entry, downloadUrl: clip.downloadUrl };
+      }).sort((a, b) => b.rank - a.rank);
+      const result = await renderTop5Countdown(entries);
+      console.log(`[Top5] Rendered ${entries.length} ranked clips (${Math.round(result.bytes / 1024 / 1024)} MB) → ${result.url}`);
+      return { success: true, ...result };
     })
   }),
   // ─── SUBTITLES ───────────────────────────────────────────────────────────

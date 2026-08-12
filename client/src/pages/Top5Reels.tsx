@@ -1,351 +1,492 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import AppLayout from "@/components/AppLayout";
+import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import {
-  Check,
+  CheckCircle2,
+  ChevronDown,
   Download,
-  Play,
-  RotateCcw,
+  GripVertical,
+  Link2,
+  Loader2,
   Sparkles,
-  TimerReset,
+  Trash2,
+  Video,
+  Wand2,
 } from "lucide-react";
 
-interface RankItem {
+type Point = { x: number; y: number };
+type Candidate = {
   id: number;
-  rank: number;
-  text: string;
-}
-
-const DEFAULT_RANKS: RankItem[] = [
-  { id: 5, rank: 5, text: "Fifth moment" },
-  { id: 4, rank: 4, text: "Fourth moment" },
-  { id: 3, rank: 3, text: "Third moment" },
-  { id: 2, rank: 2, text: "Second moment" },
-  { id: 1, rank: 1, text: "Best moment" },
-];
-
-const ACCENT_COLORS = [
-  { name: "Signal red", value: "#ef4444" },
-  { name: "Acid green", value: "#a3e635" },
-  { name: "Electric blue", value: "#38bdf8" },
-  { name: "Gold", value: "#facc15" },
-  { name: "Violet", value: "#a78bfa" },
-];
-
-function splitHeadline(title: string, accentWord: string) {
-  const cleanTitle = title.trim() || "YOUR TOP 5";
-  const cleanAccent = accentWord.trim();
-
-  if (!cleanAccent) {
-    return <span>{cleanTitle}</span>;
-  }
-
-  const expression = new RegExp(`(${cleanAccent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "ig");
-  return cleanTitle.split(expression).map((part, index) =>
-    part.toLowerCase() === cleanAccent.toLowerCase() ? (
-      <span key={`${part}-${index}`} className="text-[var(--rank-accent)]">{part}</span>
-    ) : (
-      <span key={`${part}-${index}`}>{part}</span>
-    ),
-  );
-}
-
-function TextOnlyPreview({
-  title,
-  accentWord,
-  accentColor,
-  ranks,
-  activeRank,
-}: {
   title: string;
-  accentWord: string;
-  accentColor: string;
-  ranks: RankItem[];
-  activeRank: number | null;
+  startTime: number;
+  endTime: number;
+  engagementScore: number;
+  reason: string;
+};
+type RankState = "idle" | "analyzing" | "ready" | "error" | "rendering" | "rendered";
+
+type RankEntry = {
+  id: string;
+  rank: number;
+  url: string;
+  sourceTitle: string;
+  videoId?: number;
+  duration?: number;
+  transcript?: string;
+  candidates: Candidate[];
+  selectedId?: number;
+  title: string;
+  showNumber: boolean;
+  showTitle: boolean;
+  numberPosition: Point;
+  titlePosition: Point;
+  cardSeconds: number;
+  state: RankState;
+  error?: string;
+  clipId?: number;
+};
+
+const MODEL = "openai/gpt-4o-mini";
+const API_KEY = "server";
+const ACCENTS = ["#a3e635", "#facc15", "#38bdf8", "#f472b6", "#fb7185"];
+
+const createRank = (rank: number): RankEntry => ({
+  id: `rank-${rank}`,
+  rank,
+  url: "",
+  sourceTitle: "",
+  candidates: [],
+  title: "",
+  showNumber: true,
+  showTitle: true,
+  numberPosition: { x: 0.5, y: 0.34 },
+  titlePosition: { x: 0.5, y: 0.62 },
+  cardSeconds: 1.2,
+  state: "idle",
+});
+
+const initialRanks = [5, 4, 3, 2, 1].map(createRank);
+
+function timecode(seconds: number) {
+  const value = Math.max(0, Math.round(seconds || 0));
+  const mins = Math.floor(value / 60);
+  return `${mins}:${String(value % 60).padStart(2, "0")}`;
+}
+
+function sourceLabel(url: string) {
+  const value = url.toLowerCase();
+  if (value.includes("youtube.com") || value.includes("youtu.be")) return "YouTube";
+  if (value.includes("tiktok.com")) return "TikTok";
+  if (value.includes("x.com") || value.includes("twitter.com")) return "X";
+  return "Video link";
+}
+
+function stateCopy(state: RankState) {
+  if (state === "analyzing") return "Analysing source";
+  if (state === "ready") return "Best clip selected";
+  if (state === "rendering") return "Rendering clip";
+  if (state === "rendered") return "Ready for final video";
+  if (state === "error") return "Needs attention";
+  return "Add a source";
+}
+
+function RankIntroPreview({
+  entry,
+  accent,
+  onMove,
+}: {
+  entry: RankEntry;
+  accent: string;
+  onMove: (kind: "number" | "title", point: Point) => void;
 }) {
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState<"number" | "title" | null>(null);
+
+  const move = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragging || !frameRef.current) return;
+    const box = frameRef.current.getBoundingClientRect();
+    onMove(dragging, {
+      x: Math.max(0.06, Math.min(0.94, (event.clientX - box.left) / box.width)),
+      y: Math.max(0.08, Math.min(0.92, (event.clientY - box.top) / box.height)),
+    });
+  };
+
+  const startDrag = (event: ReactPointerEvent<HTMLButtonElement>, kind: "number" | "title") => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDragging(kind);
+  };
+
   return (
     <div
-      className="relative isolate aspect-[9/16] w-full max-w-[280px] overflow-hidden rounded-[1.75rem] bg-black text-white shadow-2xl"
-      style={{ "--rank-accent": accentColor } as React.CSSProperties}
+      ref={frameRef}
+      onPointerMove={move}
+      onPointerUp={() => setDragging(null)}
+      onPointerCancel={() => setDragging(null)}
+      className="relative aspect-[9/16] w-full overflow-hidden rounded-[1.5rem] bg-[#070707] shadow-2xl"
+      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #111 0%, #050505 76%)" }}
     >
-      <div className="absolute inset-x-0 top-0 h-1 bg-[var(--rank-accent)]" />
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_83%_16%,rgba(255,255,255,0.10),transparent_26%),linear-gradient(180deg,#090909_0%,#000_74%)]" />
-
-      <div className="relative flex h-full flex-col px-[10%] pb-[9%] pt-[12%]">
-        <p className="mb-2 font-mono text-[8px] font-semibold uppercase tracking-[0.28em] text-white/55">
-          COUNTDOWN
-        </p>
-        <h3 className="max-w-full text-[25px] font-black uppercase leading-[0.91] tracking-[-0.075em]">
-          {splitHeadline(title, accentWord)}
-        </h3>
-
-        <div className="mt-auto space-y-3.5">
-          {ranks.map((item) => {
-            const active = activeRank === item.rank;
-            return (
-              <div
-                key={item.id}
-                className="group flex items-center gap-3 transition-all duration-300"
-                style={{
-                  opacity: activeRank === null || active ? 1 : 0.42,
-                  transform: active ? "translateX(4px)" : "translateX(0)",
-                }}
-              >
-                <span
-                  className="w-[29px] shrink-0 text-center text-[42px] font-black leading-none tracking-[-0.12em]"
-                  style={{
-                    color: active ? accentColor : "transparent",
-                    WebkitTextStroke: active ? "0" : "1.5px rgba(255,255,255,0.96)",
-                    textShadow: active ? `0 0 20px ${accentColor}75` : "none",
-                  }}
-                >
-                  {item.rank}
-                </span>
-                <span className="min-w-0 text-[16px] font-extrabold uppercase leading-tight tracking-[-0.04em] text-white">
-                  {item.text.trim() || `Rank ${item.rank}`}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="mt-7 flex items-center gap-2 font-mono text-[7px] font-medium uppercase tracking-[0.2em] text-white/38">
-          <span className="h-px flex-1 bg-white/15" />
-          TEXT ONLY TEMPLATE
-          <span className="h-px flex-1 bg-white/15" />
-        </div>
+      <div className="absolute inset-x-0 top-0 h-1" style={{ background: accent }} />
+      <div className="absolute bottom-4 left-5 right-5 rounded-lg border border-white/10 bg-black/35 px-3 py-2 text-center font-mono text-[8px] uppercase tracking-[0.18em] text-white/45 backdrop-blur-sm">
+        Title card before rank {entry.rank} clip
       </div>
+
+      {entry.showNumber && (
+        <button
+          type="button"
+          onPointerDown={(event) => startDrag(event, "number")}
+          className="group absolute z-10 cursor-grab touch-none select-none active:cursor-grabbing"
+          style={{ left: `${entry.numberPosition.x * 100}%`, top: `${entry.numberPosition.y * 100}%`, transform: "translate(-50%, -50%)" }}
+          aria-label="Drag rank number"
+        >
+          <span className="block rounded-xl border border-white/15 bg-black/15 px-3 py-1 text-[82px] font-black leading-none tracking-[-0.12em] shadow-2xl transition group-hover:border-white/50" style={{ color: accent }}>
+            {entry.rank}
+          </span>
+          <span className="absolute -right-5 -top-3 hidden rounded bg-white px-1 py-0.5 text-[8px] text-black group-hover:block"><GripVertical className="h-2.5 w-2.5" /></span>
+        </button>
+      )}
+
+      {entry.showTitle && (
+        <button
+          type="button"
+          onPointerDown={(event) => startDrag(event, "title")}
+          className="group absolute z-10 max-w-[82%] cursor-grab touch-none select-none active:cursor-grabbing"
+          style={{ left: `${entry.titlePosition.x * 100}%`, top: `${entry.titlePosition.y * 100}%`, transform: "translate(-50%, -50%)" }}
+          aria-label="Drag title"
+        >
+          <span className="block rounded-lg border border-white/12 bg-black/25 px-2 py-1.5 text-center text-[17px] font-black uppercase leading-[0.94] tracking-[-0.06em] text-white shadow-xl transition group-hover:border-white/50">
+            {entry.title.trim() || "AUTO TITLE"}
+          </span>
+          <span className="absolute -right-4 -top-2 hidden rounded bg-white px-1 py-0.5 text-[8px] text-black group-hover:block"><GripVertical className="h-2.5 w-2.5" /></span>
+        </button>
+      )}
     </div>
   );
 }
 
 export default function Top5ReelsPage() {
-  const [ranks, setRanks] = useState<RankItem[]>(DEFAULT_RANKS);
-  const [title, setTitle] = useState("TOP 5 INSANE MOMENTS");
-  const [accentWord, setAccentWord] = useState("INSANE");
-  const [accentColor, setAccentColor] = useState("#a3e635");
-  const [activeRank, setActiveRank] = useState<number | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
+  const [ranks, setRanks] = useState<RankEntry[]>(initialRanks);
+  const [activeRank, setActiveRank] = useState(5);
+  const [accent, setAccent] = useState(ACCENTS[0]);
+  const [finalUrl, setFinalUrl] = useState<string | null>(null);
+  const [isRenderingFinal, setIsRenderingFinal] = useState(false);
+  const utils = trpc.useUtils();
 
-  const completedCount = useMemo(
-    () => ranks.filter((item) => item.text.trim().length > 0).length,
-    [ranks],
-  );
+  const extract = trpc.extract.transcribe.useMutation();
+  const createVideo = trpc.videos.create.useMutation();
+  const detectHighlights = trpc.gemini.detectHighlights.useMutation();
+  const createClip = trpc.clips.create.useMutation();
+  const renderClip = trpc.clips.render.useMutation();
+  const composeTop5 = trpc.top5.compose.useMutation();
 
-  useEffect(() => {
-    if (!isPlaying) return;
+  const active = ranks.find((entry) => entry.rank === activeRank) ?? ranks[0];
+  const completed = useMemo(() => ranks.filter((entry) => entry.selectedId != null).length, [ranks]);
 
-    let step = 0;
-    const orderedRanks = ranks.map((item) => item.rank);
-    setActiveRank(orderedRanks[0] ?? null);
+  const patchRank = (rank: number, patch: Partial<RankEntry>) => {
+    setRanks((current) => current.map((entry) => entry.rank === rank ? { ...entry, ...patch } : entry));
+  };
 
-    const interval = window.setInterval(() => {
-      step += 1;
-      if (step >= orderedRanks.length) {
-        window.clearInterval(interval);
-        setIsPlaying(false);
-        setActiveRank(null);
+  const selectedCandidate = (entry: RankEntry) => entry.candidates.find((candidate) => candidate.id === entry.selectedId) ?? entry.candidates[0];
+
+  const analyseRank = async (rank: number) => {
+    const entry = ranks.find((item) => item.rank === rank);
+    if (!entry?.url.trim()) {
+      toast.error(`Paste a YouTube, TikTok, or X link for rank ${rank}.`);
+      return;
+    }
+
+    setFinalUrl(null);
+    patchRank(rank, { state: "analyzing", error: undefined, candidates: [], selectedId: undefined, clipId: undefined });
+    try {
+      const source: any = await extract.mutateAsync({
+        url: entry.url.trim(),
+        apiKey: API_KEY,
+        language: "en",
+        allowSpeechToText: true,
+      });
+      const sourceTitle = source.title || `Rank ${rank} source`;
+      const transcript = String(source.transcript || "").trim();
+      if (transcript.length < 10) {
+        throw new Error("No usable transcript was returned. Choose another source or use a video with speech/captions.");
+      }
+
+      const created: any = await createVideo.mutateAsync({
+        title: sourceTitle,
+        sourceType: "url",
+        sourceUrl: entry.url.trim(),
+        transcript,
+        duration: source.duration || undefined,
+        transcriptWords: source.words?.length ? source.words : undefined,
+        transcriptionEnabled: true,
+      });
+
+      const analysis: any = await detectHighlights.mutateAsync({
+        transcript,
+        videoDuration: source.duration || undefined,
+        model: MODEL,
+        apiKey: API_KEY,
+        rankingMode: true,
+        rank,
+        sourceTitle,
+      });
+      const candidates: Candidate[] = (analysis.highlights || []).slice(0, 3);
+      if (!candidates.length) throw new Error("The AI did not return a usable highlight from this source.");
+      const best = candidates[0];
+      patchRank(rank, {
+        videoId: created.id,
+        sourceTitle,
+        duration: source.duration || 0,
+        transcript,
+        candidates,
+        selectedId: best.id,
+        title: best.title,
+        state: "ready",
+      });
+      toast.success(`Rank ${rank}: selected a best clip and generated its title.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not analyse this source.";
+      patchRank(rank, { state: "error", error: message });
+      toast.error(`Rank ${rank}: ${message}`);
+    }
+  };
+
+  const analyseAll = async () => {
+    for (const entry of [...ranks].sort((a, b) => b.rank - a.rank)) {
+      if (!entry.url.trim()) {
+        toast.error(`Add a source link for rank ${entry.rank} before analysing all videos.`);
         return;
       }
-      setActiveRank(orderedRanks[step]);
-    }, 950);
+    }
+    for (const entry of [...ranks].sort((a, b) => b.rank - a.rank)) {
+      await analyseRank(entry.rank);
+    }
+  };
 
-    return () => window.clearInterval(interval);
-  }, [isPlaying, ranks]);
+  const chooseCandidate = (rank: number, candidate: Candidate) => {
+    patchRank(rank, { selectedId: candidate.id, title: candidate.title, clipId: undefined, state: "ready" });
+    setFinalUrl(null);
+  };
 
-  const updateRank = (id: number, text: string) => {
-    setRanks((current) => current.map((item) => (item.id === id ? { ...item, text } : item)));
+  const waitForClip = async (clipId: number) => {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      const clips: any[] = await (utils.clips.list as any).fetch();
+      const current = clips.find((clip) => clip.id === clipId);
+      if (current?.status === "done" && current.downloadUrl) return current;
+      if (current?.status === "error") throw new Error(current.errorMessage || "Clip rendering failed.");
+    }
+    throw new Error("Clip rendering timed out. Check the Clips page for progress.");
+  };
+
+  const renderFinal = async () => {
+    const ordered = [...ranks].sort((a, b) => b.rank - a.rank);
+    const missing = ordered.find((entry) => !entry.videoId || !selectedCandidate(entry));
+    if (missing) {
+      toast.error(`Analyse and choose a clip for rank ${missing.rank} first.`);
+      return;
+    }
+
+    setIsRenderingFinal(true);
+    setFinalUrl(null);
+    try {
+      const built: Array<{ entry: RankEntry; clipId: number }> = [];
+      for (const snapshot of ordered) {
+        const candidate = selectedCandidate(snapshot)!;
+        patchRank(snapshot.rank, { state: "rendering", error: undefined });
+        let clipId = snapshot.clipId;
+        if (!clipId) {
+          const created: any = await createClip.mutateAsync({
+            videoId: snapshot.videoId!,
+            title: snapshot.title.trim() || candidate.title,
+            startTime: candidate.startTime,
+            endTime: candidate.endTime,
+            engagementScore: candidate.engagementScore,
+          });
+          clipId = created.id;
+          patchRank(snapshot.rank, { clipId });
+        }
+        await renderClip.mutateAsync({ id: clipId, captionsEnabled: true });
+        await waitForClip(clipId);
+        patchRank(snapshot.rank, { clipId, state: "rendered" });
+        built.push({ entry: snapshot, clipId });
+      }
+
+      const output: any = await composeTop5.mutateAsync({
+        entries: built.map(({ entry, clipId }) => ({
+          clipId,
+          rank: entry.rank,
+          title: entry.title.trim(),
+          showNumber: entry.showNumber,
+          showTitle: entry.showTitle,
+          numberPosition: entry.numberPosition,
+          titlePosition: entry.titlePosition,
+          cardSeconds: entry.cardSeconds,
+          accentColor: accent,
+        })),
+      });
+      setFinalUrl(output.url);
+      toast.success("Your Top 5 video is ready to download.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not render the Top 5 video.");
+    } finally {
+      setIsRenderingFinal(false);
+      await (utils.clips.list as any).invalidate();
+    }
   };
 
   const reset = () => {
-    setRanks(DEFAULT_RANKS);
-    setTitle("TOP 5 INSANE MOMENTS");
-    setAccentWord("INSANE");
-    setAccentColor("#a3e635");
-    setActiveRank(null);
-    setIsPlaying(false);
-    toast.info("The Top 5 layout has been reset.");
-  };
-
-  const downloadLayout = () => {
-    const layout = {
-      template: "minimal-text-top-5",
-      aspectRatio: "9:16",
-      title,
-      accentWord,
-      accentColor,
-      order: ranks.map(({ rank, text }) => ({ rank, text })),
-    };
-    const blob = new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "top-5-text-layout.json";
-    anchor.click();
-    URL.revokeObjectURL(url);
-    toast.success("Top 5 text layout saved.");
+    setRanks(initialRanks);
+    setActiveRank(5);
+    setFinalUrl(null);
+    setAccent(ACCENTS[0]);
   };
 
   return (
     <AppLayout title="Top 5 Reels">
-      <div className="mx-auto max-w-6xl">
+      <div className="mx-auto max-w-7xl pb-10">
         <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
           <div>
-            <div className="mb-2 flex items-center gap-2 font-mono text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              <Sparkles className="h-3.5 w-3.5" style={{ color: accentColor }} />
-              Minimal text template
-            </div>
-            <h2 className="text-3xl font-black tracking-[-0.06em] text-foreground sm:text-4xl">
-              Top 5 Countdown
-            </h2>
-            <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-              Create a clean 5-to-1 ranking overlay with only headline text, numbered rows, and one accent color.
+            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-primary">Ranked video builder</p>
+            <h1 className="text-3xl font-black tracking-[-0.06em] text-foreground sm:text-4xl">Top 5 Video Countdown</h1>
+            <p className="mt-2 max-w-3xl text-sm leading-relaxed text-muted-foreground">
+              Add one YouTube, TikTok, or X video for each rank. The same AI used in Create picks the strongest clip from every source using a ranking-specific prompt, generates the label, and builds one high-quality 5-to-1 export.
             </p>
           </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={reset}
-              className="inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Reset
-            </button>
-            <button
-              type="button"
-              onClick={downloadLayout}
-              className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2.5 text-sm font-bold text-foreground transition-colors hover:border-foreground/25"
-            >
-              <Download className="h-4 w-4" />
-              Save layout
-            </button>
-          </div>
+          <button type="button" onClick={reset} className="inline-flex items-center gap-2 rounded-xl border border-border bg-card px-4 py-2.5 text-sm font-bold text-foreground transition hover:border-foreground/30">
+            <Trash2 className="h-4 w-4" /> Clear project
+          </button>
         </header>
 
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
           <section className="space-y-5">
             <div className="glass rounded-2xl p-5 sm:p-6">
-              <div className="mb-5 flex items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-bold text-foreground">Copy</p>
-                  <p className="mt-1 text-xs text-muted-foreground">Keep every line short so it stays legible in a vertical short.</p>
+                  <h2 className="text-base font-black text-foreground">1. Add five ranked sources</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">Every rank uses its own source. Links are analysed first; only the selected highlight is downloaded for final rendering.</p>
                 </div>
-                <span className="rounded-full bg-secondary px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                  {completedCount}/5 rows
-                </span>
-              </div>
-
-              <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_180px]">
-                <label className="block">
-                  <span className="mb-2 block text-xs font-semibold text-foreground">Headline</span>
-                  <input
-                    value={title}
-                    onChange={(event) => setTitle(event.target.value.toUpperCase())}
-                    maxLength={56}
-                    placeholder="TOP 5 INSANE MOMENTS"
-                    className="w-full rounded-xl border border-border bg-input px-3.5 py-3 text-sm font-bold uppercase tracking-[-0.02em] text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
-                  />
-                </label>
-                <label className="block">
-                  <span className="mb-2 block text-xs font-semibold text-foreground">Accent word</span>
-                  <input
-                    value={accentWord}
-                    onChange={(event) => setAccentWord(event.target.value.toUpperCase())}
-                    maxLength={18}
-                    placeholder="INSANE"
-                    className="w-full rounded-xl border border-border bg-input px-3.5 py-3 text-sm font-bold uppercase tracking-[-0.02em] text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
-                  />
-                </label>
-              </div>
-            </div>
-
-            <div className="glass rounded-2xl p-5 sm:p-6">
-              <div className="mb-4 flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-bold text-foreground">Countdown lines</p>
-                  <p className="mt-1 text-xs text-muted-foreground">The order is locked from 5 down to 1 for a natural reveal.</p>
-                </div>
-                <TimerReset className="h-4 w-4" style={{ color: accentColor }} />
-              </div>
-
-              <div className="divide-y divide-border rounded-xl border border-border bg-card">
-                {ranks.map((item) => (
-                  <label key={item.id} className="flex items-center gap-4 px-4 py-3.5 transition-colors focus-within:bg-secondary/35">
-                    <span
-                      className="w-9 text-center text-3xl font-black leading-none tracking-[-0.12em]"
-                      style={{ color: item.rank === 1 ? accentColor : "var(--foreground)" }}
-                    >
-                      {item.rank}
-                    </span>
-                    <input
-                      value={item.text}
-                      onChange={(event) => updateRank(item.id, event.target.value)}
-                      maxLength={42}
-                      placeholder={`Rank ${item.rank} text`}
-                      className="min-w-0 flex-1 bg-transparent py-1 text-sm font-bold uppercase tracking-[-0.02em] text-foreground outline-none placeholder:text-muted-foreground/55"
-                    />
-                    {item.text.trim() && <Check className="h-4 w-4 shrink-0" style={{ color: accentColor }} />}
-                  </label>
-                ))}
-              </div>
-            </div>
-
-            <div className="glass rounded-2xl p-5 sm:p-6">
-              <p className="mb-3 text-sm font-bold text-foreground">Accent</p>
-              <div className="flex flex-wrap gap-2.5">
-                {ACCENT_COLORS.map((color) => (
-                  <button
-                    key={color.value}
-                    type="button"
-                    onClick={() => setAccentColor(color.value)}
-                    title={color.name}
-                    aria-label={`Use ${color.name} accent`}
-                    className="flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold transition-all"
-                    style={{
-                      borderColor: accentColor === color.value ? color.value : "var(--border)",
-                      background: accentColor === color.value ? `${color.value}18` : "transparent",
-                      color: accentColor === color.value ? color.value : "var(--muted-foreground)",
-                    }}
-                  >
-                    <span className="h-3 w-3 rounded-full" style={{ background: color.value }} />
-                    {color.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          <aside className="lg:sticky lg:top-6 lg:h-fit">
-            <div className="glass rounded-2xl p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-bold text-foreground">Live preview</p>
-                  <p className="mt-1 text-xs text-muted-foreground">1080 × 1920 composition</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setIsPlaying((current) => !current)}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold text-black transition-transform hover:scale-[1.02]"
-                  style={{ background: accentColor }}
-                >
-                  <Play className="h-3.5 w-3.5 fill-current" />
-                  {isPlaying ? "Playing" : "Preview"}
+                <button type="button" onClick={analyseAll} disabled={extract.isPending || detectHighlights.isPending} className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45" style={{ background: accent }}>
+                  {extract.isPending || detectHighlights.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
+                  Analyse all 5
                 </button>
               </div>
 
-              <div className="mx-auto flex justify-center">
-                <TextOnlyPreview
-                  title={title}
-                  accentWord={accentWord}
-                  accentColor={accentColor}
-                  ranks={ranks}
-                  activeRank={activeRank}
-                />
+              <div className="mt-5 space-y-3">
+                {ranks.map((entry) => (
+                  <div key={entry.id} className={`rounded-2xl border p-3 transition ${activeRank === entry.rank ? "border-primary/60 bg-primary/[0.035]" : "border-border bg-card/40"}`}>
+                    <div className="flex gap-3">
+                      <button type="button" onClick={() => setActiveRank(entry.rank)} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-xl font-black text-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>
+                        {entry.rank}
+                      </button>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-xs font-bold uppercase tracking-[0.12em] text-muted-foreground">Rank {entry.rank} · {sourceLabel(entry.url)}</p>
+                          <span className={`text-[11px] font-semibold ${entry.state === "error" ? "text-destructive" : entry.state === "ready" || entry.state === "rendered" ? "text-emerald-500" : "text-muted-foreground"}`}>{stateCopy(entry.state)}</span>
+                        </div>
+                        <div className="mt-2 flex gap-2">
+                          <div className="relative min-w-0 flex-1">
+                            <Link2 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                            <input value={entry.url} onFocus={() => setActiveRank(entry.rank)} onChange={(event) => patchRank(entry.rank, { url: event.target.value, state: "idle", candidates: [], selectedId: undefined, clipId: undefined, error: undefined })} placeholder="Paste YouTube, TikTok, or X video link" className="w-full rounded-xl border border-border bg-input py-2.5 pl-9 pr-3 text-sm text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20" />
+                          </div>
+                          <button type="button" onClick={() => analyseRank(entry.rank)} disabled={!entry.url.trim() || entry.state === "analyzing"} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-secondary px-3 py-2 text-xs font-bold text-foreground transition hover:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-50">
+                            {entry.state === "analyzing" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />} Analyse
+                          </button>
+                        </div>
+                        {entry.sourceTitle && <p className="mt-2 truncate text-xs font-semibold text-foreground">{entry.sourceTitle}{entry.duration ? <span className="font-normal text-muted-foreground"> · {timecode(entry.duration)}</span> : null}</p>}
+                        {entry.error && <p className="mt-2 text-xs text-destructive">{entry.error}</p>}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="glass rounded-2xl p-5 sm:p-6">
+              <div className="mb-4 flex items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-base font-black text-foreground">2. Choose the best clip for rank {active.rank}</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">The first choice is selected automatically. Choose another candidate if you prefer.</p>
+                </div>
+                <span className="rounded-full bg-secondary px-3 py-1.5 text-xs font-bold text-muted-foreground">{completed}/5 ready</span>
               </div>
 
-              <div className="mt-4 rounded-xl border border-border bg-secondary/35 p-3 text-xs leading-relaxed text-muted-foreground">
-                <strong className="font-semibold text-foreground">Text-only by design.</strong> This template leaves the video fully visible and adds no image card, background image, or decorative clip panel.
+              {active.candidates.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">Analyse rank {active.rank} to receive AI-selected moments from that source.</div>
+              ) : (
+                <div className="space-y-3">
+                  {active.candidates.map((candidate, index) => {
+                    const selected = active.selectedId === candidate.id;
+                    return (
+                      <button key={candidate.id} type="button" onClick={() => chooseCandidate(active.rank, candidate)} className={`w-full rounded-xl border p-4 text-left transition ${selected ? "border-primary bg-primary/[0.06]" : "border-border bg-card hover:border-foreground/25"}`}>
+                        <div className="flex items-start gap-3">
+                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-black" style={{ background: selected ? accent : "var(--secondary)", color: selected ? "black" : "var(--foreground)" }}>{index + 1}</span>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <p className="font-black uppercase tracking-[-0.03em] text-foreground">{candidate.title}</p>
+                              <span className="font-mono text-xs text-muted-foreground">{timecode(candidate.startTime)}–{timecode(candidate.endTime)}</span>
+                            </div>
+                            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{candidate.reason}</p>
+                          </div>
+                          {selected && <CheckCircle2 className="h-5 w-5 shrink-0" style={{ color: accent }} />}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="glass rounded-2xl p-5 sm:p-6">
+              <div className="mb-4">
+                <h2 className="text-base font-black text-foreground">3. Intro card before rank {active.rank} plays</h2>
+                <p className="mt-1 text-xs text-muted-foreground">The card is separate from the source clip. Drag the number and generated title in the preview; each element can be removed from that rank.</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold text-foreground">Generated title</span>
+                  <input value={active.title} onChange={(event) => patchRank(active.rank, { title: event.target.value.toUpperCase(), clipId: undefined })} maxLength={72} placeholder="Generated after clip selection" className="w-full rounded-xl border border-border bg-input px-3 py-2.5 text-sm font-black uppercase text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20" />
+                </label>
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold text-foreground">Card duration</span>
+                  <select value={active.cardSeconds} onChange={(event) => patchRank(active.rank, { cardSeconds: Number(event.target.value) })} className="w-full rounded-xl border border-border bg-input px-3 py-2.5 text-sm font-semibold text-foreground outline-none focus:border-primary">
+                    <option value={0.8}>0.8 seconds</option><option value={1.2}>1.2 seconds</option><option value={1.6}>1.6 seconds</option><option value={2}>2.0 seconds</option>
+                  </select>
+                </label>
+              </div>
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button type="button" onClick={() => patchRank(active.rank, { showNumber: !active.showNumber })} className={`rounded-xl border px-3 py-2 text-xs font-bold transition ${active.showNumber ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"}`}>{active.showNumber ? "Remove number" : "Add number"}</button>
+                <button type="button" onClick={() => patchRank(active.rank, { showTitle: !active.showTitle })} className={`rounded-xl border px-3 py-2 text-xs font-bold transition ${active.showTitle ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"}`}>{active.showTitle ? "Remove title" : "Add title"}</button>
+                <div className="ml-auto flex items-center gap-2 text-xs font-semibold text-muted-foreground"><span>Accent</span>{ACCENTS.map((color) => <button key={color} type="button" onClick={() => setAccent(color)} className="h-6 w-6 rounded-full border-2 transition" style={{ background: color, borderColor: accent === color ? "white" : "transparent" }} aria-label={`Use ${color} accent`} />)}</div>
+              </div>
+            </div>
+
+            <div className="glass rounded-2xl p-5 sm:p-6">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-base font-black text-foreground">4. Render the complete Top 5 video</h2>
+                  <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">The renderer downloads only the selected ranges at the best available source quality, crops each clip to 1080 × 1920, renders the title card before it, then exports one H.264 high-quality MP4.</p>
+                </div>
+                <button type="button" onClick={renderFinal} disabled={isRenderingFinal || completed !== 5} className="inline-flex items-center gap-2 rounded-xl px-5 py-3 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: accent }}>
+                  {isRenderingFinal ? <Loader2 className="h-4 w-4 animate-spin" /> : <Video className="h-4 w-4" />}
+                  {isRenderingFinal ? "Rendering Top 5…" : "Render high-quality video"}
+                </button>
+              </div>
+              {finalUrl && <a href={finalUrl} download className="mt-4 flex items-center justify-between rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 text-sm font-bold text-foreground transition hover:bg-emerald-500/15"><span className="flex items-center gap-2"><CheckCircle2 className="h-5 w-5 text-emerald-500" /> Your Top 5 video is ready</span><span className="flex items-center gap-2 text-emerald-500"><Download className="h-4 w-4" /> Download MP4</span></a>}
+            </div>
+          </section>
+
+          <aside className="xl:sticky xl:top-6 xl:h-fit">
+            <div className="glass rounded-2xl p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div><p className="text-sm font-black text-foreground">Rank {active.rank} title card</p><p className="mt-1 text-xs text-muted-foreground">Drag text directly in the preview.</p></div>
+                <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
+              </div>
+              <RankIntroPreview entry={active} accent={accent} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <div className="mt-4 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">This preview represents the separate intro card shown immediately before the selected source clip. It does not cover the actual clip while it plays.</div>
+              <div className="mt-4 divide-y divide-border rounded-xl border border-border bg-card">
+                {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
               </div>
             </div>
           </aside>
