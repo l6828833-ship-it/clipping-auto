@@ -1783,7 +1783,7 @@ Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT R
       ? `You are an expert short-form ranking editor. Select the strongest self-contained video moments from ONE source for a ranked countdown reel. The selected moment must make sense without the surrounding video, open with a clear hook, and end on a payoff. Generate clean, short, all-caps display titles. Return only valid JSON.`
       : defaultSystemPrompt;
     const userPrompt = rankingMode
-      ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 15-60 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates.
+      ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 8-15 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates.
 
 TRANSCRIPT:
 ${input.transcript}
@@ -1803,7 +1803,7 @@ Return exactly this JSON:
   ],
   "reelTitle": "A SHORT ALL-CAPS LABEL FOR THIS RANK"
 }
-Rules: return exactly 3 highlights sorted from strongest to weakest.`
+Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTime must be no more than 15 seconds after its startTime.`
       : defaultUserPrompt;
     try {
       const { response, modelUsed, substituted } = await inworldChatResilient({
@@ -4322,6 +4322,10 @@ var appRouter = router({
         const clip = owned.find((item) => item.id === entry.clipId);
         if (!clip || clip.status !== "done" || !clip.downloadUrl) {
           throw new TRPCError5({ code: "PRECONDITION_FAILED", message: `Rank ${entry.rank} is not rendered yet. Render each selected clip before creating the Top 5 video.` });
+        }
+        const clipDuration = (clip.endTime ?? 0) - (clip.startTime ?? 0);
+        if (!Number.isFinite(clipDuration) || clipDuration <= 0 || clipDuration > 15.1) {
+          throw new TRPCError5({ code: "BAD_REQUEST", message: `Rank ${entry.rank} must use a clip of 15 seconds or less.` });
         }
         return { ...entry, downloadUrl: clip.downloadUrl };
       }).sort((a, b) => b.rank - a.rank);

@@ -52,6 +52,9 @@ type RankEntry = {
   clipUrl?: string;
   /** Hosted source media URL, available before the final clip export finishes. */
   hostedUrl?: string;
+  /** User-defined full-video timestamp and duration for a custom short clip. */
+  customStart?: number;
+  customDuration?: number;
 };
 
 const MODEL = "openai/gpt-4o-mini";
@@ -74,6 +77,14 @@ const createRank = (rank: number): RankEntry => ({
 });
 
 const initialRanks = [5, 4, 3, 2, 1].map(createRank);
+const MAX_TOP5_CLIP_SECONDS = 15;
+
+function limitToShortClip(candidate: Candidate, sourceDuration?: number): Candidate {
+  const startTime = Math.max(0, Number(candidate.startTime) || 0);
+  const availableEnd = sourceDuration && sourceDuration > 0 ? sourceDuration : Infinity;
+  const endTime = Math.min(availableEnd, startTime + MAX_TOP5_CLIP_SECONDS, Math.max(startTime + 1, Number(candidate.endTime) || startTime + MAX_TOP5_CLIP_SECONDS));
+  return { ...candidate, startTime, endTime: Math.max(startTime + 1, endTime) };
+}
 
 function timecode(seconds: number) {
   const value = Math.max(0, Math.round(seconds || 0));
@@ -219,12 +230,57 @@ export default function Top5ReelsPage() {
 
   const active = ranks.find((entry) => entry.rank === activeRank) ?? ranks[0];
   const completed = useMemo(() => ranks.filter((entry) => entry.selectedId != null).length, [ranks]);
+  const rankCount = ranks.length;
 
   const patchRank = (rank: number, patch: Partial<RankEntry>) => {
     setRanks((current) => current.map((entry) => entry.rank === rank ? { ...entry, ...patch } : entry));
   };
 
   const selectedCandidate = (entry: RankEntry) => entry.candidates.find((candidate) => candidate.id === entry.selectedId) ?? entry.candidates[0];
+
+  const removeRank = (rank: number) => {
+    if (ranks.length === 1) {
+      toast.error("Keep at least one rank in the list.");
+      return;
+    }
+    const next = ranks.filter((entry) => entry.rank !== rank);
+    setRanks(next);
+    if (activeRank === rank) setActiveRank(next[0].rank);
+    setFinalUrl(null);
+  };
+
+  const addCustomCandidate = (rank: number) => {
+    const entry = ranks.find((item) => item.rank === rank);
+    if (!entry?.videoId) {
+      toast.error(`Analyse rank ${rank} before choosing a custom clip.`);
+      return;
+    }
+    const startTime = Math.max(0, Number(entry.customStart ?? 0));
+    const requestedDuration = Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(entry.customDuration ?? MAX_TOP5_CLIP_SECONDS)));
+    const endTime = entry.duration && entry.duration > 0 ? Math.min(entry.duration, startTime + requestedDuration) : startTime + requestedDuration;
+    if (endTime <= startTime) {
+      toast.error("Choose a custom start time inside the source video.");
+      return;
+    }
+    const custom = limitToShortClip({
+      id: -Date.now(),
+      title: "CUSTOM CLIP",
+      startTime,
+      endTime,
+      engagementScore: 0,
+      reason: `Custom ${Math.round(endTime - startTime)} second selection`
+    }, entry.duration);
+    patchRank(rank, {
+      candidates: [custom, ...entry.candidates],
+      selectedId: custom.id,
+      title: "CUSTOM CLIP",
+      state: "ready",
+      error: undefined,
+      clipId: undefined,
+      clipUrl: undefined
+    });
+    setFinalUrl(null);
+  };
 
   const analyseRank = async (rank: number) => {
     const entry = ranks.find((item) => item.rank === rank);
@@ -267,7 +323,7 @@ export default function Top5ReelsPage() {
         rank,
         sourceTitle,
       });
-      const candidates: Candidate[] = (analysis.highlights || []).slice(0, 3);
+      const candidates: Candidate[] = (analysis.highlights || []).slice(0, 3).map((candidate: Candidate) => limitToShortClip(candidate, source.duration));
       if (!candidates.length) throw new Error("The AI did not return a usable highlight from this source.");
       const best = candidates[0];
       patchRank(rank, {
@@ -289,19 +345,20 @@ export default function Top5ReelsPage() {
   };
 
   const analyseAll = async () => {
-    for (const entry of [...ranks].sort((a, b) => b.rank - a.rank)) {
-      if (!entry.url.trim()) {
-        toast.error(`Add a source link for rank ${entry.rank} before analysing all videos.`);
-        return;
-      }
+    const entriesWithSources = [...ranks].filter((entry) => entry.url.trim()).sort((a, b) => b.rank - a.rank);
+    if (entriesWithSources.length === 0) {
+      toast.error("Add at least one source link before analysing.");
+      return;
     }
-    for (const entry of [...ranks].sort((a, b) => b.rank - a.rank)) {
+    for (const entry of entriesWithSources) {
       await analyseRank(entry.rank);
     }
   };
 
   const chooseCandidate = (rank: number, candidate: Candidate) => {
-    patchRank(rank, { selectedId: candidate.id, title: candidate.title, clipId: undefined, clipUrl: undefined, state: "ready" });
+    const entry = ranks.find((item) => item.rank === rank);
+    const shortCandidate = limitToShortClip(candidate, entry?.duration);
+    patchRank(rank, { selectedId: shortCandidate.id, title: shortCandidate.title, clipId: undefined, clipUrl: undefined, state: "ready" });
     setFinalUrl(null);
   };
 
@@ -470,12 +527,12 @@ export default function Top5ReelsPage() {
             <div className="glass rounded-2xl p-5 sm:p-6">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-base font-black text-foreground">1. Add five ranked sources</h2>
-                  <p className="mt-1 text-xs text-muted-foreground">Every rank uses its own source. Links are analysed first; only the selected highlight is downloaded for final rendering.</p>
+                  <h2 className="text-base font-black text-foreground">1. Add only the ranks you want</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">Each rank is optional. Remove an unused rank instead of adding a link; the final video uses only the remaining ranks.</p>
                 </div>
                 <button type="button" onClick={analyseAll} disabled={extract.isPending || detectHighlights.isPending} className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45" style={{ background: accent }}>
                   {extract.isPending || detectHighlights.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
-                  Analyse all 5
+                  Analyse sources
                 </button>
               </div>
 
@@ -489,12 +546,12 @@ export default function Top5ReelsPage() {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-3">
                           <p className="text-xs font-bold uppercase tracking-[0.12em] text-muted-foreground">Rank {entry.rank} · {sourceLabel(entry.url)}</p>
-                          <span className={`text-[11px] font-semibold ${entry.state === "error" ? "text-destructive" : entry.state === "ready" || entry.state === "rendered" ? "text-emerald-500" : "text-muted-foreground"}`}>{stateCopy(entry.state)}</span>
+                          <div className="flex items-center gap-2"><span className={`text-[11px] font-semibold ${entry.state === "error" ? "text-destructive" : entry.state === "ready" || entry.state === "rendered" ? "text-emerald-500" : "text-muted-foreground"}`}>{stateCopy(entry.state)}</span><button type="button" onClick={() => removeRank(entry.rank)} className="rounded-lg p-1 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive" aria-label={`Remove rank ${entry.rank}`} title="Remove this rank"><Trash2 className="h-3.5 w-3.5" /></button></div>
                         </div>
                         <div className="mt-2 flex gap-2">
                           <div className="relative min-w-0 flex-1">
                             <Link2 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                            <input value={entry.url} onFocus={() => setActiveRank(entry.rank)} onChange={(event) => patchRank(entry.rank, { url: event.target.value, state: "idle", candidates: [], selectedId: undefined, clipId: undefined, error: undefined })} placeholder="Paste YouTube, TikTok, or X video link" className="w-full rounded-xl border border-border bg-input py-2.5 pl-9 pr-3 text-sm text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20" />
+                            <input value={entry.url} onFocus={() => setActiveRank(entry.rank)} onChange={(event) => patchRank(entry.rank, { url: event.target.value, state: "idle", candidates: [], selectedId: undefined, clipId: undefined, clipUrl: undefined, hostedUrl: undefined, error: undefined })} placeholder="Paste YouTube, TikTok, or X video link" className="w-full rounded-xl border border-border bg-input py-2.5 pl-9 pr-3 text-sm text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20" />
                           </div>
                           <button type="button" onClick={() => analyseRank(entry.rank)} disabled={!entry.url.trim() || entry.state === "analyzing"} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-secondary px-3 py-2 text-xs font-bold text-foreground transition hover:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-50">
                             {entry.state === "analyzing" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />} Analyse
@@ -513,9 +570,9 @@ export default function Top5ReelsPage() {
               <div className="mb-4 flex items-center justify-between gap-4">
                 <div>
                   <h2 className="text-base font-black text-foreground">2. Choose the best clip for rank {active.rank}</h2>
-                  <p className="mt-1 text-xs text-muted-foreground">The first choice is selected automatically. Choose another candidate if you prefer.</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Every AI choice is capped at 15 seconds. Choose a suggestion or make a custom 1–15 second range from the full source.</p>
                 </div>
-                <span className="rounded-full bg-secondary px-3 py-1.5 text-xs font-bold text-muted-foreground">{completed}/5 ready</span>
+                <span className="rounded-full bg-secondary px-3 py-1.5 text-xs font-bold text-muted-foreground">{completed}/{rankCount} ready</span>
               </div>
 
               {active.candidates.length === 0 ? (
@@ -531,7 +588,7 @@ export default function Top5ReelsPage() {
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-center justify-between gap-2">
                               <p className="font-black uppercase tracking-[-0.03em] text-foreground">{candidate.title}</p>
-                              <span className="font-mono text-xs text-muted-foreground">{timecode(candidate.startTime)}–{timecode(candidate.endTime)}</span>
+                              <span className="font-mono text-xs text-muted-foreground">{timecode(candidate.startTime)}–{timecode(candidate.endTime)} · ≤15s</span>
                             </div>
                             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{candidate.reason}</p>
                           </div>
@@ -542,12 +599,28 @@ export default function Top5ReelsPage() {
                   })}
                 </div>
               )}
+
+              {active.videoId && (
+                <div className="mt-4 rounded-xl border border-dashed border-primary/35 bg-primary/[0.035] p-4">
+                  <div className="flex flex-wrap items-end justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-black text-foreground">Custom short clip</p>
+                      <p className="mt-1 text-xs text-muted-foreground">Choose any moment in the full video. The maximum duration is 15 seconds.</p>
+                    </div>
+                    <button type="button" onClick={() => addCustomCandidate(active.rank)} className="rounded-xl px-3 py-2 text-xs font-black text-black transition hover:brightness-110" style={{ background: accent }}>Use custom clip</button>
+                  </div>
+                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    <label className="block"><span className="mb-1.5 block text-xs font-semibold text-foreground">Start time (seconds)</span><input type="number" min="0" max={active.duration || undefined} step="1" value={active.customStart ?? 0} onChange={(event) => patchRank(active.rank, { customStart: Number(event.target.value) || 0 })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
+                    <label className="block"><span className="mb-1.5 flex justify-between text-xs font-semibold text-foreground"><span>Duration</span><span className="text-muted-foreground">1–15 sec</span></span><input type="number" min="1" max={MAX_TOP5_CLIP_SECONDS} step="1" value={active.customDuration ?? MAX_TOP5_CLIP_SECONDS} onChange={(event) => patchRank(active.rank, { customDuration: Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(event.target.value) || 1)) })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="glass rounded-2xl p-5 sm:p-6">
               <div className="mb-4">
                 <h2 className="text-base font-black text-foreground">3. Persistent numbers and timed rank title</h2>
-                <p className="mt-1 text-xs text-muted-foreground">All five rank numbers stay on-screen for the whole video. The title for rank {active.rank} appears when that specific source clip begins, then remains visible.</p>
+                  <p className="mt-1 text-xs text-muted-foreground">All remaining rank numbers stay on-screen for the whole video. The title for rank {active.rank} appears when that specific source clip begins, then remains visible.</p>
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="block">
@@ -572,17 +645,17 @@ export default function Top5ReelsPage() {
             <div className="glass rounded-2xl p-5 sm:p-6">
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-base font-black text-foreground">4. Render the complete Top 5 video</h2>
-                  <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">The renderer downloads only the selected ranges at the best available source quality, crops each clip to 1080 × 1920, keeps the full 5-to-1 ranking list visible, and reveals each title when its matching clip begins.</p>
+                  <h2 className="text-base font-black text-foreground">4. Render the ranked video</h2>
+                  <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">The renderer uses only the {rankCount} remaining rank{rankCount === 1 ? "" : "s"}. Every selected source range is 15 seconds or less, cropped to 1080 × 1920, with persistent rank numbers and timed titles.</p>
                 </div>
-                <button type="button" onClick={renderFinal} disabled={isRenderingFinal || completed !== 5} className="inline-flex items-center gap-2 rounded-xl px-5 py-3 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: accent }}>
+                <button type="button" onClick={renderFinal} disabled={isRenderingFinal || completed !== rankCount} className="inline-flex items-center gap-2 rounded-xl px-5 py-3 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40" style={{ background: accent }}>
                   {isRenderingFinal ? <Loader2 className="h-4 w-4 animate-spin" /> : <Video className="h-4 w-4" />}
-                  {isRenderingFinal ? "Rendering Top 5…" : "Render high-quality video"}
+                  {isRenderingFinal ? "Rendering ranked video…" : "Render high-quality video"}
                 </button>
               </div>
               {renderStage && <div className="mt-4 flex items-center gap-3 rounded-xl border border-primary/25 bg-primary/[0.07] p-4 text-sm font-semibold text-foreground"><Loader2 className={`h-4 w-4 shrink-0 ${isRenderingFinal || isPreviewingClip ? "animate-spin" : ""}`} style={{ color: accent }} /><span>{renderStage}</span></div>}
-              {(isRenderingFinal || isPreviewingClip) && <div className="mt-3 grid grid-cols-5 gap-1.5" aria-label="Top 5 render progress">{[5, 4, 3, 2, 1].map((rank) => { const item = ranks.find((entry) => entry.rank === rank); return <div key={rank} className={`h-1.5 rounded-full ${item?.state === "rendered" ? "bg-emerald-500" : item?.state === "rendering" ? "animate-pulse" : "bg-secondary"}`} style={item?.state === "rendering" ? { background: accent } : undefined} />; })}</div>}
-              {finalUrl && <a href={finalUrl} download className="mt-4 flex items-center justify-between rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 text-sm font-bold text-foreground transition hover:bg-emerald-500/15"><span className="flex items-center gap-2"><CheckCircle2 className="h-5 w-5 text-emerald-500" /> Your Top 5 video is ready</span><span className="flex items-center gap-2 text-emerald-500"><Download className="h-4 w-4" /> Download MP4</span></a>}
+              {(isRenderingFinal || isPreviewingClip) && <div className="mt-3 grid gap-1.5" style={{ gridTemplateColumns: `repeat(${rankCount}, minmax(0, 1fr))` }} aria-label="Ranked-video render progress">{[...ranks].sort((a, b) => b.rank - a.rank).map((item) => <div key={item.rank} className={`h-1.5 rounded-full ${item.state === "rendered" ? "bg-emerald-500" : item.state === "rendering" ? "animate-pulse" : "bg-secondary"}`} style={item.state === "rendering" ? { background: accent } : undefined} />)}</div>}
+              {finalUrl && <a href={finalUrl} download className="mt-4 flex items-center justify-between rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 text-sm font-bold text-foreground transition hover:bg-emerald-500/15"><span className="flex items-center gap-2"><CheckCircle2 className="h-5 w-5 text-emerald-500" /> Your ranked video is ready</span><span className="flex items-center gap-2 text-emerald-500"><Download className="h-4 w-4" /> Download MP4</span></a>}
             </div>
           </section>
 
@@ -597,7 +670,7 @@ export default function Top5ReelsPage() {
                 {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                 {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}
               </button>
-              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">YouTube sources show their thumbnail immediately after analysis. Preview selected clip first downloads a playable source range, then shows that source here before the vertical clip export completes. The final render reuses completed previews instead of rendering them twice.</div>
+              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">AI and custom choices are capped at 15 seconds. YouTube sources show their thumbnail immediately after analysis; preview downloads only the selected short range before the vertical export completes. Removed ranks are not included in the final overlay.</div>
               <div className="mt-4 divide-y divide-border rounded-xl border border-border bg-card">
                 {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "rendering" ? <Loader2 className="h-4 w-4 animate-spin" style={{ color: accent }} /> : entry.state === "error" ? <span className="text-xs font-black text-destructive">!</span> : entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
               </div>
