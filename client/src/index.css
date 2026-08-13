@@ -341,3 +341,15 @@ button:active:not(:disabled) {
 
 /* Minimal Clip Maker mark: the supplied theme's soft blue tile now carries only a play icon. */
 .clip-maker-mark{filter:drop-shadow(0 5px 10px rgba(49,94,245,.23))}.clip-maker-mark svg{display:block}
+
+/* Native two-character layout, supplied homepage style, with local Clip Maker artwork. */
+.clip-maker-mark{display:grid;place-items:center;color:#fff;background:#315ef5;filter:drop-shadow(0 5px 10px rgba(49,94,245,.23))}.clip-maker-mark svg{display:block}.sp-brand-mark{grid-row:span 2;width:27px;height:27px;border-radius:9px}.dash-brand-mark{width:25px;height:25px;border-radius:7px;flex:0 0 auto}.statement-brand-mark{width:25px;height:25px;border-radius:7px}.sp-brand .clip-maker-mark{font-size:0}.sp-brand .clip-maker-mark+span{font-size:15px;font-weight:750;letter-spacing:-.055em;line-height:1}.sp-brand .clip-maker-mark+span b{color:#315ef5;font-weight:750}
+.sp-hero-characters{top:-49px;left:-42px;width:255px;height:156px;filter:drop-shadow(0 13px 14px rgba(37,37,34,.1))}.sp-hero-characters img{position:absolute;display:block!important;object-fit:contain}.crew-auto-scout{bottom:-8px;left:4px;width:122px;height:auto;background:none!important;border:0!important;box-shadow:none!important}.crew-clip-finisher{bottom:-3px;left:126px;width:104px;height:auto;background:none!important;border:0!important;box-shadow:none!important}.crew-hey{top:15px;left:111px}
+.stage-video,.stage-short{display:block!important;background:none!important;border:0!important;box-shadow:none!important}.stage-video{top:28px;left:20%;width:164px;height:auto}.stage-short{top:75px;right:7%;width:123px;height:auto}.sp-start-art img{display:block!important;position:absolute;right:-16px;bottom:-8px;width:145px;height:auto;filter:drop-shadow(0 10px 12px rgba(35,35,32,.08))}
+@media(max-width:780px){.sp-hero-characters{top:-35px;left:-22px;width:170px;height:108px}.crew-auto-scout{width:78px;left:0}.crew-clip-finisher{left:78px;width:70px}.crew-hey{top:5px;left:70px}.stage-video{left:10%;width:138px}.stage-short{top:73px;right:1%;width:92px}.stage-hello{left:43%}}
+
+/* Keep the two service characters visible together, rather than sequencing one off-screen. */
+.crew-auto-scout,.crew-clip-finisher,.stage-video,.stage-short{opacity:1!important}
+@media(prefers-reduced-motion:no-preference){.crew-auto-scout,.stage-video{animation:clip-maker-scout-float 4.8s ease-in-out infinite!important}.crew-clip-finisher,.stage-short{animation:clip-maker-finisher-float 4.8s ease-in-out .55s infinite!important}}
+@keyframes clip-maker-scout-float{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-8px) rotate(2deg)}}
+@keyframes clip-maker-finisher-float{0%,100%{transform:translateY(-2px) rotate(2deg)}50%{transform:translateY(-10px) rotate(-2deg)}}
