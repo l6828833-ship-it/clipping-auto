@@ -44,12 +44,24 @@ const faqItems = [
   ["Which platforms are supported?", "Your finished shorts are prepared for the vertical formats used by TikTok, Instagram Reels, and YouTube Shorts."],
 ];
 
+function ClipMakerMark({ className = "" }: { className?: string }) {
+  return (
+    <span className={`clip-maker-mark ${className}`} aria-hidden="true">
+      <svg viewBox="0 0 32 32" role="img">
+        <rect x="1" y="1" width="30" height="30" rx="9" fill="currentColor" />
+        <path d="M13 10.4 22 16l-9 5.6v-11.2Z" fill="#fff" />
+        <path d="M8 9v4M8 19v4M24 9v4M24 19v4" stroke="#ff9a82" strokeWidth="2" strokeLinecap="round" />
+      </svg>
+    </span>
+  );
+}
+
 function Brand() {
   return (
     <a href="#top" className="sp-brand" aria-label="Clip Maker home">
-      <span className="sp-brand-mark"><Scissors size={17} /></span>
+      <ClipMakerMark className="sp-brand-mark" />
       <span>Clip <b>Maker</b></span>
-      <small>AI clip studio</small>
+      <small>AI video studio</small>
     </a>
   );
 }
@@ -105,13 +117,12 @@ export default function Home() {
 
           <div className="sp-studio-wrap" id="workflow">
             <div className="sp-hero-characters" aria-hidden="true">
-              <span className="crew-auto-scout crew-mascot"><Scissors size={43} /></span>
-              <span className="crew-clip-finisher crew-mascot"><Sparkles size={37} /></span>
+              <img className="crew-auto-scout crew-mascot" src="/brand/clip-maker-scout-clean.png" alt="" />
               <span className="crew-hey">clip!</span>
             </div>
             <div className="sp-dashboard-shell">
               <aside className="sp-dash-sidebar">
-                <div className="dash-mini-brand"><span className="dash-brand-mark"><Scissors size={14} /></span><div><b>Clip Maker</b><span>AI clip studio</span></div></div>
+                <div className="dash-mini-brand"><ClipMakerMark className="dash-brand-mark" /><div><b>Clip Maker</b><span>AI video studio</span></div></div>
                 <div className="dash-nav"><button><LayoutDashboard size={15} />Dashboard</button><button className="dash-nav-active"><WandSparkles size={15} />Create</button><button><BarChart3 size={15} />Top 5 Reels</button><button><ListVideo size={15} />Clips</button><button><UserRound size={15} />Profile</button></div>
                 <div className="dash-user"><span>AC</span><div><b>claire</b><small>creator@clip-maker.com</small></div><MoreHorizontal size={16} /></div>
               </aside>
@@ -129,7 +140,7 @@ export default function Home() {
 
         <section className="sp-proof-strip"><p>From raw recording to a run of clips you’re proud to post.</p><div><span>INPUT</span><i /> <span>FIND</span><i /> <span>POLISH</span><i /> <span>PUBLISH</span></div></section>
 
-        <section className="sp-character-section" id="creators"><div className="sp-character-copy"><span className="sp-eyebrow">Meet the auto crew</span><h2>Your footage has more <em>to say.</em></h2><p>Auto scouts your long video for the strongest beat. Clip turns that beat into a clean, finished vertical short.</p><DarkButton onClick={() => notify("Build a first project")}>Build a first project</DarkButton></div><div className="sp-character-stage"><div className="stage-orbit orbit-a" /><div className="stage-orbit orbit-b" /><span className="stage-video stage-mascot"><Scissors size={56} /></span><span className="stage-short stage-mascot"><Sparkles size={43} /></span><span className="stage-hello">clip!</span><div className="stage-chip chip-a"><Scissors size={14} /> Auto-find beats</div><div className="stage-chip chip-b"><Sparkles size={14} /> Ready to post</div></div></section>
+        <section className="sp-character-section" id="creators"><div className="sp-character-copy"><span className="sp-eyebrow">Meet the auto crew</span><h2>Your footage has more <em>to say.</em></h2><p>Auto scouts your long video for the strongest beat. Clip turns that beat into a clean, finished vertical short.</p><DarkButton onClick={() => notify("Build a first project")}>Build a first project</DarkButton></div><div className="sp-character-stage"><div className="stage-orbit orbit-a" /><div className="stage-orbit orbit-b" /><img src="/brand/clip-maker-scout-clean.png" alt="Clip Maker scout finding a video highlight" className="stage-video stage-mascot" /><span className="stage-hello">clip!</span><div className="stage-chip chip-a"><Scissors size={14} /> Auto-find beats</div><div className="stage-chip chip-b"><Sparkles size={14} /> Ready to post</div></div></section>
 
         <section className="sp-flow-section" id="features"><div className="sp-section-heading"><span className="sp-eyebrow">A clean cut from start to finish</span><h2>One workflow.<br />More <em>watchable moments.</em></h2><p>Clip Maker runs the full clipping loop in one simple flow, so you can keep moving instead of rebuilding your edit in five places.</p></div><div className="sp-flow-rail"><FlowCard index="01" title="Drop in the full story" body="Import a podcast, talk, lesson, or interview from a link or a file." icon={<FileVideo2 size={18} />} tone="blue" /><FlowCard index="02" title="Spot the strongest beats" body="Review AI-detected clips with a clear reason behind every pick." icon={<Highlighter size={18} />} tone="coral" /><FlowCard index="03" title="Make every word visible" body="Generate lively subtitles, then tune the look to match your channel." icon={<Captions size={18} />} tone="mint" /><FlowCard index="04" title="Export ready to share" body="Download vertical cuts that are formatted for the platforms you use." icon={<Download size={18} />} tone="lavender" /></div></section>
 
@@ -137,9 +148,9 @@ export default function Home() {
 
         <section className="sp-usecases-section"><div className="sp-section-heading compact"><span className="sp-eyebrow">More ways to keep creating</span><h2>Built for the people<br />behind the <em>channel.</em></h2></div><div className="sp-usecases-grid"><UseCase prompt="“Find five useful clips in this recorded episode.”" title="Podcasts & interviews" copy="Turn long conversations into a month of thought-provoking shorts." icon={<AudioLines size={16} />} /><UseCase prompt="“Keep every lesson moving after it leaves the classroom.”" title="Educators & coaches" copy="Make clear, captioned explanations that travel farther than the original lesson." icon={<Sparkles size={16} />} /><UseCase prompt="“Give this launch story more than one chance to land.”" title="Teams & brands" copy="Reframe a strong message for every feed without losing its point of view." icon={<Clapperboard size={16} />} /></div></section>
 
-        <section className="sp-start-section"><span className="sp-eyebrow">Make your first cut in minutes</span><h2>Start with a video.<br />Leave with <em>momentum.</em></h2><p>Clip Maker works best when you give it something worth watching. We’ll help you find what comes next.</p><div className="sp-start-columns"><article><span>01</span><h3>Bring the long version</h3><p>Paste a link or upload the file you already have.</p><DarkButton onClick={() => notify("Add your video")}>Add a video</DarkButton></article><article><span>02</span><h3>Choose your highlights</h3><p>Review the strongest sections before they become clips.</p><div className="mini-list"><b><Check size={13} /> Opening hook</b><b><Check size={13} /> Strong takeaway</b><b><Check size={13} /> Great quote</b></div></article><article className="sp-start-art"><span>03</span><h3>Share the short</h3><p>Make the most of the moment you already made.</p><span className="start-mascot"><Sparkles size={58} /></span></article></div></section>
+        <section className="sp-start-section"><span className="sp-eyebrow">Make your first cut in minutes</span><h2>Start with a video.<br />Leave with <em>momentum.</em></h2><p>Clip Maker works best when you give it something worth watching. We’ll help you find what comes next.</p><div className="sp-start-columns"><article><span>01</span><h3>Bring the long version</h3><p>Paste a link or upload the file you already have.</p><DarkButton onClick={() => notify("Add your video")}>Add a video</DarkButton></article><article><span>02</span><h3>Choose your highlights</h3><p>Review the strongest sections before they become clips.</p><div className="mini-list"><b><Check size={13} /> Opening hook</b><b><Check size={13} /> Strong takeaway</b><b><Check size={13} /> Great quote</b></div></article><article className="sp-start-art"><span>03</span><h3>Share the short</h3><p>Make the most of the moment you already made.</p><img src="/brand/clip-maker-scout-clean.png" alt="Clip Maker scout ready to create a short" className="start-mascot" /></article></div></section>
 
-        <section className="sp-statement"><div className="sp-grid sp-grid-bottom" /><div className="statement-player"><i /><i /><span className="statement-brand-mark"><Scissors size={14} /></span><i /><i /></div><h2>Good stories don’t end<br />when the recording does.</h2><p>Give every great moment a second chance to be seen.</p><DarkButton onClick={() => notify("Create shorts free")} wide>Create shorts free</DarkButton></section>
+        <section className="sp-statement"><div className="sp-grid sp-grid-bottom" /><div className="statement-player"><i /><i /><ClipMakerMark className="statement-brand-mark" /><i /><i /></div><h2>Good stories don’t end<br />when the recording does.</h2><p>Give every great moment a second chance to be seen.</p><DarkButton onClick={() => notify("Create shorts free")} wide>Create shorts free</DarkButton></section>
 
         <section className="sp-principles"><div><span className="sp-eyebrow">A clearer creative loop</span><h2>Made for your work,<br />not more <em>work.</em></h2><p>Clip Maker keeps the original video, the best moments, and every export in one calm place.</p></div><div className="principle-grid"><Principle icon={<Clock3 size={20} />} title="Less rewatching" copy="Find memorable moments without scrubbing the whole recording again." /><Principle icon={<Scissors size={20} />} title="More control" copy="Review every selected moment before it becomes a finished clip." /><Principle icon={<Captions size={20} />} title="Captions included" copy="Create accessible, active subtitles from the same project." /><Principle icon={<FolderOpen size={20} />} title="Projects stay tidy" copy="Keep a clear record of source videos, cuts, and exports." /></div></section>
 
