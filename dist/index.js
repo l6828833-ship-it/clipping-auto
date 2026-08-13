@@ -2650,6 +2650,11 @@ async function hostVideo(opts) {
       "--no-playlist", ...YTDLP_COOKIE_ARGS,
       ...YT_CLIENT_ARGS,
       "--no-warnings",
+      // Fail quickly when a provider leaves a media connection hanging.
+      "--socket-timeout", "20",
+      "--retries", "2",
+      "--fragment-retries", "2",
+      "--abort-on-unavailable-fragment",
       // Parallel fragments are the single biggest speed win on YouTube DASH.
       "--concurrent-fragments",
       process.env.YTDLP_CONCURRENT_FRAGMENTS ?? "2",
@@ -2719,7 +2724,10 @@ async function hostVideo(opts) {
     const sectionArgs = range ? [
       "--download-sections",
       `*${offset.toFixed(3)}-${(range.end + SECTION_BUFFER).toFixed(3)}`,
-      "--force-keyframes-at-cuts"
+      /* ffmpeg performs a quick stream-copy section download. Deliberately do
+       * not force keyframes here: that option re-encodes during import and can
+       * make a 30-second preview look stuck on a small Fly machine. */
+      "--downloader", "ffmpeg"
     ] : [];
     const downloadFull = () => runStreaming(
       ytDlp,
@@ -2736,6 +2744,10 @@ async function hostVideo(opts) {
       [
         "--no-playlist", ...YTDLP_COOKIE_ARGS,
         "--no-warnings",
+        "--socket-timeout", "20",
+        "--retries", "2",
+        "--fragment-retries", "2",
+        "--abort-on-unavailable-fragment",
         "-f", [
           `bv*[height<=${maxHeight}]+ba`,
           `bv*+ba`,
