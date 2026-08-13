@@ -2747,9 +2747,12 @@ async function hostVideo(opts) {
         "--retries", "2",
         "--fragment-retries", "2",
         "--abort-on-unavailable-fragment",
+        /* Stable fallback: prefer one public muxed MP4 stream so yt-dlp does
+         * not need to assemble brittle adaptive audio/video segments on Fly.
+         * It may be lower resolution than the primary path, but produces a
+         * compatible, renderable source instead of leaving the rank stuck. */
         "-f", [
-          `bv*[height<=${maxHeight}]+ba`,
-          `bv*+ba`,
+          `b[ext=mp4][height<=${maxHeight}]`,
           `b[height<=${maxHeight}]`,
           "b"
         ].join("/"),
@@ -2770,7 +2773,7 @@ async function hostVideo(opts) {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (/403|Forbidden|requested format|no video formats|format is not available|no downloadable|SABR/i.test(msg)) {
-          console.warn(`[Host] Preferred download format was unavailable. Retrying with the best compatible public format...`);
+          console.warn(`[Host] Preferred adaptive format was unavailable. Retrying with a stable public muxed MP4 format...`);
           /* Clear partial fragments before retrying with the provider-compatible selector. */
           for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
             await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
