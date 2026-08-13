@@ -197,6 +197,8 @@ function RankOverlayPreview({
   hostedUrl,
   previewStart,
   onSourceTime,
+  moveFootage = false,
+  onFootageMove,
   onMove,
 }: {
   entry: RankEntry;
@@ -206,11 +208,14 @@ function RankOverlayPreview({
   hostedUrl?: string;
   previewStart?: number;
   onSourceTime?: (seconds: number) => void;
+  moveFootage?: boolean;
+  onFootageMove?: (offset: { offsetX: number; offsetY: number }) => void;
   onMove: (kind: "number" | "title", point: Point) => void;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [dragging, setDragging] = useState<"number" | "title" | null>(null);
+  const [dragging, setDragging] = useState<"number" | "title" | "footage" | null>(null);
+  const footageDragOrigin = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(null);
   const youTubeId = parseYouTubeId(entry.url);
   const thumbnailUrl = youTubeId ? youTubeThumbnail(youTubeId) : undefined;
   /* While editing an unrendered rank, always navigate the original playable
@@ -250,6 +255,17 @@ function RankOverlayPreview({
   const move = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!dragging || !frameRef.current) return;
     const box = frameRef.current.getBoundingClientRect();
+    if (dragging === "footage") {
+      const origin = footageDragOrigin.current;
+      if (!origin || !onFootageMove) return;
+      /* Drag the picture in the direction the user moves it; crop offsets use
+       * the inverse coordinate system because they describe the crop window. */
+      onFootageMove({
+        offsetX: Math.max(-1, Math.min(1, origin.offsetX - ((event.clientX - origin.x) / box.width) * 2)),
+        offsetY: Math.max(-1, Math.min(1, origin.offsetY - ((event.clientY - origin.y) / box.height) * 2)),
+      });
+      return;
+    }
     onMove(dragging, {
       x: Math.max(0.06, Math.min(0.94, (event.clientX - box.left) / box.width)),
       y: Math.max(0.08, Math.min(0.92, (event.clientY - box.top) / box.height)),
@@ -261,6 +277,13 @@ function RankOverlayPreview({
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     setDragging(kind);
+  };
+  const startFootageDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!moveFootage || !onFootageMove || fullSourceEmbed || fullLetterboxMode) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    footageDragOrigin.current = { x: event.clientX, y: event.clientY, offsetX: entry.offsetX, offsetY: entry.offsetY };
+    setDragging("footage");
   };
   const previewSize = (fullSize: number, min: number) => Math.max(min, Math.round(fullSize * 0.29));
 
@@ -279,13 +302,14 @@ function RankOverlayPreview({
         <iframe key={fullSourceEmbed} src={fullSourceEmbed} title="Playable full source video" allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen className="absolute inset-0 h-full w-full border-0" />
       ) : hostedUrl ? (
         fullLetterboxMode ? <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-contain" /> :
-        softLetterboxMode ? <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 overflow-hidden" style={{ height: `${entry.zoom * 100}%` }}><video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="h-full w-full object-cover" /></div> :
+        softLetterboxMode ? <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 overflow-hidden" style={{ height: `${entry.zoom * 100}%` }}><video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="h-full w-full object-cover" style={{ objectPosition: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} /></div> :
         <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" style={{ transform: `scale(${entry.zoom})`, transformOrigin: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} />
       ) : thumbnailUrl ? (
         <img src={thumbnailUrl} alt={`${entry.sourceTitle || "Source"} thumbnail`} className="absolute inset-0 h-full w-full object-cover opacity-75" />
       ) : (
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_78%_16%,rgba(255,255,255,0.13),transparent_24%),linear-gradient(180deg,#161616_0%,#050505_78%)]" />
       )}
+      {moveFootage && !fullSourceEmbed && !fullLetterboxMode && <div onPointerDown={startFootageDrag} className={`absolute inset-0 z-[5] ${dragging === "footage" ? "cursor-grabbing" : "cursor-move"}`} aria-label="Drag video to reposition the footage" />}
       <div className="absolute inset-x-0 top-0 z-10 h-1" style={{ background: accent }} />
 
       {ranks.map((rankEntry) => {
@@ -335,6 +359,7 @@ export default function Top5ReelsPage() {
   const [isPreviewingClip, setIsPreviewingClip] = useState(false);
   const [renderStage, setRenderStage] = useState<string | null>(null);
   const [playerTime, setPlayerTime] = useState<number | null>(null);
+  const [isMovingFootage, setIsMovingFootage] = useState(false);
   const utils = trpc.useUtils();
 
   const extract = trpc.extract.transcribe.useMutation();
@@ -824,8 +849,10 @@ export default function Top5ReelsPage() {
                 <div><p className="text-sm font-black text-foreground">Persistent ranking overlay</p><p className="mt-1 text-xs text-muted-foreground">Drag the active number or title directly in the preview.</p></div>
                 <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
               </div>
-              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={active.customStart ?? selectedCandidate(active)?.startTime} onSourceTime={setPlayerTime} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={active.customStart ?? selectedCandidate(active)?.startTime} onSourceTime={setPlayerTime} moveFootage={isMovingFootage} onFootageMove={({ offsetX, offsetY }) => patchRank(active.rank, { offsetX, offsetY, clipId: undefined, clipUrl: undefined, state: "ready" })} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
               {playerTime !== null && !active.clipUrl && parseYouTubeId(active.url) && <button type="button" onClick={() => patchRank(active.rank, { customStart: playerTime, hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="mt-3 flex w-full items-center justify-center rounded-xl border border-primary/45 bg-primary/[0.08] px-3 py-2 text-xs font-black text-primary transition hover:bg-primary/[0.14]">Use current video time: {timecode(playerTime)}</button>}
+              <button type="button" onClick={() => setIsMovingFootage((current) => !current)} disabled={active.zoom <= 0.5} className={`mt-3 flex w-full items-center justify-center rounded-xl border px-3 py-2 text-xs font-black transition disabled:cursor-not-allowed disabled:opacity-45 ${isMovingFootage ? "border-primary bg-primary text-black" : "border-border bg-card text-foreground hover:border-primary"}`}>{isMovingFootage ? "Drag the video in preview — done" : "Move video framing"}</button>
+              {active.zoom <= 0.5 && <p className="mt-2 text-center text-[11px] text-muted-foreground">Use zoom above 0.50× to reposition footage. At 0.50× the complete source frame is visible.</p>}
               <button type="button" onClick={previewActiveClip} disabled={!active.videoId || !selectedCandidate(active) || isPreviewingClip || isRenderingFinal} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground transition hover:border-primary hover:bg-primary/[0.06] disabled:cursor-not-allowed disabled:opacity-45">
                 {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                 {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}
