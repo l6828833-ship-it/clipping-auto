@@ -937,6 +937,14 @@ var YT_CLIENT_ARGS_STR = [
   "--extractor-args",
   q("youtube:player_client=mweb")
 ].join(" ");
+/* Public fallback clients used only after the default compatible source gets a
+ * 403. They do not require a user cookie and are kept bounded to one retry. */
+var YT_PUBLIC_FALLBACK_CLIENT_ARGS = [
+  "--impersonate",
+  "chrome",
+  "--extractor-args",
+  "youtube:player_client=web_embedded,web,tv"
+];
 /*
  * Cloud containers have no browser profile. Never try to read a local Chrome,
  * Brave, or Firefox cookie database. Private/restricted sources can optionally
@@ -2489,6 +2497,9 @@ function classifyFailure(msg) {
   if (/requested format|no video formats|format is not available/i.test(msg)) {
     return "No downloadable video format was available for this source.";
   }
+  if (/HTTP Error 403|403:\s*Forbidden|unable to download video data/i.test(msg)) {
+    return "The source website rejected this server's download request (HTTP 403). Try a different public source link for this rank; this specific video may require browser access that a cloud server cannot use.";
+  }
   if (/timed out|ETIMEDOUT/i.test(msg)) {
     return "The operation timed out. Try a shorter video.";
   }
@@ -2749,10 +2760,10 @@ async function hostVideo(opts) {
      * adaptive selector returns no format. It deliberately uses no YouTube
      * client override and accepts the best public stream the provider exposes.
      */
-    const downloadCompatible = () => runStreaming(
+    const downloadCompatible = (clientArgs = []) => runStreaming(
       ytDlp,
       [
-        "--no-playlist", ...YTDLP_COOKIE_ARGS,
+        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...clientArgs,
         "--no-warnings",
         "--socket-timeout", "20",
         "--retries", "2",
@@ -2792,7 +2803,17 @@ async function hostVideo(opts) {
             await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
           }
           compatibleFullSource = !!range;
-          await downloadCompatible();
+          try {
+            await downloadCompatible();
+          } catch (compatibleErr) {
+            const compatibleMessage = compatibleErr instanceof Error ? compatibleErr.message : String(compatibleErr);
+            if (!/HTTP Error 403|403:\s*Forbidden|unable to download video data/i.test(compatibleMessage)) throw compatibleErr;
+            console.warn(`[Host] Default public stream was rejected with 403. Retrying once with alternate public YouTube clients...`);
+            for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
+              await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
+            }
+            await downloadCompatible(YT_PUBLIC_FALLBACK_CLIENT_ARGS);
+          }
         } else {
           throw err;
         }

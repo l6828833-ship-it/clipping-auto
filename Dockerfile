@@ -23,13 +23,15 @@ ENV NODE_ENV=production \
     PYTHONUNBUFFERED=1
 
 # FFmpeg and yt-dlp are required by the hosted-video, subtitle, and render paths.
+# Nightly yt-dlp plus its official default/curl-cffi extras keeps YouTube
+# extractor fixes and browser-style TLS impersonation current in this image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
       ffmpeg \
       python3 \
       python3-pip \
-    && pip3 install --no-cache-dir --break-system-packages -U yt-dlp \
+    && pip3 install --no-cache-dir --break-system-packages -U --pre "yt-dlp[default,curl-cffi]" \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
