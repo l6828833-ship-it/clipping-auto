@@ -2652,7 +2652,7 @@ async function hostVideo(opts) {
       "--no-warnings",
       // Parallel fragments are the single biggest speed win on YouTube DASH.
       "--concurrent-fragments",
-      "8",
+      process.env.YTDLP_CONCURRENT_FRAGMENTS ?? "2",
       /*
        * Adaptive-first format selection.
        *
@@ -2711,10 +2711,20 @@ async function hostVideo(opts) {
         opts.onProgress?.(Math.max(0, Math.min(95, Math.round(scaled))));
       };
     };
+    /*
+     * For a clip render, download only a small padded interval around its chosen
+     * highlight. The previous implementation fetched the complete source at
+     * 2160p, which can run for many minutes and stall a 1 GB Fly machine.
+     */
+    const sectionArgs = range ? [
+      "--download-sections",
+      `*${offset.toFixed(3)}-${(range.end + SECTION_BUFFER).toFixed(3)}`,
+      "--force-keyframes-at-cuts"
+    ] : [];
     const downloadFull = () => runStreaming(
       ytDlp,
-      [...commonArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
-      { timeout: 18e5, onLine: makeProgressHandler() }
+      [...commonArgs, ...sectionArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
+      { timeout: range ? 6e5 : 18e5, onLine: makeProgressHandler() }
     );
     /*
      * Generic fallback for TikTok, X and providers where the specialised
@@ -2737,10 +2747,11 @@ async function hostVideo(opts) {
         "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
         "--newline", "--progress",
         "-o", `${stem}.%(ext)s`,
+        ...sectionArgs,
         "--match-filter", `duration < ${maxMinutes * 60}`,
         sourceUrl
       ],
-      { timeout: 18e5, onLine: makeProgressHandler() }
+      { timeout: range ? 6e5 : 18e5, onLine: makeProgressHandler() }
     );
     const downloadWithFallback = async () => {
       try {
@@ -2760,11 +2771,10 @@ async function hostVideo(opts) {
       }
     };
     if (range) {
-      console.log(`[Host] Downloading full video at best quality for clip range ${range.start}-${range.end}s...`);
+      console.log(`[Host] Downloading selected ${(range.end - range.start).toFixed(1)}s range for clip ${range.start}-${range.end}s at best available quality...`);
       await downloadWithFallback();
-      effectiveOffset = 0;
-      fileName = fullFileName;
-      outPath = path5.join(VIDEOS_DIR, fileName);
+      /* Section media begins at offset, so the renderer subtracts it later. */
+      effectiveOffset = offset;
     } else {
       await downloadWithFallback();
     }
