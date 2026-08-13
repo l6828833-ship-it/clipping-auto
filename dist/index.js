@@ -751,7 +751,10 @@ function registerMediaRoutes(app) {
     const total = stat.size;
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    /* Render URLs can be reused after a retry. Never let a browser retain a
+     * cached partial MP4 under the same URL. */
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("X-Content-Type-Options", "nosniff");
     if (req.query.download === "1") {
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.name}"`);
     }
@@ -2564,6 +2567,20 @@ function runStreaming(bin, args, opts) {
     });
   });
 }
+async function assertPlayableMp4(filePath, label = "Rendered video") {
+  const stat = await fs6.stat(filePath).catch(() => null);
+  if (!stat || stat.size < 4096) throw new MediaError(`${label} is empty or incomplete.`);
+  const meta = await probeMedia(filePath).catch(() => null);
+  if (!meta || meta.duration <= 0.05 || !meta.width || !meta.height) {
+    throw new MediaError(`${label} has no readable video stream.`);
+  }
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) throw new MediaError(FFMPEG_MISSING);
+  /* Decode a frame before publishing. This catches a truncated MP4/MOOV atom
+   * even when the output file has a non-zero size. */
+  await runStreaming(ffmpeg, ["-v", "error", "-i", filePath, "-frames:v", "1", "-f", "null", "-"], { timeout: 3e4 });
+  return { stat, meta };
+}
 async function findWritten(dir, stem) {
   const files = await fs6.readdir(dir).catch(() => []);
   const match = files.filter((f) => f.startsWith(stem) && !f.endsWith(".part") && !f.endsWith(".ytdl")).sort((a, b) => b.length - a.length)[0];
@@ -3242,10 +3259,17 @@ async function renderClipFromHosted(opts) {
   try {
     const existing = await fs6.stat(outPath);
     if (existing.size > 0) {
-      return { fileName, url: urlFor("clip", fileName), bytes: existing.size };
+      try {
+        await assertPlayableMp4(outPath, "Cached clip");
+        return { fileName, url: urlFor("clip", fileName), bytes: existing.size };
+      } catch {
+        await fs6.rm(outPath, { force: true }).catch(() => {});
+      }
     }
   } catch {
   }
+  const publishPath = `${outPath}.render.mp4`;
+  await fs6.rm(publishPath, { force: true }).catch(() => {});
   const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, `clip-${opts.clipId}-`));
   try {
     const captionFilter = [];
@@ -3341,7 +3365,7 @@ async function renderClipFromHosted(opts) {
       "-y",
       "-loglevel",
       captions ? "verbose" : "error",
-      outPath
+      publishPath
     ];
     const ffmpegLog = await runStreaming(ffmpeg, args, {
       timeout: renderTimeout,
@@ -3356,16 +3380,11 @@ async function renderClipFromHosted(opts) {
         console.warn(`[Render] Clip ${opts.clipId}: ${fontWarning}`);
       }
     }
-    const stat = await fs6.stat(outPath).catch(() => null);
-    if (!stat || stat.size === 0) throw new MediaError("Rendering produced an empty file.");
-    const outMeta = await probeMedia(outPath).catch(() => null);
-    if (!outMeta || outMeta.duration <= 0.05 || !outMeta.width || !outMeta.height) {
-      throw new MediaError(
-        "Rendering produced a file with no video frames. The clip range may fall outside the imported footage."
-      );
-    }
-    return { fileName, url: urlFor("clip", fileName), bytes: stat.size, fontWarning };
+    const checked = await assertPlayableMp4(publishPath, "Rendering");
+    await fs6.rename(publishPath, outPath);
+    return { fileName, url: urlFor("clip", fileName), bytes: checked.stat.size, fontWarning };
   } catch (err) {
+    await fs6.rm(publishPath, { force: true }).catch(() => {});
     await fs6.rm(outPath, { force: true }).catch(() => {
     });
     if (err instanceof MediaError) throw err;
@@ -3377,6 +3396,7 @@ async function renderClipFromHosted(opts) {
     }
     throw new MediaError(classifyFailure(msg) ?? `Rendering failed: ${msg.slice(0, 250)}`);
   } finally {
+    await fs6.rm(publishPath, { force: true }).catch(() => {});
     await fs6.rm(tmpDir, { recursive: true, force: true }).catch(() => {
     });
   }
@@ -3428,7 +3448,16 @@ async function renderTop5Countdown(entries) {
   const fileName = clipFileName(entries[0].clipId, `top5-overlay:${fingerprint}`, 0, entries.length, 1, 0, 0);
   const outPath = path5.join(CLIPS_DIR, fileName);
   const existing = await fs6.stat(outPath).catch(() => null);
-  if (existing?.size > 0) return { url: urlFor("clip", fileName), bytes: existing.size };
+  if (existing?.size > 0) {
+    try {
+      await assertPlayableMp4(outPath, "Cached ranked video");
+      return { url: urlFor("clip", fileName), bytes: existing.size };
+    } catch {
+      await fs6.rm(outPath, { force: true }).catch(() => {});
+    }
+  }
+  const publishPath = `${outPath}.render.mp4`;
+  await fs6.rm(publishPath, { force: true }).catch(() => {});
 
   const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, "top5-overlay-"));
   try {
@@ -3484,13 +3513,14 @@ async function renderTop5Countdown(entries) {
        * clean final export while avoiding the slow-preset bottleneck on Fly's
        * single shared CPU for a 15-second ranked video. */
       "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr", "-g", "60",
-      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-tag:v", "avc1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", "-threads", "1", "-y", "-loglevel", "error", outPath
+      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-tag:v", "avc1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", "-threads", "1", "-y", "-loglevel", "error", publishPath
     ], { timeout: 6e5, cwd: tmpDir });
-    console.log(`[Top5] Composition finished for ${timeline.length} ranked clip${timeline.length === 1 ? "" : "s"}.`);
-    const stat = await fs6.stat(outPath).catch(() => null);
-    if (!stat || stat.size === 0) throw new MediaError("Top 5 rendering produced an empty file.");
-    return { url: urlFor("clip", fileName), bytes: stat.size };
+    const checked = await assertPlayableMp4(publishPath, "Top 5 rendering");
+    await fs6.rename(publishPath, outPath);
+    console.log(`[Top5] Composition finished for ${timeline.length} ranked clip${timeline.length === 1 ? "" : "s"} and passed playback validation.`);
+    return { url: urlFor("clip", fileName), bytes: checked.stat.size };
   } finally {
+    await fs6.rm(publishPath, { force: true }).catch(() => {});
     await fs6.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 }
