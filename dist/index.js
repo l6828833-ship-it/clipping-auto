@@ -2732,7 +2732,7 @@ async function hostVideo(opts) {
     const downloadFull = () => runStreaming(
       ytDlp,
       [...commonArgs, ...sectionArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
-      { timeout: range ? 6e5 : 18e5, onLine: makeProgressHandler() }
+      { timeout: range ? 18e4 : 18e5, onLine: makeProgressHandler() }
     );
     /*
      * Generic fallback for TikTok, X and providers where the specialised
@@ -2763,7 +2763,7 @@ async function hostVideo(opts) {
         "--match-filter", `duration < ${maxMinutes * 60}`,
         sourceUrl
       ],
-      { timeout: range ? 6e5 : 18e5, onLine: makeProgressHandler() }
+      { timeout: range ? 18e4 : 18e5, onLine: makeProgressHandler() }
     );
     const downloadWithFallback = async () => {
       try {

@@ -367,7 +367,9 @@ export default function Top5ReelsPage() {
       return { clipId, downloadUrl: existing.downloadUrl };
     }
 
-    await renderClip.mutateAsync({ id: clipId, captionsEnabled: true });
+    // The ranked layout uses its own title and persistent number overlay; skip
+    // speech-to-text captions so each selected clip can render promptly.
+    await renderClip.mutateAsync({ id: clipId, captionsEnabled: false });
     const finished = await waitForClip(clipId);
     patchRank(snapshot.rank, { clipId, clipUrl: finished.downloadUrl, state: "rendered" });
     return { clipId, downloadUrl: finished.downloadUrl as string };
