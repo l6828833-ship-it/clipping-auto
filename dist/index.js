@@ -2645,6 +2645,9 @@ async function hostVideo(opts) {
   const stem = path5.join(tmpDir, "source");
   const ffmpegDir = path5.dirname(ffmpeg);
   let effectiveOffset = offset;
+  /* Set when a selected clip falls back to one complete muxed source file.
+   * The renderer must then use absolute timestamps instead of a section offset. */
+  let compatibleFullSource = false;
   try {
     const commonArgs = [
       "--no-playlist", ...YTDLP_COOKIE_ARGS,
@@ -2756,16 +2759,22 @@ async function hostVideo(opts) {
           `b[height<=${maxHeight}]`,
           "b"
         ].join("/"),
-        "--merge-output-format", "mp4",
-        "--ffmpeg-location", ffmpegDir,
+        /* Do not pass --download-sections, --merge-output-format, or an
+         * ffmpeg location here. Even a progressive stream causes yt-dlp to
+         * invoke FFmpeg for an in-place section cut on some YouTube responses,
+         * which is exactly the failing path in the production logs. Download a
+         * single already-muxed file first; this function normalizes it below. */
         "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
         "--newline", "--progress",
         "-o", `${stem}.%(ext)s`,
-        ...sectionArgs,
-        "--match-filter", `duration < ${maxMinutes * 60}`,
+        /* Full-source fallback is deliberately bounded so a multi-hour video
+         * cannot fill the 1 GB service volume. Typical ranked sources are well
+         * below this twenty-minute / 350 MB limit. */
+        "--match-filter", `duration < ${Math.min(maxMinutes, 20) * 60}`,
+        "--max-filesize", "350M",
         sourceUrl
       ],
-      { timeout: range ? 18e4 : 18e5, onLine: makeProgressHandler() }
+      { timeout: range ? 9e5 : 18e5, onLine: makeProgressHandler() }
     );
     const downloadWithFallback = async () => {
       try {
@@ -2773,11 +2782,12 @@ async function hostVideo(opts) {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (/403|Forbidden|requested format|no video formats|format is not available|no downloadable|SABR/i.test(msg)) {
-          console.warn(`[Host] Preferred adaptive format was unavailable. Retrying with a stable public muxed MP4 format...`);
+          console.warn(`[Host] Preferred adaptive format was unavailable. Downloading one stable public muxed MP4 source before local normalization to avoid the FFmpeg section-cut failure...`);
           /* Clear partial fragments before retrying with the provider-compatible selector. */
           for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
             await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
           }
+          compatibleFullSource = !!range;
           await downloadCompatible();
         } else {
           throw err;
@@ -2787,7 +2797,8 @@ async function hostVideo(opts) {
     if (range) {
       console.log(`[Host] Downloading selected ${(range.end - range.start).toFixed(1)}s range for clip ${range.start}-${range.end}s at best available quality...`);
       await downloadWithFallback();
-      /* Section media begins at offset, so the renderer subtracts it later. */
+      /* Both paths now write the same padded local interval. The compatibility
+       * path downloads one safe muxed file, then trims it locally below. */
       effectiveOffset = offset;
     } else {
       await downloadWithFallback();
@@ -2799,13 +2810,23 @@ async function hostVideo(opts) {
         `The video could not be downloaded. It may be longer than the ${maxMinutes}-minute limit.`
       );
     }
+    /* The stable compatible fallback deliberately downloaded the whole muxed
+     * file without ffmpeg. Make a short, accurately trimmed local working copy
+     * here instead of asking yt-dlp to section-cut it during download. */
+    const localTrimArgs = compatibleFullSource && range ? [
+      `-ss ${offset.toFixed(3)}`,
+      `-t ${(range.end + SECTION_BUFFER - offset).toFixed(3)}`
+    ] : [];
     const normaliseCmd = [
       q(ffmpeg),
       `-i ${q(downloaded)}`,
-      "-c copy",
+      ...localTrimArgs,
+      // A local trim is encoded for frame-accurate timestamp handling. Other
+      // already-sectioned media stays stream-copied for maximum quality/speed.
+      compatibleFullSource && range ? "-c:v libx264 -preset veryfast -crf 16 -c:a aac -b:a 192k" : "-c copy",
       // Drop any subtitle/data streams the source carried.
       "-map 0:v:0 -map 0:a:0?",
-      "-movflags +faststart",
+      compatibleFullSource && range ? "-movflags +faststart -avoid_negative_ts make_zero -pix_fmt yuv420p" : "-movflags +faststart",
       "-y -loglevel error",
       q(outPath)
     ].join(" ");
@@ -2813,11 +2834,12 @@ async function hostVideo(opts) {
       await run(normaliseCmd, 9e5);
     } catch (copyErr) {
       const copyMessage = copyErr instanceof Error ? copyErr.message : String(copyErr);
-      console.warn(`[Host] Stream-copy normalization failed; rebuilding selected range for compatibility: ${copyMessage.slice(0, 240)}`);
+      console.warn(`[Host] Source normalization failed; rebuilding the local range for compatibility: ${copyMessage.slice(0, 240)}`);
       const reencodeCmd = [
         q(ffmpeg),
         "-fflags +genpts",
         `-i ${q(downloaded)}`,
+        ...localTrimArgs,
         "-map 0:v:0 -map 0:a:0?",
         // A working copy that clips are cut from, so keep it near-transparent;
         // every loss here is inherited by every export made from it.
