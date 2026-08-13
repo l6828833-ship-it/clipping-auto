@@ -2646,8 +2646,31 @@ async function hostVideo(opts) {
   const ffmpegDir = path5.dirname(ffmpeg);
   let effectiveOffset = offset;
   /* Set when a selected clip falls back to one complete muxed source file.
-   * The renderer must then use absolute timestamps instead of a section offset. */
+   * That file is trimmed locally into the same padded interval as a section. */
   let compatibleFullSource = false;
+  /* A predictable quality ladder keeps Top 5 responsive. We never wait for
+   * unavailable 1440p/4K streams: the first available level is 1080p, then
+   * 720p, 480p, and finally 360p. The last selector remains only as a
+   * last-resort "do not get stuck" option for unusual source platforms. */
+  const qualityLadder = [1080, 720, 480, 360].filter((height) => height <= maxHeight);
+  const adaptiveFormatSelector = [
+    ...qualityLadder.flatMap((height) => [
+      `bv*[height=${height}][vcodec^=avc1]+ba[acodec^=mp4a]`,
+      `bv*[height=${height}]+ba`,
+      `b[height=${height}]`
+    ]),
+    "b[height<=360]",
+    "b"
+  ].join("/");
+  const compatibleFormatSelector = [
+    ...qualityLadder.flatMap((height) => [
+      `b[ext=mp4][height=${height}]`,
+      `b[height=${height}]`
+    ]),
+    "b[ext=mp4][height<=360]",
+    "b[height<=360]",
+    "b"
+  ].join("/");
   try {
     const commonArgs = [
       "--no-playlist", ...YTDLP_COOKIE_ARGS,
@@ -2668,30 +2691,15 @@ async function hostVideo(opts) {
        * they offer resolutions up to 4K. Fall back to progressive (muxed) only
        * when adaptive fails — progressive caps at 360p on YouTube currently.
        *
-       * If the SABR/403 issue is still active, the adaptive download will fail
-       * and the auto-retry logic in hostVideo will NOT silently fall back to
-       * progressive — it will throw, so the user sees the real problem instead
-       * of getting a blurry clip.
+       * If a provider rejects an adaptive level, hostVideo immediately moves
+       * to the same deterministic muxed quality ladder rather than waiting for
+       * an unavailable higher-resolution stream.
        */
       "-f",
-      [
-        `bv*[height<=${maxHeight}][vcodec^=avc1]+ba[acodec^=mp4a]`,
-        `bv*[height<=${maxHeight}]+ba`,
-        `b[height<=${maxHeight}]`
-      ].join("/"),
-      /*
-       * Sort: highest resolution wins, then fps, then codec preference, then
-       * bitrate. This ensures we never pick a low-res rendition when a high-res
-       * one is available.
-       */
+      adaptiveFormatSelector,
+      /* Each fallback has an exact height, so only sort within that level. */
       "-S",
-      [
-        `res:${maxHeight}`,
-        "fps",
-        "codec:avc:m4a",
-        "vbr",
-        "abr"
-      ].join(","),
+      ["fps", "codec:avc:m4a", "vbr", "abr"].join(","),
       "--merge-output-format",
       "mp4",
       "--ffmpeg-location",
@@ -2754,11 +2762,7 @@ async function hostVideo(opts) {
          * not need to assemble brittle adaptive audio/video segments on Fly.
          * It may be lower resolution than the primary path, but produces a
          * compatible, renderable source instead of leaving the rank stuck. */
-        "-f", [
-          `b[ext=mp4][height<=${maxHeight}]`,
-          `b[height<=${maxHeight}]`,
-          "b"
-        ].join("/"),
+        "-f", compatibleFormatSelector,
         /* Do not pass --download-sections, --merge-output-format, or an
          * ffmpeg location here. Even a progressive stream causes yt-dlp to
          * invoke FFmpeg for an in-place section cut on some YouTube responses,
@@ -2874,7 +2878,8 @@ async function hostVideo(opts) {
         `Vertical exports will be upscaled and may appear soft. For sharp results, upload a 1080p+ source directly.`
       );
     } else {
-      console.log(`[Host] Video ${opts.videoId}: source ${meta.width}x${meta.height} ${meta.fps?.toFixed(0) ?? "?"}fps — sufficient for sharp 1080x1920 export`);
+      const selectedTier = [1080, 720, 480, 360].find((height) => meta.height >= height) ?? meta.height;
+      console.log(`[Host] Video ${opts.videoId}: using ${selectedTier}p source (${meta.width}x${meta.height} ${meta.fps?.toFixed(0) ?? "?"}fps) — sufficient for sharp 1080x1920 export`);
     }
     return { fileName, url: urlFor("video", fileName), bytes: stat.size, offset: effectiveOffset, ...meta, isLowRes };
   } catch (err) {
