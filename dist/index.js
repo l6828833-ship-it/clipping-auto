@@ -2724,10 +2724,9 @@ async function hostVideo(opts) {
     const sectionArgs = range ? [
       "--download-sections",
       `*${offset.toFixed(3)}-${(range.end + SECTION_BUFFER).toFixed(3)}`,
-      /* ffmpeg performs a quick stream-copy section download. Deliberately do
-       * not force keyframes here: that option re-encodes during import and can
-       * make a 30-second preview look stuck on a small Fly machine. */
-      "--downloader", "ffmpeg"
+      /* Let yt-dlp manage the selected range and merge its streams. An external
+       * ffmpeg downloader can emit an incomplete merged file for adaptive audio
+       * and video streams, which then fails during the preview normalization. */
     ] : [];
     const downloadFull = () => runStreaming(
       ytDlp,
@@ -2809,20 +2808,28 @@ async function hostVideo(opts) {
     ].join(" ");
     try {
       await run(normaliseCmd, 9e5);
-    } catch {
+    } catch (copyErr) {
+      const copyMessage = copyErr instanceof Error ? copyErr.message : String(copyErr);
+      console.warn(`[Host] Stream-copy normalization failed; rebuilding selected range for compatibility: ${copyMessage.slice(0, 240)}`);
       const reencodeCmd = [
         q(ffmpeg),
+        "-fflags +genpts",
         `-i ${q(downloaded)}`,
         "-map 0:v:0 -map 0:a:0?",
         // A working copy that clips are cut from, so keep it near-transparent;
         // every loss here is inherited by every export made from it.
         "-c:v libx264 -preset veryfast -crf 16",
         "-c:a aac -b:a 192k",
-        "-movflags +faststart -pix_fmt yuv420p",
+        "-movflags +faststart -avoid_negative_ts make_zero -pix_fmt yuv420p",
         "-y -loglevel error",
         q(outPath)
       ].join(" ");
-      await run(reencodeCmd, 18e5);
+      try {
+        await run(reencodeCmd, 18e5);
+      } catch (reencodeErr) {
+        const reencodeMessage = reencodeErr instanceof Error ? reencodeErr.message : String(reencodeErr);
+        throw new MediaError(`Selected source range could not be normalized: ${reencodeMessage.slice(0, 420)}`);
+      }
     }
     const stat = await fs6.stat(outPath).catch(() => null);
     if (!stat || stat.size === 0) throw new MediaError("Hosting produced an empty file.");
