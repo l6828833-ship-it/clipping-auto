@@ -3732,7 +3732,9 @@ var appRouter = router({
             hostedOffset: result.offset,
             width: result.width || null,
             height: result.height || null,
-            ...result.duration && result.offset === 0 ? { duration: result.duration } : {}
+            /* A selected preview range can begin at 0, but it must never
+             * overwrite the original full-source duration with 15 seconds. */
+            ...!range && result.duration ? { duration: result.duration } : {}
           });
           console.log(
             `[Host] Video ${video.id} hosted (${Math.round(result.bytes / 1024 / 1024)} MB, ${result.width}x${result.height}, quality=${qualityState}) \u2192 ${result.url}`

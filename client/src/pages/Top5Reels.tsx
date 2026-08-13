@@ -440,16 +440,6 @@ export default function Top5ReelsPage() {
         throw new Error("No usable transcript was returned. Choose another source or use a video with speech/captions.");
       }
 
-      const created: any = await createVideo.mutateAsync({
-        title: sourceTitle,
-        sourceType: "url",
-        sourceUrl: entry.url.trim(),
-        transcript,
-        duration: source.duration || undefined,
-        transcriptWords: source.words?.length ? source.words : undefined,
-        transcriptionEnabled: true,
-      });
-
       const analysis: any = await detectHighlights.mutateAsync({
         transcript,
         videoDuration: source.duration || undefined,
@@ -461,11 +451,25 @@ export default function Top5ReelsPage() {
       });
       const candidates: Candidate[] = (analysis.highlights || []).slice(0, 3).map((candidate: Candidate) => limitToShortClip(candidate, source.duration));
       if (!candidates.length) throw new Error("The AI did not return a usable highlight from this source.");
+      const transcriptEnd = Math.max(0, ...(Array.isArray(source.words) ? source.words.map((word: any) => Number(word.end) || Number(word.start) || 0) : []));
+      const highlightEnd = Math.max(0, ...candidates.map((candidate) => candidate.endTime));
+      /* Provider duration is preferred; caption and highlight timing keep the
+       * full editor usable if a provider omits its duration metadata. */
+      const fullDuration = Math.max(Number(source.duration) || 0, transcriptEnd, highlightEnd);
       const best = candidates[0];
+      const created: any = await createVideo.mutateAsync({
+        title: sourceTitle,
+        sourceType: "url",
+        sourceUrl: entry.url.trim(),
+        transcript,
+        duration: fullDuration || undefined,
+        transcriptWords: source.words?.length ? source.words : undefined,
+        transcriptionEnabled: true,
+      });
       patchRank(rank, {
         videoId: created.id,
         sourceTitle,
-        duration: source.duration || 0,
+        duration: fullDuration,
         transcript,
         candidates,
         selectedId: best.id,
