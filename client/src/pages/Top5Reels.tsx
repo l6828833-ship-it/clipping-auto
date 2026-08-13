@@ -196,6 +196,7 @@ function RankOverlayPreview({
   previewUrl,
   hostedUrl,
   previewStart,
+  onSourceTime,
   onMove,
 }: {
   entry: RankEntry;
@@ -204,11 +205,21 @@ function RankOverlayPreview({
   previewUrl?: string;
   hostedUrl?: string;
   previewStart?: number;
+  onSourceTime?: (seconds: number) => void;
   onMove: (kind: "number" | "title", point: Point) => void;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [dragging, setDragging] = useState<"number" | "title" | null>(null);
+  const youTubeId = parseYouTubeId(entry.url);
+  const thumbnailUrl = youTubeId ? youTubeThumbnail(youTubeId) : undefined;
+  /* While editing an unrendered rank, always navigate the original playable
+   * YouTube source—not the earlier locally hosted/cropped 15-second file. */
+  const fullSourceEmbed = youTubeId && entry.customStart !== undefined && !previewUrl && !hostedUrl
+    ? `https://www.youtube.com/embed/${youTubeId}?autoplay=1&mute=1&playsinline=1&controls=1&rel=0&enablejsapi=1&start=${Math.floor(Math.max(0, previewStart ?? 0))}`
+    : undefined;
+  const fullLetterboxMode = entry.zoom <= 0.5 && !!hostedUrl;
+  const softLetterboxMode = entry.zoom > 0.5 && entry.zoom < 1 && !!hostedUrl;
   useEffect(() => {
     const video = videoRef.current;
     if (!video || previewUrl || !hostedUrl || previewStart == null) return;
@@ -220,6 +231,21 @@ function RankOverlayPreview({
     else video.addEventListener("loadedmetadata", seek, { once: true });
     return () => video.removeEventListener("loadedmetadata", seek);
   }, [hostedUrl, previewStart, previewUrl]);
+  useEffect(() => {
+    if (!fullSourceEmbed || !onSourceTime) return;
+    const receivePlayerTime = (event: MessageEvent) => {
+      if (!/youtube\.com$/.test(new URL(event.origin).hostname)) return;
+      try {
+        const data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+        const value = Number(data?.info?.currentTime);
+        if (data?.event === "infoDelivery" && Number.isFinite(value)) onSourceTime(roundClipTime(value));
+      } catch {
+        // Ignore unrelated cross-window messages.
+      }
+    };
+    window.addEventListener("message", receivePlayerTime);
+    return () => window.removeEventListener("message", receivePlayerTime);
+  }, [fullSourceEmbed, onSourceTime]);
 
   const move = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!dragging || !frameRef.current) return;
@@ -237,14 +263,6 @@ function RankOverlayPreview({
     setDragging(kind);
   };
   const previewSize = (fullSize: number, min: number) => Math.max(min, Math.round(fullSize * 0.29));
-  const youTubeId = parseYouTubeId(entry.url);
-  const thumbnailUrl = youTubeId ? youTubeThumbnail(youTubeId) : undefined;
-  /* Before a short local preview is hosted, a custom YouTube range opens the
-   * original source as a playable navigator at the moving start timestamp. */
-  const fullSourceEmbed = youTubeId && entry.customStart !== undefined && !previewUrl && !hostedUrl
-    ? `https://www.youtube.com/embed/${youTubeId}?autoplay=1&mute=1&playsinline=1&controls=1&rel=0&start=${Math.floor(Math.max(0, entry.customStart))}`
-    : undefined;
-  const letterboxMode = entry.zoom < 1 && !!hostedUrl;
 
   return (
     <div
@@ -253,14 +271,16 @@ function RankOverlayPreview({
       onPointerUp={() => setDragging(null)}
       onPointerCancel={() => setDragging(null)}
       className="relative aspect-[9/16] w-full overflow-hidden rounded-[1.5rem] bg-[#070707] shadow-2xl"
-      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)", backgroundColor: letterboxMode ? entry.barColor : undefined }}
+      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)", backgroundColor: (fullLetterboxMode || softLetterboxMode) ? entry.barColor : undefined }}
     >
       {previewUrl ? (
         <video ref={videoRef} key={previewUrl} src={previewUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" />
-      ) : hostedUrl ? (
-        <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className={`absolute inset-0 h-full w-full ${letterboxMode ? "object-contain" : "object-cover"}`} style={letterboxMode ? undefined : { transform: `scale(${entry.zoom})`, transformOrigin: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} />
       ) : fullSourceEmbed ? (
         <iframe key={fullSourceEmbed} src={fullSourceEmbed} title="Playable full source video" allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen className="absolute inset-0 h-full w-full border-0" />
+      ) : hostedUrl ? (
+        fullLetterboxMode ? <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-contain" /> :
+        softLetterboxMode ? <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 overflow-hidden" style={{ height: `${entry.zoom * 100}%` }}><video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="h-full w-full object-cover" /></div> :
+        <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" style={{ transform: `scale(${entry.zoom})`, transformOrigin: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} />
       ) : thumbnailUrl ? (
         <img src={thumbnailUrl} alt={`${entry.sourceTitle || "Source"} thumbnail`} className="absolute inset-0 h-full w-full object-cover opacity-75" />
       ) : (
@@ -314,6 +334,7 @@ export default function Top5ReelsPage() {
   const [isRenderingFinal, setIsRenderingFinal] = useState(false);
   const [isPreviewingClip, setIsPreviewingClip] = useState(false);
   const [renderStage, setRenderStage] = useState<string | null>(null);
+  const [playerTime, setPlayerTime] = useState<number | null>(null);
   const utils = trpc.useUtils();
 
   const extract = trpc.extract.transcribe.useMutation();
@@ -746,7 +767,7 @@ export default function Top5ReelsPage() {
                     <label className="block"><span className="mb-1.5 block text-xs font-semibold text-foreground">Start time (seconds)</span><input type="number" min="0" max={active.duration || undefined} step="0.1" value={roundClipTime(active.customStart ?? selectedCandidate(active)?.startTime ?? 0)} onChange={(event) => patchRank(active.rank, { customStart: roundClipTime(Number(event.target.value) || 0), hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
                     <label className="block"><span className="mb-1.5 flex justify-between text-xs font-semibold text-foreground"><span>Duration</span><span className="text-muted-foreground">1–15 sec</span></span><input type="number" min="1" max={MAX_TOP5_CLIP_SECONDS} step="0.1" value={roundClipTime(active.customDuration ?? Math.min(MAX_TOP5_CLIP_SECONDS, Math.max(1, (selectedCandidate(active)?.endTime ?? MAX_TOP5_CLIP_SECONDS) - (selectedCandidate(active)?.startTime ?? 0))))} onChange={(event) => patchRank(active.rank, { customDuration: roundClipTime(Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(event.target.value) || 1))), hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
                   </div>
-                  <div className="mt-4 rounded-xl border border-border bg-card/70 p-3"><div className="mb-2 flex items-center justify-between text-xs font-semibold text-foreground"><span>Clip zoom</span><span className="font-mono text-muted-foreground">{active.zoom.toFixed(2)}×</span></div><input type="range" min="0.5" max="3" step="0.05" value={active.zoom} onChange={(event) => patchRank(active.rank, { zoom: Number(event.target.value), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full accent-primary" />{active.zoom < 1 && <div className="mt-3 flex items-center justify-between rounded-lg border border-border bg-input/60 px-3 py-2"><div><p className="text-xs font-bold text-foreground">Top & bottom bar color</p><p className="text-[11px] text-muted-foreground">The full 16:9 source stays visible between these bars.</p></div><input type="color" value={active.barColor} onChange={(event) => patchRank(active.rank, { barColor: event.target.value, clipId: undefined, clipUrl: undefined, state: "ready" })} className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0" aria-label="Choose letterbox bar color" /></div>}<div className="mt-2 flex items-center justify-between"><span className="text-[11px] text-muted-foreground">Below 1.00× preserves the whole 16:9 video. Only top and bottom bars are added.</span><button type="button" onClick={() => patchRank(active.rank, { zoom: 1, offsetX: 0, offsetY: 0, clipId: undefined, clipUrl: undefined, state: "ready" })} className="rounded-lg border border-border px-2 py-1 text-[11px] font-bold text-foreground hover:bg-secondary">Reset zoom</button></div></div>
+                  <div className="mt-4 rounded-xl border border-border bg-card/70 p-3"><div className="mb-2 flex items-center justify-between text-xs font-semibold text-foreground"><span>Clip zoom</span><span className="font-mono text-muted-foreground">{active.zoom.toFixed(2)}×</span></div><input type="range" min="0.5" max="3" step="0.05" value={active.zoom} onChange={(event) => patchRank(active.rank, { zoom: Number(event.target.value), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full accent-primary" />{active.zoom < 1 && <div className="mt-3 flex items-center justify-between rounded-lg border border-border bg-input/60 px-3 py-2"><div><p className="text-xs font-bold text-foreground">Top & bottom bar color</p><p className="text-[11px] text-muted-foreground">Bars appear above and below the horizontal source.</p></div><input type="color" value={active.barColor} onChange={(event) => patchRank(active.rank, { barColor: event.target.value, clipId: undefined, clipUrl: undefined, state: "ready" })} className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0" aria-label="Choose letterbox bar color" /></div>}<div className="mt-2 flex items-center justify-between"><span className="text-[11px] text-muted-foreground">0.50× shows the complete 16:9 frame. 0.51×–0.99× gradually reveals more with top and bottom bars.</span><button type="button" onClick={() => patchRank(active.rank, { zoom: 1, offsetX: 0, offsetY: 0, clipId: undefined, clipUrl: undefined, state: "ready" })} className="rounded-lg border border-border px-2 py-1 text-[11px] font-bold text-foreground hover:bg-secondary">Reset zoom</button></div></div>
                 </div>
               )}
             </div>
@@ -799,7 +820,8 @@ export default function Top5ReelsPage() {
                 <div><p className="text-sm font-black text-foreground">Persistent ranking overlay</p><p className="mt-1 text-xs text-muted-foreground">Drag the active number or title directly in the preview.</p></div>
                 <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
               </div>
-              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={active.hostedUrl ? 0 : active.customStart ?? selectedCandidate(active)?.startTime} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={active.customStart ?? selectedCandidate(active)?.startTime} onSourceTime={setPlayerTime} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              {playerTime !== null && !active.clipUrl && parseYouTubeId(active.url) && <button type="button" onClick={() => patchRank(active.rank, { customStart: playerTime, hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="mt-3 flex w-full items-center justify-center rounded-xl border border-primary/45 bg-primary/[0.08] px-3 py-2 text-xs font-black text-primary transition hover:bg-primary/[0.14]">Use current video time: {timecode(playerTime)}</button>}
               <button type="button" onClick={previewActiveClip} disabled={!active.videoId || !selectedCandidate(active) || isPreviewingClip || isRenderingFinal} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground transition hover:border-primary hover:bg-primary/[0.06] disabled:cursor-not-allowed disabled:opacity-45">
                 {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                 {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}

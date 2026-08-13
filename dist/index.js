@@ -3034,10 +3034,11 @@ function buildCropFilter(crop, srcW = 0, srcH = 0) {
   if (srcW > 0 && srcH > 0) {
     /* h264 with yuv420p needs even dimensions. */
     const even = (n) => Math.max(2, 2 * Math.round(n / 2));
-    /* A horizontal zoom-out is a letterbox mode, not a smaller vertical crop:
-     * keep the complete 16:9 frame at full output width and pad only above and
-     * below it. This makes 0.5×–0.99× a predictable full-frame choice. */
-    if (zoom < 1 && srcW > srcH) {
+    /* 0.50× is the full-frame letterbox choice: preserve the complete 16:9
+     * source at output width and pad only above and below. Between 0.51× and
+     * 0.99× the normal geometry produces a gradual crop reduction, rather
+     * than jumping straight to the complete 16:9 frame. */
+    if (zoom <= 0.5 && srcW > srcH) {
       const fullW = TARGET_W;
       const fullH = even(TARGET_W * srcH / srcW);
       const barY = Math.round((TARGET_H - fullH) / 2);
