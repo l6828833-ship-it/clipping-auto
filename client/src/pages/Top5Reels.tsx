@@ -161,7 +161,7 @@ function CustomClipTimeline({
   };
   return (
     <div className="mt-4">
-      <div className="mb-2 flex items-center justify-between text-xs font-semibold text-muted-foreground"><span>Drag both handles to choose the live clip</span><span className="font-mono text-foreground">{timecode(safeStart)}–{timecode(end)} · {safeDuration.toFixed(1)}s</span></div>
+      <div className="mb-2 flex items-center justify-between text-xs font-semibold text-muted-foreground"><span>Drag both handles — preview updates instantly</span><span className="font-mono text-foreground">{timecode(safeStart)}–{timecode(end)} · {safeDuration.toFixed(1)}s</span></div>
       <div ref={trackRef} onPointerMove={move} onPointerUp={finishDrag} onPointerCancel={finishDrag} className="relative h-11 touch-none rounded-xl border border-border bg-input/70">
         <div className="absolute inset-x-3 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-secondary" />
         <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full" style={{ left: `${(safeStart / total) * 100}%`, width: `${(safeDuration / total) * 100}%`, background: accent }} />
@@ -391,23 +391,27 @@ export default function Top5ReelsPage() {
     setFinalUrl(null);
   };
 
-  const previewCustomRange = async (rank: number, startTime: number, requestedDuration: number) => {
+  const previewCustomRange = (rank: number, startTime: number, requestedDuration: number) => {
     const entry = ranks.find((item) => item.rank === rank);
     const selected = entry && selectedCandidate(entry);
     if (!entry?.videoId || !selected) return;
     const candidate = limitToShortClip({ ...selected, startTime, endTime: startTime + requestedDuration, reason: "Custom live range" }, entry.duration);
-    try {
-      setIsPreviewingClip(true);
-      patchRank(rank, { customStart: candidate.startTime, customDuration: candidate.endTime - candidate.startTime, clipId: undefined, clipUrl: undefined, state: "ready", error: undefined });
-      await ensureHostedSource(entry, candidate, true);
-      setRenderStage(`Rank ${rank} live range preview is ready.`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Could not load this custom range.";
-      patchRank(rank, { error: message });
-      toast.error(message);
-    } finally {
-      setIsPreviewingClip(false);
-    }
+    /* Do not download while the user is still editing. Clearing the old local
+     * preview switches the panel straight to the full playable source at this
+     * timestamp. Downloading occurs only after Preview/Render is pressed. */
+    patchRank(rank, {
+      customStart: candidate.startTime,
+      customDuration: candidate.endTime - candidate.startTime,
+      hostedUrl: undefined,
+      hostedRangeStart: undefined,
+      hostedRangeEnd: undefined,
+      clipId: undefined,
+      clipUrl: undefined,
+      state: "ready",
+      error: undefined
+    });
+    setRenderStage(`Rank ${rank} custom range is live in the source player. Render when you are ready.`);
+    setFinalUrl(null);
   };
 
   const addCustomCandidate = (rank: number) => {
@@ -787,7 +791,7 @@ export default function Top5ReelsPage() {
                   <div className="flex flex-wrap items-end justify-between gap-3">
                     <div>
                       <p className="text-sm font-black text-foreground">Custom short clip</p>
-                      <p className="mt-1 text-xs text-muted-foreground">Choose any moment in the full video. The maximum duration is 15 seconds.</p>
+                      <p className="mt-1 text-xs text-muted-foreground">Drag or type a time for an instant full-source preview. Only the final selected range is capped at 15 seconds.</p>
                     </div>
                     <button type="button" onClick={() => addCustomCandidate(active.rank)} className="rounded-xl px-3 py-2 text-xs font-black text-black transition hover:brightness-110" style={{ background: accent }}>Use custom clip</button>
                   </div>
