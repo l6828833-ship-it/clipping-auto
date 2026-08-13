@@ -62,6 +62,8 @@ type RankEntry = {
   zoom: number;
   offsetX: number;
   offsetY: number;
+  /** Color of top-and-bottom bars in horizontal zoom-out mode. */
+  barColor: string;
 };
 
 const MODEL = "openai/gpt-4o-mini";
@@ -83,17 +85,25 @@ const createRank = (rank: number): RankEntry => ({
   zoom: 1,
   offsetX: 0,
   offsetY: 0,
+  barColor: "#000000",
   state: "idle",
 });
 
 const initialRanks = [5, 4, 3, 2, 1].map(createRank);
 const MAX_TOP5_CLIP_SECONDS = 15;
 
+const roundClipTime = (seconds: number) => Math.round(Math.max(0, seconds || 0) * 10) / 10;
+
 function limitToShortClip(candidate: Candidate, sourceDuration?: number): Candidate {
-  const startTime = Math.max(0, Number(candidate.startTime) || 0);
-  const availableEnd = sourceDuration && sourceDuration > 0 ? sourceDuration : Infinity;
-  const endTime = Math.min(availableEnd, startTime + MAX_TOP5_CLIP_SECONDS, Math.max(startTime + 1, Number(candidate.endTime) || startTime + MAX_TOP5_CLIP_SECONDS));
-  return { ...candidate, startTime, endTime: Math.max(startTime + 1, endTime) };
+  const sourceEnd = Number(sourceDuration) > 0 ? Number(sourceDuration) : Infinity;
+  /* Keep a legal non-zero interval even when the user selects close to the
+   * source end, but never move beyond the actual source duration. */
+  const rawStart = Math.max(0, Number(candidate.startTime) || 0);
+  const startTime = Number.isFinite(sourceEnd) ? Math.min(rawStart, Math.max(0, sourceEnd - 0.1)) : rawStart;
+  const requested = Math.max(0.1, (Number(candidate.endTime) || startTime + MAX_TOP5_CLIP_SECONDS) - startTime);
+  const available = Number.isFinite(sourceEnd) ? Math.max(0.1, sourceEnd - startTime) : MAX_TOP5_CLIP_SECONDS;
+  const duration = Math.min(MAX_TOP5_CLIP_SECONDS, requested, available);
+  return { ...candidate, startTime: roundClipTime(startTime), endTime: roundClipTime(startTime + duration) };
 }
 
 function timecode(seconds: number) {
@@ -119,9 +129,9 @@ function CustomClipTimeline({
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState<"start" | "end" | null>(null);
-  const total = Math.max(15, Number(sourceDuration) || 0);
-  const safeStart = Math.max(0, Math.min(start, total - 1));
-  const safeDuration = Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, duration, total - safeStart));
+  const total = Number(sourceDuration) > 0 ? Number(sourceDuration) : MAX_TOP5_CLIP_SECONDS;
+  const safeStart = Math.max(0, Math.min(roundClipTime(start), Math.max(0, total - 0.1)));
+  const safeDuration = Math.max(0.1, Math.min(MAX_TOP5_CLIP_SECONDS, roundClipTime(duration), Math.max(0.1, total - safeStart)));
   const end = safeStart + safeDuration;
   const pointToTime = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rect = trackRef.current?.getBoundingClientRect();
@@ -132,10 +142,10 @@ function CustomClipTimeline({
     if (!dragging) return;
     const value = pointToTime(event);
     if (dragging === "start") {
-      const nextStart = Math.max(0, Math.min(value, total - safeDuration));
+      const nextStart = roundClipTime(Math.max(0, Math.min(value, total - safeDuration)));
       onChange(nextStart, safeDuration);
     } else {
-      const nextDuration = Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, value - safeStart, total - safeStart));
+      const nextDuration = roundClipTime(Math.max(0.1, Math.min(MAX_TOP5_CLIP_SECONDS, value - safeStart, total - safeStart)));
       onChange(safeStart, nextDuration);
     }
   };
@@ -234,6 +244,7 @@ function RankOverlayPreview({
   const fullSourceEmbed = youTubeId && entry.customStart !== undefined && !previewUrl && !hostedUrl
     ? `https://www.youtube.com/embed/${youTubeId}?autoplay=1&mute=1&playsinline=1&controls=1&rel=0&start=${Math.floor(Math.max(0, entry.customStart))}`
     : undefined;
+  const letterboxMode = entry.zoom < 1 && !!hostedUrl;
 
   return (
     <div
@@ -242,12 +253,12 @@ function RankOverlayPreview({
       onPointerUp={() => setDragging(null)}
       onPointerCancel={() => setDragging(null)}
       className="relative aspect-[9/16] w-full overflow-hidden rounded-[1.5rem] bg-[#070707] shadow-2xl"
-      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)" }}
+      style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)", backgroundColor: letterboxMode ? entry.barColor : undefined }}
     >
       {previewUrl ? (
         <video ref={videoRef} key={previewUrl} src={previewUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" />
       ) : hostedUrl ? (
-        <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" style={{ transform: `scale(${entry.zoom})`, transformOrigin: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} />
+        <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className={`absolute inset-0 h-full w-full ${letterboxMode ? "object-contain" : "object-cover"}`} style={letterboxMode ? undefined : { transform: `scale(${entry.zoom})`, transformOrigin: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} />
       ) : fullSourceEmbed ? (
         <iframe key={fullSourceEmbed} src={fullSourceEmbed} title="Playable full source video" allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen className="absolute inset-0 h-full w-full border-0" />
       ) : thumbnailUrl ? (
@@ -546,7 +557,7 @@ export default function Top5ReelsPage() {
 
     // The ranked layout uses its own title and persistent number overlay; skip
     // speech-to-text captions so each selected clip can render promptly.
-    await renderClip.mutateAsync({ id: clipId, captionsEnabled: false, renderProfile: "top5", zoom: snapshot.zoom, offsetX: snapshot.offsetX, offsetY: snapshot.offsetY });
+    await renderClip.mutateAsync({ id: clipId, captionsEnabled: false, renderProfile: "top5", zoom: snapshot.zoom, offsetX: snapshot.offsetX, offsetY: snapshot.offsetY, barColor: snapshot.barColor });
     setRenderStage(`Encoding rank ${snapshot.rank} vertical clip…`);
     const finished = await waitForClip(clipId, snapshot.rank);
     patchRank(snapshot.rank, { clipId, clipUrl: finished.downloadUrl, state: "rendered" });
@@ -732,10 +743,10 @@ export default function Top5ReelsPage() {
                   </div>
                   <CustomClipTimeline sourceDuration={active.duration} start={active.customStart ?? selectedCandidate(active)?.startTime ?? 0} duration={active.customDuration ?? Math.min(MAX_TOP5_CLIP_SECONDS, Math.max(1, (selectedCandidate(active)?.endTime ?? MAX_TOP5_CLIP_SECONDS) - (selectedCandidate(active)?.startTime ?? 0)))} accent={accent} onChange={(customStart, customDuration) => patchRank(active.rank, { customStart, customDuration, hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} onCommit={(customStart, customDuration) => void previewCustomRange(active.rank, customStart, customDuration)} />
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    <label className="block"><span className="mb-1.5 block text-xs font-semibold text-foreground">Start time (seconds)</span><input type="number" min="0" max={active.duration || undefined} step="0.1" value={active.customStart ?? selectedCandidate(active)?.startTime ?? 0} onChange={(event) => patchRank(active.rank, { customStart: Math.max(0, Number(event.target.value) || 0), hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
-                    <label className="block"><span className="mb-1.5 flex justify-between text-xs font-semibold text-foreground"><span>Duration</span><span className="text-muted-foreground">1–15 sec</span></span><input type="number" min="1" max={MAX_TOP5_CLIP_SECONDS} step="0.1" value={active.customDuration ?? Math.min(MAX_TOP5_CLIP_SECONDS, Math.max(1, (selectedCandidate(active)?.endTime ?? MAX_TOP5_CLIP_SECONDS) - (selectedCandidate(active)?.startTime ?? 0)))} onChange={(event) => patchRank(active.rank, { customDuration: Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(event.target.value) || 1)), hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
+                    <label className="block"><span className="mb-1.5 block text-xs font-semibold text-foreground">Start time (seconds)</span><input type="number" min="0" max={active.duration || undefined} step="0.1" value={roundClipTime(active.customStart ?? selectedCandidate(active)?.startTime ?? 0)} onChange={(event) => patchRank(active.rank, { customStart: roundClipTime(Number(event.target.value) || 0), hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
+                    <label className="block"><span className="mb-1.5 flex justify-between text-xs font-semibold text-foreground"><span>Duration</span><span className="text-muted-foreground">1–15 sec</span></span><input type="number" min="1" max={MAX_TOP5_CLIP_SECONDS} step="0.1" value={roundClipTime(active.customDuration ?? Math.min(MAX_TOP5_CLIP_SECONDS, Math.max(1, (selectedCandidate(active)?.endTime ?? MAX_TOP5_CLIP_SECONDS) - (selectedCandidate(active)?.startTime ?? 0))))} onChange={(event) => patchRank(active.rank, { customDuration: roundClipTime(Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(event.target.value) || 1))), hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
                   </div>
-                  <div className="mt-4 rounded-xl border border-border bg-card/70 p-3"><div className="mb-2 flex items-center justify-between text-xs font-semibold text-foreground"><span>Clip zoom</span><span className="font-mono text-muted-foreground">{active.zoom.toFixed(2)}×</span></div><input type="range" min="0.5" max="3" step="0.05" value={active.zoom} onChange={(event) => patchRank(active.rank, { zoom: Number(event.target.value), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full accent-primary" /><div className="mt-2 flex items-center justify-between"><span className="text-[11px] text-muted-foreground">0.5× zooms out with a clean black fill. 1.00× is the original vertical crop; higher values zoom in.</span><button type="button" onClick={() => patchRank(active.rank, { zoom: 1, offsetX: 0, offsetY: 0, clipId: undefined, clipUrl: undefined, state: "ready" })} className="rounded-lg border border-border px-2 py-1 text-[11px] font-bold text-foreground hover:bg-secondary">Reset zoom</button></div></div>
+                  <div className="mt-4 rounded-xl border border-border bg-card/70 p-3"><div className="mb-2 flex items-center justify-between text-xs font-semibold text-foreground"><span>Clip zoom</span><span className="font-mono text-muted-foreground">{active.zoom.toFixed(2)}×</span></div><input type="range" min="0.5" max="3" step="0.05" value={active.zoom} onChange={(event) => patchRank(active.rank, { zoom: Number(event.target.value), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full accent-primary" />{active.zoom < 1 && <div className="mt-3 flex items-center justify-between rounded-lg border border-border bg-input/60 px-3 py-2"><div><p className="text-xs font-bold text-foreground">Top & bottom bar color</p><p className="text-[11px] text-muted-foreground">The full 16:9 source stays visible between these bars.</p></div><input type="color" value={active.barColor} onChange={(event) => patchRank(active.rank, { barColor: event.target.value, clipId: undefined, clipUrl: undefined, state: "ready" })} className="h-8 w-10 cursor-pointer rounded border-0 bg-transparent p-0" aria-label="Choose letterbox bar color" /></div>}<div className="mt-2 flex items-center justify-between"><span className="text-[11px] text-muted-foreground">Below 1.00× preserves the whole 16:9 video. Only top and bottom bars are added.</span><button type="button" onClick={() => patchRank(active.rank, { zoom: 1, offsetX: 0, offsetY: 0, clipId: undefined, clipUrl: undefined, state: "ready" })} className="rounded-lg border border-border px-2 py-1 text-[11px] font-bold text-foreground hover:bg-secondary">Reset zoom</button></div></div>
                 </div>
               )}
             </div>

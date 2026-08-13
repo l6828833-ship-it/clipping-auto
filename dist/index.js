@@ -702,8 +702,8 @@ function shortHash(...parts) {
 function videoFileName(videoId, sourceUrl) {
   return `video-${videoId}-${shortHash(sourceUrl)}.mp4`;
 }
-function clipFileName(clipId, sourceKey, start, end, zoom, offsetX, offsetY) {
-  return `clip-${clipId}-${shortHash(sourceKey, start, end, zoom, offsetX, offsetY)}.mp4`;
+function clipFileName(clipId, sourceKey, start, end, zoom, offsetX, offsetY, barColor = "black") {
+  return `clip-${clipId}-${shortHash(sourceKey, start, end, zoom, offsetX, offsetY, barColor)}.mp4`;
 }
 async function ensureDirs() {
   await fs.mkdir(VIDEOS_DIR, { recursive: true });
@@ -3030,9 +3030,19 @@ function buildCropFilter(crop, srcW = 0, srcH = 0) {
   const zoom = Math.max(0.1, Math.min(10, Number.isFinite(crop.zoom) ? crop.zoom : 1));
   const ox = Math.min(1, Math.max(-1, Number.isFinite(crop.offsetX) ? crop.offsetX : 0));
   const oy = Math.min(1, Math.max(-1, Number.isFinite(crop.offsetY) ? crop.offsetY : 0));
+  const barColor = typeof crop.barColor === "string" && /^#[0-9a-f]{6}$/i.test(crop.barColor) ? `0x${crop.barColor.slice(1)}` : "black";
   if (srcW > 0 && srcH > 0) {
     /* h264 with yuv420p needs even dimensions. */
     const even = (n) => Math.max(2, 2 * Math.round(n / 2));
+    /* A horizontal zoom-out is a letterbox mode, not a smaller vertical crop:
+     * keep the complete 16:9 frame at full output width and pad only above and
+     * below it. This makes 0.5×–0.99× a predictable full-frame choice. */
+    if (zoom < 1 && srcW > srcH) {
+      const fullW = TARGET_W;
+      const fullH = even(TARGET_W * srcH / srcW);
+      const barY = Math.round((TARGET_H - fullH) / 2);
+      return `scale=${fullW}:${fullH}:flags=lanczos,pad=${TARGET_W}:${TARGET_H}:0:${barY}:${barColor},setsar=1`;
+    }
     const cover = Math.max(TARGET_W / srcW, TARGET_H / srcH);
     const scaledW = even(srcW * cover * zoom);
     const scaledH = even(srcH * cover * zoom);
@@ -3058,7 +3068,7 @@ function buildCropFilter(crop, srcW = 0, srcH = 0) {
     /* Only needed when pulled back far enough that the frame is not covered. */
     if (cropW !== TARGET_W || cropH !== TARGET_H) {
       parts.push(
-        `pad=${TARGET_W}:${TARGET_H}:${Math.round((TARGET_W - cropW) / 2)}:${Math.round((TARGET_H - cropH) / 2)}:black`
+        `pad=${TARGET_W}:${TARGET_H}:${Math.round((TARGET_W - cropW) / 2)}:${Math.round((TARGET_H - cropH) / 2)}:${barColor}`
       );
     }
     parts.push("setsar=1");
@@ -3224,7 +3234,8 @@ async function renderClipFromHosted(opts) {
     end,
     crop.zoom,
     crop.offsetX,
-    crop.offsetY
+    crop.offsetY,
+    crop.barColor
   );
   const outPath = path5.join(CLIPS_DIR, fileName);
   try {
@@ -3850,6 +3861,8 @@ var appRouter = router({
       zoom: z4.number().min(0.1).max(10).optional(),
       offsetX: z4.number().min(-1).max(1).optional(),
       offsetY: z4.number().min(-1).max(1).optional(),
+      /** Top-and-bottom letterbox color used by horizontal zoom-out. */
+      barColor: z4.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
       /** Overrides the clip's saved setting for this render. */
       captionsEnabled: z4.boolean().optional(),
       /** Optimized intermediate profile used only by the ranked-video builder. */
@@ -3916,12 +3929,15 @@ var appRouter = router({
       const crop = {
         zoom: input.zoom ?? clip.zoom ?? DEFAULT_CROP.zoom,
         offsetX: input.offsetX ?? clip.offsetX ?? DEFAULT_CROP.offsetX,
-        offsetY: input.offsetY ?? clip.offsetY ?? DEFAULT_CROP.offsetY
+        offsetY: input.offsetY ?? clip.offsetY ?? DEFAULT_CROP.offsetY,
+        barColor: input.barColor ?? "#000000"
       };
       await updateClip(clip.id, {
         status: "rendering",
         errorMessage: null,
-        ...crop,
+        zoom: crop.zoom,
+        offsetX: crop.offsetX,
+        offsetY: crop.offsetY,
         captionsEnabled
       });
       /*
