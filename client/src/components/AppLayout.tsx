@@ -58,8 +58,8 @@ export default function AppLayout({ children, title }: AppLayoutProps) {
             <Zap className="w-4 h-4 text-white" />
           </div>
           <div>
-            <div className="text-sm font-black tracking-tight text-foreground">ShortsPro AI</div>
-            <div className="text-[10px] text-muted-foreground">Video Platform</div>
+            <div className="text-sm font-black tracking-tight text-foreground">Clip Maker</div>
+            <div className="text-[10px] text-muted-foreground">AI Video Clip Studio</div>
           </div>
         </Link>
       </div>

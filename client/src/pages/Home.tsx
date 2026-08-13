@@ -51,7 +51,7 @@ export default function Home() {
             <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: "var(--cobalt)" }}>
               <Zap className="w-4 h-4 text-white" />
             </div>
-            <span className="text-base font-black tracking-tight">ShortsPro AI</span>
+            <span className="text-base font-black tracking-tight">Clip Maker</span>
           </Link>
 
           <nav className="hidden md:flex items-center gap-8 text-sm text-muted-foreground">
@@ -211,14 +211,14 @@ export default function Home() {
             <div className="w-6 h-6 rounded flex items-center justify-center" style={{ background: "var(--cobalt)" }}>
               <Zap className="w-3 h-3 text-white" />
             </div>
-            <span className="text-sm font-bold">ShortsPro AI</span>
+            <span className="text-sm font-bold">Clip Maker</span>
           </div>
           <div className="flex items-center gap-6 text-xs text-muted-foreground">
             <a href="#features" className="hover:text-foreground transition-colors">Features</a>
             <a href="#how-it-works" className="hover:text-foreground transition-colors">How it works</a>
             <a href="#pricing" className="hover:text-foreground transition-colors">Pricing</a>
           </div>
-          <p className="text-xs text-muted-foreground">© 2026 ShortsPro AI</p>
+          <p className="text-xs text-muted-foreground">© 2026 Clip Maker</p>
         </div>
       </footer>
     </div>
