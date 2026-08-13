@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import AppLayout from "@/components/AppLayout";
 import { trpc } from "@/lib/trpc";
+import { parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { toast } from "sonner";
 import {
   CheckCircle2,
@@ -49,6 +50,8 @@ type RankEntry = {
   clipId?: number;
   /** Local URL for the finished selected clip, used by the in-page preview. */
   clipUrl?: string;
+  /** Hosted source media URL, available before the final clip export finishes. */
+  hostedUrl?: string;
 };
 
 const MODEL = "openai/gpt-4o-mini";
@@ -100,12 +103,16 @@ function RankOverlayPreview({
   ranks,
   accent,
   previewUrl,
+  hostedUrl,
+  previewStart,
   onMove,
 }: {
   entry: RankEntry;
   ranks: RankEntry[];
   accent: string;
   previewUrl?: string;
+  hostedUrl?: string;
+  previewStart?: number;
   onMove: (kind: "number" | "title", point: Point) => void;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
@@ -127,6 +134,8 @@ function RankOverlayPreview({
     setDragging(kind);
   };
   const previewSize = (fullSize: number, min: number) => Math.max(min, Math.round(fullSize * 0.29));
+  const youTubeId = parseYouTubeId(entry.url);
+  const thumbnailUrl = youTubeId ? youTubeThumbnail(youTubeId) : undefined;
 
   return (
     <div
@@ -139,11 +148,15 @@ function RankOverlayPreview({
     >
       {previewUrl ? (
         <video key={previewUrl} src={previewUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" />
+      ) : hostedUrl ? (
+        <video key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls onLoadedMetadata={(event) => { event.currentTarget.currentTime = Math.max(0, previewStart ?? 0); }} className="absolute inset-0 h-full w-full object-cover" />
+      ) : thumbnailUrl ? (
+        <img src={thumbnailUrl} alt={`${entry.sourceTitle || "Source"} thumbnail`} className="absolute inset-0 h-full w-full object-cover opacity-75" />
       ) : (
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_78%_16%,rgba(255,255,255,0.13),transparent_24%),linear-gradient(180deg,#161616_0%,#050505_78%)]" />
       )}
       <div className="absolute inset-x-0 top-0 z-10 h-1" style={{ background: accent }} />
-      <p className="absolute left-[10%] top-[8%] z-20 text-[8px] font-black uppercase tracking-[0.2em] text-white/55">{previewUrl ? `Rank ${entry.rank} selected clip preview` : "Persistent ranking overlay"}</p>
+      <p className="absolute left-[10%] top-[8%] z-20 text-[8px] font-black uppercase tracking-[0.2em] text-white/55">{previewUrl ? `Rank ${entry.rank} rendered clip preview` : hostedUrl ? `Rank ${entry.rank} hosted source preview` : thumbnailUrl ? `${sourceLabel(entry.url)} source preview` : "Persistent ranking overlay"}</p>
 
       {ranks.map((rankEntry) => {
         const activeNumber = rankEntry.rank === entry.rank;
@@ -201,6 +214,7 @@ export default function Top5ReelsPage() {
   const detectHighlights = trpc.gemini.detectHighlights.useMutation();
   const createClip = trpc.clips.create.useMutation();
   const renderClip = trpc.clips.render.useMutation();
+  const hostVideo = trpc.videos.host.useMutation();
   const composeTop5 = trpc.top5.compose.useMutation();
 
   const active = ranks.find((entry) => entry.rank === activeRank) ?? ranks[0];
@@ -302,11 +316,37 @@ export default function Top5ReelsPage() {
     throw new Error("Clip rendering timed out. Check the Clips page for progress.");
   };
 
+  const ensureHostedSource = async (snapshot: RankEntry, candidate: Candidate) => {
+    if (!snapshot.videoId) throw new Error(`Rank ${snapshot.rank} has no source video.`);
+    let video: any = await (utils.videos.get as any).fetch({ id: snapshot.videoId });
+    if (video?.hostedStatus === "ready" && video.hostedUrl) {
+      patchRank(snapshot.rank, { hostedUrl: video.hostedUrl });
+      return video.hostedUrl as string;
+    }
+    if (video?.hostedStatus === "error") throw new Error(video.hostError || `Could not import rank ${snapshot.rank} source.`);
+
+    setRenderStage(`Downloading rank ${snapshot.rank} source for preview…`);
+    await hostVideo.mutateAsync({ id: snapshot.videoId, startTime: candidate.startTime, endTime: candidate.endTime });
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      video = await (utils.videos.get as any).fetch({ id: snapshot.videoId });
+      if (video?.hostedStatus === "ready" && video.hostedUrl) {
+        patchRank(snapshot.rank, { hostedUrl: video.hostedUrl });
+        return video.hostedUrl as string;
+      }
+      if (video?.hostedStatus === "error") throw new Error(video.hostError || `Could not import rank ${snapshot.rank} source.`);
+      const progress = Number(video?.hostProgress || 0);
+      setRenderStage(`Downloading rank ${snapshot.rank} source for preview${progress > 0 ? ` (${progress}%)` : ""}…`);
+    }
+    throw new Error(`Rank ${snapshot.rank} source import timed out after 4 minutes. Try another public video or check Fly logs.`);
+  };
+
   const prepareRankClip = async (snapshot: RankEntry) => {
     const candidate = selectedCandidate(snapshot);
     if (!snapshot.videoId || !candidate) throw new Error(`Analyse and select a clip for rank ${snapshot.rank} first.`);
 
     patchRank(snapshot.rank, { state: "rendering", error: undefined });
+    await ensureHostedSource(snapshot, candidate);
     let clipId = snapshot.clipId;
     if (!clipId) {
       const created: any = await createClip.mutateAsync({
@@ -550,12 +590,12 @@ export default function Top5ReelsPage() {
                 <div><p className="text-sm font-black text-foreground">Persistent ranking overlay</p><p className="mt-1 text-xs text-muted-foreground">Drag the active number or title directly in the preview.</p></div>
                 <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
               </div>
-              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={selectedCandidate(active)?.startTime} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
               <button type="button" onClick={previewActiveClip} disabled={!active.videoId || !selectedCandidate(active) || isPreviewingClip || isRenderingFinal} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground transition hover:border-primary hover:bg-primary/[0.06] disabled:cursor-not-allowed disabled:opacity-45">
                 {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                 {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}
               </button>
-              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">Press Preview selected clip to render the chosen source clip and watch it here with your persistent number/title overlay. The final render reuses completed previews instead of rendering them twice.</div>
+              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">YouTube sources show their thumbnail immediately after analysis. Preview selected clip first downloads a playable source range, then shows that source here before the vertical clip export completes. The final render reuses completed previews instead of rendering them twice.</div>
               <div className="mt-4 divide-y divide-border rounded-xl border border-border bg-card">
                 {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "rendering" ? <Loader2 className="h-4 w-4 animate-spin" style={{ color: accent }} /> : entry.state === "error" ? <span className="text-xs font-black text-destructive">!</span> : entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
               </div>
