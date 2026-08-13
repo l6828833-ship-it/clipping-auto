@@ -360,6 +360,7 @@ export default function Top5ReelsPage() {
   const [renderStage, setRenderStage] = useState<string | null>(null);
   const [playerTime, setPlayerTime] = useState<number | null>(null);
   const [isMovingFootage, setIsMovingFootage] = useState(false);
+  const autoPreviewKeyRef = useRef<string | null>(null);
   const utils = trpc.useUtils();
 
   const extract = trpc.extract.transcribe.useMutation();
@@ -637,6 +638,23 @@ export default function Top5ReelsPage() {
     }
   };
 
+  /* Rendering begins automatically after the user pauses editing. The stable
+   * key prevents a status update from creating a second download for the same
+   * range and framing. */
+  useEffect(() => {
+    const selected = selectedCandidate(active);
+    if (!active.videoId || !selected || active.clipUrl || isPreviewingClip || isRenderingFinal) return;
+    const start = active.customStart ?? selected.startTime;
+    const duration = active.customDuration ?? (selected.endTime - selected.startTime);
+    const key = [active.videoId, selected.id, start.toFixed(1), duration.toFixed(1), active.zoom.toFixed(2), active.offsetX.toFixed(3), active.offsetY.toFixed(3), active.barColor].join(":");
+    if (autoPreviewKeyRef.current === key) return;
+    const timer = window.setTimeout(() => {
+      autoPreviewKeyRef.current = key;
+      void previewActiveClip();
+    }, 1400);
+    return () => window.clearTimeout(timer);
+  }, [active, isPreviewingClip, isRenderingFinal]);
+
   const renderFinal = async () => {
     const ordered = [...ranks].sort((a, b) => b.rank - a.rank);
     const missing = ordered.find((entry) => !entry.videoId || !selectedCandidate(entry));
@@ -857,11 +875,11 @@ export default function Top5ReelsPage() {
               {playerTime !== null && !active.clipUrl && parseYouTubeId(active.url) && <button type="button" onClick={() => patchRank(active.rank, { customStart: playerTime, hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} className="mt-3 flex w-full items-center justify-center rounded-xl border border-primary/45 bg-primary/[0.08] px-3 py-2 text-xs font-black text-primary transition hover:bg-primary/[0.14]">Use current video time: {timecode(playerTime)}</button>}
               <button type="button" onClick={() => setIsMovingFootage((current) => !current)} disabled={active.zoom <= 0.5} className={`mt-3 flex w-full items-center justify-center rounded-xl border px-3 py-2 text-xs font-black transition disabled:cursor-not-allowed disabled:opacity-45 ${isMovingFootage ? "border-primary bg-primary text-black" : "border-border bg-card text-foreground hover:border-primary"}`}>{isMovingFootage ? "Drag the video in preview — done" : "Move video framing"}</button>
               {active.zoom <= 0.5 && <p className="mt-2 text-center text-[11px] text-muted-foreground">Use zoom above 0.50× to reposition footage. At 0.50× the complete source frame is visible.</p>}
-              <button type="button" onClick={previewActiveClip} disabled={!active.videoId || !selectedCandidate(active) || isPreviewingClip || isRenderingFinal} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground transition hover:border-primary hover:bg-primary/[0.06] disabled:cursor-not-allowed disabled:opacity-45">
-                {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}
-              </button>
-              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">AI and custom choices are capped at 15 seconds. YouTube sources show their thumbnail immediately after analysis; preview downloads only the selected short range before the vertical export completes. Removed ranks are not included in the final overlay.</div>
+              <div className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground">
+                {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : active.clipUrl ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <Loader2 className="h-4 w-4 animate-spin" />}
+                {isPreviewingClip ? `Preparing rank ${active.rank} preview automatically…` : active.clipUrl ? "Selected clip preview is ready" : "Auto-preview starts after you pause editing…"}
+              </div>
+              <div className="mt-3 rounded-xl border border-border bg-secondary/30 p-3 text-xs leading-relaxed text-muted-foreground">AI and custom choices are capped at 15 seconds. YouTube sources update instantly while you edit. After a brief pause, the selected short range is prepared automatically for the final vertical preview. Removed ranks are not included in the final overlay.</div>
               <div className="mt-4 divide-y divide-border rounded-xl border border-border bg-card">
                 {ranks.map((entry) => <button key={entry.id} type="button" onClick={() => setActiveRank(entry.rank)} className={`flex w-full items-center gap-3 px-3 py-3 text-left transition ${activeRank === entry.rank ? "bg-secondary/60" : "hover:bg-secondary/35"}`}><span className="flex h-7 w-7 items-center justify-center rounded-lg text-xs font-black" style={{ background: entry.rank === 1 ? accent : "var(--secondary)" }}>{entry.rank}</span><span className="min-w-0 flex-1 truncate text-xs font-bold text-foreground">{entry.title || `Rank ${entry.rank} title`}</span>{entry.state === "rendering" ? <Loader2 className="h-4 w-4 animate-spin" style={{ color: accent }} /> : entry.state === "error" ? <span className="text-xs font-black text-destructive">!</span> : entry.state === "ready" || entry.state === "rendered" ? <CheckCircle2 className="h-4 w-4" style={{ color: accent }} /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</button>)}
               </div>
