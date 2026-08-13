@@ -3110,6 +3110,16 @@ async function renderClipFromHosted(opts) {
   }
   await ensureDirs();
   const duration = end - start;
+  /* Top 5 clips already have no captions and receive their shared overlay in
+   * the final composition. Encode them with a bounded fast profile so one
+   * rank cannot spend fifteen minutes on an unnecessarily slow intermediate. */
+  const rankedProfile = opts.renderProfile === "top5";
+  /* The final Top 5 composition is 30 fps, so ranked intermediates must not
+   * waste CPU encoding a 60 fps source that will be reduced immediately. */
+  const outputFps = rankedProfile ? 30 : Math.round(hostedMeta?.fps || 30);
+  const encoderPreset = rankedProfile ? "medium" : "slow";
+  const outputCrf = rankedProfile ? "18" : (hostedMeta && hostedMeta.width >= 1280 ? "17" : "18");
+  const renderTimeout = rankedProfile ? 3e5 : 9e5;
   const captionKey = captions ? crypto2.createHash("sha1").update(JSON.stringify({ w: captions.words, s: captions.style })).digest("hex").slice(0, 8) : "nocap";
   const normalised = normaliseSegments(opts.segments, duration, crop);
   const segments = hostedMeta && hostedMeta.width > 0 && hostedMeta.height > 0 ? normalised.flatMap(
@@ -3200,18 +3210,18 @@ async function renderClipFromHosted(opts) {
       "-c:v",
       "libx264",
       "-preset",
-      "slow",
+      encoderPreset,
       "-crf",
-      (hostedMeta && hostedMeta.width >= 1280) ? "17" : "18",
+      outputCrf,
       "-profile:v",
       "high",
       "-level",
       "4.2",
       "-pix_fmt",
       "yuv420p",
-      "-r", String(Math.round(hostedMeta?.fps || 30)),
+      "-r", String(outputFps),
       "-fps_mode", "cfr",
-      "-g", String(Math.round((hostedMeta?.fps || 30) * 2)),
+      "-g", String(outputFps * 2),
       "-c:a",
       "aac",
       "-b:a",
@@ -3232,7 +3242,7 @@ async function renderClipFromHosted(opts) {
       outPath
     ];
     const ffmpegLog = await runStreaming(ffmpeg, args, {
-      timeout: 9e5,
+      timeout: renderTimeout,
       cwd: tmpDir,
       captureAll: !!captions
     });
@@ -3744,7 +3754,9 @@ var appRouter = router({
       offsetX: z4.number().min(-1).max(1).optional(),
       offsetY: z4.number().min(-1).max(1).optional(),
       /** Overrides the clip's saved setting for this render. */
-      captionsEnabled: z4.boolean().optional()
+      captionsEnabled: z4.boolean().optional(),
+      /** Optimized intermediate profile used only by the ranked-video builder. */
+      renderProfile: z4.enum(["top5"]).optional()
     })).mutation(async ({ input, ctx }) => {
       const owned = await getClipsByUser(ctx.user.id);
       const clip = owned.find((c) => c.id === input.id);
@@ -3753,6 +3765,7 @@ var appRouter = router({
         throw new TRPCError5({ code: "BAD_REQUEST", message: "Set a valid start and end time before rendering." });
       }
       const captionsEnabled = input.captionsEnabled ?? clip.captionsEnabled ?? true;
+      const renderProfile = input.renderProfile === "top5" ? "top5" : "standard";
       const video = await getVideoById(clip.videoId, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "This clip's video no longer exists." });
       const hostedPath = localPathFromUrl(video.hostedUrl);
@@ -3962,7 +3975,8 @@ var appRouter = router({
             crop,
             // Time-varying framing, when the clip has a timeline.
             segments: clip.framingSegments,
-            captions: finalCaptions
+            captions: finalCaptions,
+            renderProfile
           });
           await updateClip(clip.id, {
             status: "done",
@@ -4013,7 +4027,8 @@ var appRouter = router({
                   hostedOffset: reResult.offset,
                   crop,
                   segments: clip.framingSegments,
-                  captions: finalCaptions
+                  captions: finalCaptions,
+                  renderProfile
                 });
                 await updateClip(clip.id, {
                   status: "done",
