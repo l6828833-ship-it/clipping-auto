@@ -32,6 +32,7 @@ import {
   WandSparkles,
   X,
   Youtube,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -45,7 +46,7 @@ const faqItems = [
 ];
 
 function ClipMakerMark({ className = "" }: { className?: string }) {
-  return <span className={`clip-maker-mark ${className}`} aria-hidden="true"><Play size={15} fill="currentColor" /></span>;
+  return <span className={`clip-maker-mark ${className}`} aria-hidden="true"><Zap size={16} strokeWidth={2.25} /></span>;
 }
 
 function Brand() {
