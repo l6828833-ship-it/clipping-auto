@@ -365,3 +365,8 @@ button:active:not(:disabled) {
 .sp-hero-characters{top:-130px;left:-38px;width:185px;height:120px}.crew-auto-scout{bottom:0;width:90px}.crew-clip-finisher{bottom:0;left:90px;width:78px}.crew-hey{top:2px;left:78px}
 .dash-mini-brand{min-height:25px;align-items:center}.dash-mini-brand>div{display:flex;align-items:center;min-height:25px}.dash-mini-brand b{margin:0;line-height:1}.dash-brand-mark{margin:0}
 @media(max-width:780px){.sp-hero-characters{top:-35px;left:-22px;width:170px;height:108px}.crew-auto-scout{width:78px;left:0}.crew-clip-finisher{left:78px;width:70px}.crew-hey{top:5px;left:70px}}
+
+/* One Clip Maker mark everywhere: identical blue tile, white play icon, corners, and glow. */
+.clip-maker-mark,.sp-brand-mark,.dash-brand-mark,.statement-brand-mark{width:28px!important;height:28px!important;min-width:28px!important;border-radius:9px!important;background:#315ef5!important;color:#fff!important;display:grid!important;place-items:center!important;filter:drop-shadow(0 5px 10px rgba(49,94,245,.23))!important}.clip-maker-mark svg{width:15px!important;height:15px!important}.sp-brand-mark{grid-row:1!important}.dash-brand-mark,.statement-brand-mark{flex:0 0 28px!important}
+/* Bring the two workflow characters down to meet the upper-left edge of the dashboard table. */
+.sp-hero-characters{top:-92px;left:-30px;width:185px;height:120px}.crew-auto-scout{bottom:0;left:0;width:90px}.crew-clip-finisher{bottom:0;left:90px;width:78px}.crew-hey{top:2px;left:78px}
