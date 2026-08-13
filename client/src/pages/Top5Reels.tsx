@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import AppLayout from "@/components/AppLayout";
 import { trpc } from "@/lib/trpc";
 import { parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
@@ -52,9 +52,16 @@ type RankEntry = {
   clipUrl?: string;
   /** Hosted source media URL, available before the final clip export finishes. */
   hostedUrl?: string;
+  /** Source interval represented by the current hosted preview file. */
+  hostedRangeStart?: number;
+  hostedRangeEnd?: number;
   /** User-defined full-video timestamp and duration for a custom short clip. */
   customStart?: number;
   customDuration?: number;
+  /** Per-rank crop controls shared by live preview and final render. */
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
 };
 
 const MODEL = "openai/gpt-4o-mini";
@@ -73,6 +80,9 @@ const createRank = (rank: number): RankEntry => ({
   titlePosition: { x: 0.43, y: 0.31 + (5 - rank) * 0.115 },
   numberSize: 96,
   titleSize: 56,
+  zoom: 1,
+  offsetX: 0,
+  offsetY: 0,
   state: "idle",
 });
 
@@ -90,6 +100,66 @@ function timecode(seconds: number) {
   const value = Math.max(0, Math.round(seconds || 0));
   const mins = Math.floor(value / 60);
   return `${mins}:${String(value % 60).padStart(2, "0")}`;
+}
+
+function CustomClipTimeline({
+  sourceDuration,
+  start,
+  duration,
+  accent,
+  onChange,
+  onCommit,
+}: {
+  sourceDuration?: number;
+  start: number;
+  duration: number;
+  accent: string;
+  onChange: (start: number, duration: number) => void;
+  onCommit: (start: number, duration: number) => void;
+}) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const [dragging, setDragging] = useState<"start" | "end" | null>(null);
+  const total = Math.max(15, Number(sourceDuration) || 0);
+  const safeStart = Math.max(0, Math.min(start, total - 1));
+  const safeDuration = Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, duration, total - safeStart));
+  const end = safeStart + safeDuration;
+  const pointToTime = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect) return safeStart;
+    return Math.max(0, Math.min(total, ((event.clientX - rect.left) / rect.width) * total));
+  };
+  const move = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    const value = pointToTime(event);
+    if (dragging === "start") {
+      const nextStart = Math.max(0, Math.min(value, total - safeDuration));
+      onChange(nextStart, safeDuration);
+    } else {
+      const nextDuration = Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, value - safeStart, total - safeStart));
+      onChange(safeStart, nextDuration);
+    }
+  };
+  const finishDrag = () => {
+    if (dragging) onCommit(safeStart, safeDuration);
+    setDragging(null);
+  };
+  const handleDown = (event: ReactPointerEvent<HTMLButtonElement>, handle: "start" | "end") => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDragging(handle);
+  };
+  return (
+    <div className="mt-4">
+      <div className="mb-2 flex items-center justify-between text-xs font-semibold text-muted-foreground"><span>Drag both handles to choose the live clip</span><span className="font-mono text-foreground">{timecode(safeStart)}–{timecode(end)} · {safeDuration.toFixed(1)}s</span></div>
+      <div ref={trackRef} onPointerMove={move} onPointerUp={finishDrag} onPointerCancel={finishDrag} className="relative h-11 touch-none rounded-xl border border-border bg-input/70">
+        <div className="absolute inset-x-3 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-secondary" />
+        <div className="absolute top-1/2 h-2 -translate-y-1/2 rounded-full" style={{ left: `${(safeStart / total) * 100}%`, width: `${(safeDuration / total) * 100}%`, background: accent }} />
+        <button type="button" onPointerDown={(event) => handleDown(event, "start")} className="absolute top-1/2 h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-black shadow-lg" style={{ left: `${(safeStart / total) * 100}%` }} aria-label="Drag clip start" />
+        <button type="button" onPointerDown={(event) => handleDown(event, "end")} className="absolute top-1/2 h-6 w-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-black shadow-lg" style={{ left: `${(end / total) * 100}%` }} aria-label="Drag clip end" />
+      </div>
+    </div>
+  );
 }
 
 function sourceLabel(url: string) {
@@ -127,7 +197,19 @@ function RankOverlayPreview({
   onMove: (kind: "number" | "title", point: Point) => void;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const [dragging, setDragging] = useState<"number" | "title" | null>(null);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || previewUrl || !hostedUrl || previewStart == null) return;
+    const seek = () => {
+      const maxTime = Math.max(0, (video.duration || previewStart) - 0.15);
+      video.currentTime = Math.min(Math.max(0, previewStart), maxTime);
+    };
+    if (video.readyState >= 1) seek();
+    else video.addEventListener("loadedmetadata", seek, { once: true });
+    return () => video.removeEventListener("loadedmetadata", seek);
+  }, [hostedUrl, previewStart, previewUrl]);
 
   const move = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!dragging || !frameRef.current) return;
@@ -158,16 +240,15 @@ function RankOverlayPreview({
       style={{ backgroundImage: "radial-gradient(circle at 82% 11%, rgba(255,255,255,0.11), transparent 23%), linear-gradient(180deg, #161616 0%, #050505 78%)" }}
     >
       {previewUrl ? (
-        <video key={previewUrl} src={previewUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" />
+        <video ref={videoRef} key={previewUrl} src={previewUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" />
       ) : hostedUrl ? (
-        <video key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls onLoadedMetadata={(event) => { event.currentTarget.currentTime = Math.max(0, previewStart ?? 0); }} className="absolute inset-0 h-full w-full object-cover" />
+        <video ref={videoRef} key={hostedUrl} src={hostedUrl} autoPlay muted loop playsInline controls className="absolute inset-0 h-full w-full object-cover" style={{ transform: `scale(${entry.zoom})`, transformOrigin: `${50 + entry.offsetX * 50}% ${50 + entry.offsetY * 50}%` }} />
       ) : thumbnailUrl ? (
         <img src={thumbnailUrl} alt={`${entry.sourceTitle || "Source"} thumbnail`} className="absolute inset-0 h-full w-full object-cover opacity-75" />
       ) : (
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_78%_16%,rgba(255,255,255,0.13),transparent_24%),linear-gradient(180deg,#161616_0%,#050505_78%)]" />
       )}
       <div className="absolute inset-x-0 top-0 z-10 h-1" style={{ background: accent }} />
-      <p className="absolute left-[10%] top-[8%] z-20 text-[8px] font-black uppercase tracking-[0.2em] text-white/55">{previewUrl ? `Rank ${entry.rank} rendered clip preview` : hostedUrl ? `Rank ${entry.rank} hosted source preview` : thumbnailUrl ? `${sourceLabel(entry.url)} source preview` : "Persistent ranking overlay"}</p>
 
       {ranks.map((rankEntry) => {
         const activeNumber = rankEntry.rank === entry.rank;
@@ -176,8 +257,8 @@ function RankOverlayPreview({
           top: `${rankEntry.numberPosition.y * 100}%`,
           transform: "translate(-50%, -50%)",
           fontSize: `${previewSize(rankEntry.numberSize, 18)}px`,
-          color: rankEntry.rank === 1 ? accent : "transparent",
-          WebkitTextStroke: `1.4px ${rankEntry.rank === 1 ? accent : "rgba(255,255,255,0.96)"}`,
+          color: accent,
+          WebkitTextStroke: `1.4px ${accent}`,
         } as React.CSSProperties;
         if (!activeNumber) return <span key={rankEntry.id} className="absolute z-10 select-none font-black leading-none tracking-[-0.12em]" style={numberStyle}>{rankEntry.rank}</span>;
         return (
@@ -203,9 +284,6 @@ function RankOverlayPreview({
         </button>
       )}
 
-      <div className="absolute bottom-4 left-5 right-5 rounded-lg border border-white/10 bg-black/45 px-3 py-2 text-center font-mono text-[8px] uppercase tracking-[0.16em] text-white/55 backdrop-blur-sm">
-        All rank numbers stay visible · rank {entry.rank} title appears when its clip starts
-      </div>
     </div>
   );
 }
@@ -247,6 +325,25 @@ export default function Top5ReelsPage() {
     setRanks(next);
     if (activeRank === rank) setActiveRank(next[0].rank);
     setFinalUrl(null);
+  };
+
+  const previewCustomRange = async (rank: number, startTime: number, requestedDuration: number) => {
+    const entry = ranks.find((item) => item.rank === rank);
+    const selected = entry && selectedCandidate(entry);
+    if (!entry?.videoId || !selected) return;
+    const candidate = limitToShortClip({ ...selected, startTime, endTime: startTime + requestedDuration, reason: "Custom live range" }, entry.duration);
+    try {
+      setIsPreviewingClip(true);
+      patchRank(rank, { customStart: candidate.startTime, customDuration: candidate.endTime - candidate.startTime, clipId: undefined, clipUrl: undefined, state: "ready", error: undefined });
+      await ensureHostedSource(entry, candidate, true);
+      setRenderStage(`Rank ${rank} live range preview is ready.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not load this custom range.";
+      patchRank(rank, { error: message });
+      toast.error(message);
+    } finally {
+      setIsPreviewingClip(false);
+    }
   };
 
   const addCustomCandidate = (rank: number) => {
@@ -358,7 +455,7 @@ export default function Top5ReelsPage() {
   const chooseCandidate = (rank: number, candidate: Candidate) => {
     const entry = ranks.find((item) => item.rank === rank);
     const shortCandidate = limitToShortClip(candidate, entry?.duration);
-    patchRank(rank, { selectedId: shortCandidate.id, title: shortCandidate.title, clipId: undefined, clipUrl: undefined, state: "ready" });
+    patchRank(rank, { selectedId: shortCandidate.id, title: shortCandidate.title, customStart: undefined, customDuration: undefined, clipId: undefined, clipUrl: undefined, state: "ready" });
     setFinalUrl(null);
   };
 
@@ -377,22 +474,24 @@ export default function Top5ReelsPage() {
     throw new Error("Clip rendering is still running after 2 minutes. It will continue in the background; refresh the page or check the Clips page for the finished download.");
   };
 
-  const ensureHostedSource = async (snapshot: RankEntry, candidate: Candidate) => {
+  const ensureHostedSource = async (snapshot: RankEntry, candidate: Candidate, forceRange = false) => {
     if (!snapshot.videoId) throw new Error(`Rank ${snapshot.rank} has no source video.`);
+    const sameRange = Math.abs((snapshot.hostedRangeStart ?? -1) - candidate.startTime) < 0.1 && Math.abs((snapshot.hostedRangeEnd ?? -1) - candidate.endTime) < 0.1;
     let video: any = await (utils.videos.get as any).fetch({ id: snapshot.videoId });
-    if (video?.hostedStatus === "ready" && video.hostedUrl) {
+    if (video?.hostedStatus === "ready" && video.hostedUrl && sameRange && !forceRange) {
       patchRank(snapshot.rank, { hostedUrl: video.hostedUrl });
       return video.hostedUrl as string;
     }
-    if (video?.hostedStatus === "error") throw new Error(video.hostError || `Could not import rank ${snapshot.rank} source.`);
+    if (video?.hostedStatus === "error" && !forceRange) throw new Error(video.hostError || `Could not import rank ${snapshot.rank} source.`);
 
-    setRenderStage(`Downloading rank ${snapshot.rank} source for preview…`);
-    await hostVideo.mutateAsync({ id: snapshot.videoId, startTime: candidate.startTime, endTime: candidate.endTime });
+    patchRank(snapshot.rank, { hostedUrl: undefined });
+    setRenderStage(`Loading rank ${snapshot.rank} live clip preview…`);
+    await hostVideo.mutateAsync({ id: snapshot.videoId, startTime: candidate.startTime, endTime: candidate.endTime, force: forceRange || !sameRange });
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
       video = await (utils.videos.get as any).fetch({ id: snapshot.videoId });
       if (video?.hostedStatus === "ready" && video.hostedUrl) {
-        patchRank(snapshot.rank, { hostedUrl: video.hostedUrl });
+        patchRank(snapshot.rank, { hostedUrl: video.hostedUrl, hostedRangeStart: candidate.startTime, hostedRangeEnd: candidate.endTime });
         return video.hostedUrl as string;
       }
       if (video?.hostedStatus === "error") throw new Error(video.hostError || `Could not import rank ${snapshot.rank} source.`);
@@ -403,8 +502,18 @@ export default function Top5ReelsPage() {
   };
 
   const prepareRankClip = async (snapshot: RankEntry) => {
-    const candidate = selectedCandidate(snapshot);
-    if (!snapshot.videoId || !candidate) throw new Error(`Analyse and select a clip for rank ${snapshot.rank} first.`);
+    const selected = selectedCandidate(snapshot);
+    if (!snapshot.videoId || !selected) throw new Error(`Analyse and select a clip for rank ${snapshot.rank} first.`);
+    /* A live custom range overrides the AI timestamps immediately, so preview
+     * and final export use the handle positions even before pressing a button. */
+    const candidate = snapshot.customStart !== undefined
+      ? limitToShortClip({
+          ...selected,
+          startTime: snapshot.customStart,
+          endTime: snapshot.customStart + (snapshot.customDuration ?? MAX_TOP5_CLIP_SECONDS),
+          reason: "Custom live range"
+        }, snapshot.duration)
+      : selected;
 
     patchRank(snapshot.rank, { state: "rendering", error: undefined });
     await ensureHostedSource(snapshot, candidate);
@@ -430,7 +539,7 @@ export default function Top5ReelsPage() {
 
     // The ranked layout uses its own title and persistent number overlay; skip
     // speech-to-text captions so each selected clip can render promptly.
-    await renderClip.mutateAsync({ id: clipId, captionsEnabled: false, renderProfile: "top5" });
+    await renderClip.mutateAsync({ id: clipId, captionsEnabled: false, renderProfile: "top5", zoom: snapshot.zoom, offsetX: snapshot.offsetX, offsetY: snapshot.offsetY });
     setRenderStage(`Encoding rank ${snapshot.rank} vertical clip…`);
     const finished = await waitForClip(clipId, snapshot.rank);
     patchRank(snapshot.rank, { clipId, clipUrl: finished.downloadUrl, state: "rendered" });
@@ -614,10 +723,12 @@ export default function Top5ReelsPage() {
                     </div>
                     <button type="button" onClick={() => addCustomCandidate(active.rank)} className="rounded-xl px-3 py-2 text-xs font-black text-black transition hover:brightness-110" style={{ background: accent }}>Use custom clip</button>
                   </div>
+                  <CustomClipTimeline sourceDuration={active.duration} start={active.customStart ?? selectedCandidate(active)?.startTime ?? 0} duration={active.customDuration ?? Math.min(MAX_TOP5_CLIP_SECONDS, Math.max(1, (selectedCandidate(active)?.endTime ?? MAX_TOP5_CLIP_SECONDS) - (selectedCandidate(active)?.startTime ?? 0)))} accent={accent} onChange={(customStart, customDuration) => patchRank(active.rank, { customStart, customDuration, hostedUrl: undefined, clipId: undefined, clipUrl: undefined, state: "ready" })} onCommit={(customStart, customDuration) => void previewCustomRange(active.rank, customStart, customDuration)} />
                   <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    <label className="block"><span className="mb-1.5 block text-xs font-semibold text-foreground">Start time (seconds)</span><input type="number" min="0" max={active.duration || undefined} step="1" value={active.customStart ?? 0} onChange={(event) => patchRank(active.rank, { customStart: Number(event.target.value) || 0 })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
-                    <label className="block"><span className="mb-1.5 flex justify-between text-xs font-semibold text-foreground"><span>Duration</span><span className="text-muted-foreground">1–15 sec</span></span><input type="number" min="1" max={MAX_TOP5_CLIP_SECONDS} step="1" value={active.customDuration ?? MAX_TOP5_CLIP_SECONDS} onChange={(event) => patchRank(active.rank, { customDuration: Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(event.target.value) || 1)) })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
+                    <label className="block"><span className="mb-1.5 block text-xs font-semibold text-foreground">Start time (seconds)</span><input type="number" min="0" max={active.duration || undefined} step="0.1" value={active.customStart ?? selectedCandidate(active)?.startTime ?? 0} onChange={(event) => patchRank(active.rank, { customStart: Math.max(0, Number(event.target.value) || 0), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
+                    <label className="block"><span className="mb-1.5 flex justify-between text-xs font-semibold text-foreground"><span>Duration</span><span className="text-muted-foreground">1–15 sec</span></span><input type="number" min="1" max={MAX_TOP5_CLIP_SECONDS} step="0.1" value={active.customDuration ?? Math.min(MAX_TOP5_CLIP_SECONDS, Math.max(1, (selectedCandidate(active)?.endTime ?? MAX_TOP5_CLIP_SECONDS) - (selectedCandidate(active)?.startTime ?? 0)))} onChange={(event) => patchRank(active.rank, { customDuration: Math.max(1, Math.min(MAX_TOP5_CLIP_SECONDS, Number(event.target.value) || 1)), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full rounded-xl border border-border bg-input px-3 py-2 text-sm text-foreground outline-none focus:border-primary" /></label>
                   </div>
+                  <div className="mt-4 rounded-xl border border-border bg-card/70 p-3"><div className="mb-2 flex items-center justify-between text-xs font-semibold text-foreground"><span>Clip zoom</span><span className="font-mono text-muted-foreground">{active.zoom.toFixed(2)}×</span></div><input type="range" min="1" max="3" step="0.05" value={active.zoom} onChange={(event) => patchRank(active.rank, { zoom: Number(event.target.value), clipId: undefined, clipUrl: undefined, state: "ready" })} className="w-full accent-primary" /><div className="mt-2 flex items-center justify-between"><span className="text-[11px] text-muted-foreground">Move right to zoom in. Move left to zoom out to the original frame.</span><button type="button" onClick={() => patchRank(active.rank, { zoom: 1, offsetX: 0, offsetY: 0, clipId: undefined, clipUrl: undefined, state: "ready" })} className="rounded-lg border border-border px-2 py-1 text-[11px] font-bold text-foreground hover:bg-secondary">Reset zoom</button></div></div>
                 </div>
               )}
             </div>
@@ -670,7 +781,7 @@ export default function Top5ReelsPage() {
                 <div><p className="text-sm font-black text-foreground">Persistent ranking overlay</p><p className="mt-1 text-xs text-muted-foreground">Drag the active number or title directly in the preview.</p></div>
                 <span className="rounded-lg bg-secondary px-2 py-1 font-mono text-[10px] text-muted-foreground">1080 × 1920</span>
               </div>
-              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={selectedCandidate(active)?.startTime} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
+              <RankOverlayPreview entry={active} ranks={ranks} accent={accent} previewUrl={active.clipUrl} hostedUrl={active.hostedUrl} previewStart={active.hostedUrl ? 0 : active.customStart ?? selectedCandidate(active)?.startTime} onMove={(kind, point) => patchRank(active.rank, kind === "number" ? { numberPosition: point } : { titlePosition: point })} />
               <button type="button" onClick={previewActiveClip} disabled={!active.videoId || !selectedCandidate(active) || isPreviewingClip || isRenderingFinal} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-border bg-card px-4 py-3 text-sm font-black text-foreground transition hover:border-primary hover:bg-primary/[0.06] disabled:cursor-not-allowed disabled:opacity-45">
                 {isPreviewingClip ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                 {isPreviewingClip ? `Preparing rank ${active.rank} preview…` : active.clipUrl ? "Replay selected clip preview" : `Preview rank ${active.rank} selected clip`}

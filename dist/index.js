@@ -3676,14 +3676,16 @@ var appRouter = router({
       id: z4.number(),
       /** Download only this time range (seconds). Much faster than full video. */
       startTime: z4.number().min(0).optional(),
-      endTime: z4.number().min(0).optional()
+      endTime: z4.number().min(0).optional(),
+      /** Replace a previously hosted short range for a live custom preview. */
+      force: z4.boolean().default(false)
     })).mutation(async ({ input, ctx }) => {
       const video = await getVideoById(input.id, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
       if (video.hostedStatus === "downloading") {
         return { success: true, hostedStatus: "downloading", hostedUrl: null };
       }
-      if (video.hostedStatus === "ready" && video.hostedUrl) {
+      if (video.hostedStatus === "ready" && video.hostedUrl && !input.force) {
         return { success: true, hostedStatus: "ready", hostedUrl: video.hostedUrl };
       }
       const sourceUrl = video.sourceUrl;
