@@ -357,3 +357,11 @@ button:active:not(:disabled) {
 /* The supplied stage uses a cream canvas; multiply removes the generated image's pale rectangular field while retaining the orange Clip Finisher. */
 .sp-character-stage .stage-short{mix-blend-mode:multiply;background:transparent!important}
 .sp-character-stage .stage-short{filter:none!important}
+
+/* The title now contains only Clip Maker, so align it centrally with the play-icon mark. */
+.sp-brand{grid-template-rows:27px}.sp-brand .sp-brand-mark{grid-row:1}
+
+/* Keep the illustrative character pair clear of the dashboard’s own Clip Maker brand block. */
+.sp-hero-characters{top:-130px;left:-38px;width:185px;height:120px}.crew-auto-scout{bottom:0;width:90px}.crew-clip-finisher{bottom:0;left:90px;width:78px}.crew-hey{top:2px;left:78px}
+.dash-mini-brand{min-height:25px;align-items:center}.dash-mini-brand>div{display:flex;align-items:center;min-height:25px}.dash-mini-brand b{margin:0;line-height:1}.dash-brand-mark{margin:0}
+@media(max-width:780px){.sp-hero-characters{top:-35px;left:-22px;width:170px;height:108px}.crew-auto-scout{width:78px;left:0}.crew-clip-finisher{left:78px;width:70px}.crew-hey{top:5px;left:70px}}

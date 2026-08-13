@@ -53,7 +53,6 @@ function Brand() {
     <a href="#top" className="sp-brand" aria-label="Clip Maker home">
       <ClipMakerMark className="sp-brand-mark" />
       <span>Clip <b>Maker</b></span>
-      <small>AI video studio</small>
     </a>
   );
 }
@@ -115,7 +114,7 @@ export default function Home() {
             </div>
             <div className="sp-dashboard-shell">
               <aside className="sp-dash-sidebar">
-                <div className="dash-mini-brand"><ClipMakerMark className="dash-brand-mark" /><div><b>Clip Maker</b><span>AI video studio</span></div></div>
+                <div className="dash-mini-brand"><ClipMakerMark className="dash-brand-mark" /><div><b>Clip Maker</b></div></div>
                 <div className="dash-nav"><button><LayoutDashboard size={15} />Dashboard</button><button className="dash-nav-active"><WandSparkles size={15} />Create</button><button><BarChart3 size={15} />Top 5 Reels</button><button><ListVideo size={15} />Clips</button><button><UserRound size={15} />Profile</button></div>
                 <div className="dash-user"><span>AC</span><div><b>claire</b><small>creator@clip-maker.com</small></div><MoreHorizontal size={16} /></div>
               </aside>
