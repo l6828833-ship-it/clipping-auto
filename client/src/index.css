@@ -353,3 +353,7 @@ button:active:not(:disabled) {
 @media(prefers-reduced-motion:no-preference){.crew-auto-scout,.stage-video{animation:clip-maker-scout-float 4.8s ease-in-out infinite!important}.crew-clip-finisher,.stage-short{animation:clip-maker-finisher-float 4.8s ease-in-out .55s infinite!important}}
 @keyframes clip-maker-scout-float{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-8px) rotate(2deg)}}
 @keyframes clip-maker-finisher-float{0%,100%{transform:translateY(-2px) rotate(2deg)}50%{transform:translateY(-10px) rotate(-2deg)}}
+
+/* The supplied stage uses a cream canvas; multiply removes the generated image's pale rectangular field while retaining the orange Clip Finisher. */
+.sp-character-stage .stage-short{mix-blend-mode:multiply;background:transparent!important}
+.sp-character-stage .stage-short{filter:none!important}
