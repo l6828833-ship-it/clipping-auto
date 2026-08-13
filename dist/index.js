@@ -2760,6 +2760,30 @@ async function hostVideo(opts) {
      * adaptive selector returns no format. It deliberately uses no YouTube
      * client override and accepts the best public stream the provider exposes.
      */
+    /* Direct compatible short-range path. This is the normal fallback for a
+     * selected highlight: it works for a 15-second clip even if the complete
+     * original is much longer than the bounded full-source rescue path. */
+    const downloadShortCompatible = (clientArgs = []) => runStreaming(
+      ytDlp,
+      [
+        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...clientArgs,
+        "--no-warnings",
+        "--socket-timeout", "20",
+        "--retries", "2",
+        "--fragment-retries", "2",
+        "--abort-on-unavailable-fragment",
+        "-f", compatibleFormatSelector,
+        "--merge-output-format", "mp4",
+        "--ffmpeg-location", ffmpegDir,
+        "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
+        "--newline", "--progress",
+        "-o", `${stem}.%(ext)s`,
+        ...sectionArgs,
+        "--match-filter", `duration < ${maxMinutes * 60}`,
+        sourceUrl
+      ],
+      { timeout: 18e4, onLine: makeProgressHandler() }
+    );
     const downloadCompatible = (clientArgs = []) => runStreaming(
       ytDlp,
       [
@@ -2802,17 +2826,30 @@ async function hostVideo(opts) {
           for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
             await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
           }
-          compatibleFullSource = !!range;
+          compatibleFullSource = false;
           try {
-            await downloadCompatible();
-          } catch (compatibleErr) {
-            const compatibleMessage = compatibleErr instanceof Error ? compatibleErr.message : String(compatibleErr);
-            if (!/HTTP Error 403|403:\s*Forbidden|unable to download video data/i.test(compatibleMessage)) throw compatibleErr;
-            console.warn(`[Host] Default public stream was rejected with 403. Retrying once with alternate public YouTube clients...`);
-            for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
-              await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
+            /* Keep normal long videos on a selected short range. */
+            await downloadShortCompatible();
+          } catch (shortErr) {
+            const shortMessage = shortErr instanceof Error ? shortErr.message : String(shortErr);
+            if (/HTTP Error 403|403:\s*Forbidden|unable to download video data/i.test(shortMessage)) {
+              console.warn(`[Host] Default public short stream was rejected with 403. Retrying once with alternate public YouTube clients...`);
+              for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
+                await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
+              }
+              await downloadShortCompatible(YT_PUBLIC_FALLBACK_CLIENT_ARGS);
+            } else if (range && /ffmpeg|exited with code|merge/i.test(shortMessage)) {
+              /* Only a section-cut compatibility failure uses the complete,
+               * size-bounded source rescue. It is never the normal path. */
+              console.warn(`[Host] Compatible short-range cut failed; using the bounded full-source rescue for this source...`);
+              for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
+                await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
+              }
+              compatibleFullSource = true;
+              await downloadCompatible();
+            } else {
+              throw shortErr;
             }
-            await downloadCompatible(YT_PUBLIC_FALLBACK_CLIENT_ARGS);
           }
         } else {
           throw err;
@@ -2831,8 +2868,13 @@ async function hostVideo(opts) {
     opts.onProgress?.(96);
     const downloaded = await findWritten(tmpDir, "source");
     if (!downloaded) {
+      if (range) {
+        throw new MediaError(
+          "The selected short clip could not be downloaded from this source. Try another public video or choose a different 15-second moment."
+        );
+      }
       throw new MediaError(
-        `The video could not be downloaded. It may be longer than the ${maxMinutes}-minute limit.`
+        `The complete video could not be downloaded. It may be longer than the ${maxMinutes}-minute limit.`
       );
     }
     /* The stable compatible fallback deliberately downloaded the whole muxed
