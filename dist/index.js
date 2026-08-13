@@ -3465,11 +3465,16 @@ async function renderTop5Countdown(entries) {
 
     filters.push(`${previousVideo}null[vout]`);
     const graph = filters.join(";");
+    console.log(`[Top5] Composing ${timeline.length} short ranked clip${timeline.length === 1 ? "" : "s"} (${elapsed.toFixed(1)}s total) with overlay...`);
     await runStreaming(ffmpeg, [
       ...inputArgs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
-      "-c:v", "libx264", "-preset", "slow", "-crf", "17", "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr", "-g", "60",
-      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-tag:v", "avc1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", "-y", "-loglevel", "error", outPath
-    ], { timeout: 18e5, cwd: tmpDir });
+      /* Intermediates are already 1080×1920 H.264. Medium/CRF18 preserves a
+       * clean final export while avoiding the slow-preset bottleneck on Fly's
+       * single shared CPU for a 15-second ranked video. */
+      "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr", "-g", "60",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-tag:v", "avc1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", "-threads", "1", "-y", "-loglevel", "error", outPath
+    ], { timeout: 6e5, cwd: tmpDir });
+    console.log(`[Top5] Composition finished for ${timeline.length} ranked clip${timeline.length === 1 ? "" : "s"}.`);
     const stat = await fs6.stat(outPath).catch(() => null);
     if (!stat || stat.size === 0) throw new MediaError("Top 5 rendering produced an empty file.");
     return { url: urlFor("clip", fileName), bytes: stat.size };

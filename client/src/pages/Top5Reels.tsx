@@ -362,15 +362,19 @@ export default function Top5ReelsPage() {
     setFinalUrl(null);
   };
 
-  const waitForClip = async (clipId: number) => {
-    for (let attempt = 0; attempt < 180; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 2000));
-      const clips: any[] = await (utils.clips.list as any).fetch();
+  const waitForClip = async (clipId: number, rank: number) => {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      /* The render job writes in the background. Always invalidate first so
+       * this loop cannot remain on an old cached `rendering` response. */
+      await (utils.clips.list as any).invalidate();
+      const clips: any[] = await (utils.clips.list as any).fetch(undefined, { staleTime: 0 });
       const current = clips.find((clip) => clip.id === clipId);
       if (current?.status === "done" && current.downloadUrl) return current;
       if (current?.status === "error") throw new Error(current.errorMessage || "Clip rendering failed.");
+      setRenderStage(`Encoding rank ${rank} vertical clip… checking completion (${attempt + 1}s)`);
     }
-    throw new Error("Clip rendering timed out. Check the Clips page for progress.");
+    throw new Error("Clip rendering is still running after 2 minutes. It will continue in the background; refresh the page or check the Clips page for the finished download.");
   };
 
   const ensureHostedSource = async (snapshot: RankEntry, candidate: Candidate) => {
@@ -427,7 +431,8 @@ export default function Top5ReelsPage() {
     // The ranked layout uses its own title and persistent number overlay; skip
     // speech-to-text captions so each selected clip can render promptly.
     await renderClip.mutateAsync({ id: clipId, captionsEnabled: false, renderProfile: "top5" });
-    const finished = await waitForClip(clipId);
+    setRenderStage(`Encoding rank ${snapshot.rank} vertical clip…`);
+    const finished = await waitForClip(clipId, snapshot.rank);
     patchRank(snapshot.rank, { clipId, clipUrl: finished.downloadUrl, state: "rendered" });
     return { clipId, downloadUrl: finished.downloadUrl as string };
   };
@@ -470,7 +475,7 @@ export default function Top5ReelsPage() {
         built.push({ entry: snapshot, clipId: result.clipId });
       }
 
-      setRenderStage("Joining the five clips and adding the ranking overlay…");
+      setRenderStage(`Adding the ranking overlay and exporting ${built.length} short clip${built.length === 1 ? "" : "s"}…`);
       const output: any = await composeTop5.mutateAsync({
         entries: built.map(({ entry, clipId }) => ({
           clipId,
@@ -487,8 +492,8 @@ export default function Top5ReelsPage() {
         })),
       });
       setFinalUrl(output.url);
-      setRenderStage("Top 5 video is ready.");
-      toast.success("Your Top 5 video is ready to download.");
+      setRenderStage("Your ranked video is ready to download.");
+      toast.success("Your ranked video is ready to download.");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not render the Top 5 video.";
       setRenderStage(null);
