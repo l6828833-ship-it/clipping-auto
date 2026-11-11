@@ -7,10 +7,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/requirements-whisper.txt /tmp/requirements-whisper.txt
+# Fetch the CPU-only PyTorch wheel from PyTorch. Resolve its dependencies on PyPI.
 RUN python3 -m venv /opt/media-tools \
-    && /opt/media-tools/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 'torch==2.8.0' \
-    && /opt/media-tools/bin/pip install --no-cache-dir \
-        'yt-dlp[default,curl-cffi]==2026.10.26' -r /tmp/requirements-whisper.txt
+    && /opt/media-tools/bin/python -m pip install --no-cache-dir --index-url https://pypi.org/simple 'pip==26.3' \
+    && /opt/media-tools/bin/python -m pip install --no-cache-dir --no-deps --only-binary=:all: \
+        --index-url https://download.pytorch.org/whl/cpu 'torch==2.8.0+cpu' \
+    && /opt/media-tools/bin/python -m pip install --no-cache-dir --index-url https://pypi.org/simple \
+        'torch==2.8.0+cpu' 'yt-dlp[default,curl-cffi]==2026.10.26' -r /tmp/requirements-whisper.txt \
+    && /opt/media-tools/bin/python -m pip check
 
 ENV PATH="/opt/media-tools/bin:${PATH}" XDG_CACHE_HOME=/opt/clip-maker-cache
 RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
