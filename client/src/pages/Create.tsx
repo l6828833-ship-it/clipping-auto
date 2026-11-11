@@ -6,7 +6,7 @@ import VideoFramer, { CropView, DEFAULT_FRAMING, type Framing } from "@/componen
 import SubtitleOverlay, {
   previewWordsFor, DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE, PRESET_Y,
 } from "@/components/SubtitleOverlay";
-import { parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
+import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import {
@@ -75,19 +75,20 @@ function NoKeyWarning() {
 }
 
 // ─── Extraction progress stages ───────────────────────────────────────────────
-type Stage = "idle" | "fetching-info" | "downloading" | "extracting-audio" | "transcribing" | "done" | "error";
+type Stage = "idle" | "fetching-info" | "downloading" | "extracting-audio" | "transcribing" | "uploading" | "done" | "error";
 const STAGE_LABELS: Record<Stage, string> = {
   idle: "",
   "fetching-info": "Fetching video info…",
   downloading: "Looking for YouTube transcript…",
   "extracting-audio": "Extracting & encoding audio…",
   transcribing: "Transcribing with Whisper (fallback)…",
+  uploading: "Uploading and preparing your file…",
   done: "Transcript ready!",
   error: "Extraction failed",
 };
 const STAGE_PROGRESS: Record<Stage, number> = {
   idle: 0, "fetching-info": 15, downloading: 40,
-  "extracting-audio": 65, transcribing: 85, done: 100, error: 0,
+  "extracting-audio": 65, transcribing: 85, uploading: 0, done: 100, error: 0,
 };
 
 // ─── Step bar ─────────────────────────────────────────────────────────────────
@@ -175,14 +176,6 @@ function StepInput({ apiKey, onNext }: {
     },
   });
 
-  const uploadTranscribeMutation = trpc.extract.uploadTranscribe.useMutation({
-    onError: (err) => {
-      setStage("error");
-      setStageError(err.message);
-      toast.error(err.message);
-    },
-  });
-
   const handleExtractUrl = async () => {
     if (!url.trim()) { toast.error("Please enter a video URL"); return; }
 
@@ -239,66 +232,61 @@ function StepInput({ apiKey, onNext }: {
     }
   };
 
-  const handleExtractFile = async () => {
-    if (!file) { toast.error("Please select a file"); return; }
-
-    /*
-     * With subtitles off there is nothing to send to the transcriber, so the
-     * upload needs no API key and no round trip at all.
-     */
-    if (!subtitlesOn) {
-      setStage("done");
-      setStageError("");
-      setTranscript("");
-      setTimedWords([]);
-      if (!title) setTitle(file.name.replace(/\.[^.]+$/, ""));
-      toast.success("Video ready. Subtitles are off, so nothing was transcribed.");
-      return;
-    }
-
-    setStage("extracting-audio");
-    setStageError("");
+  const selectFile = (selected: File | null) => {
+    setFile(selected);
+    setStage("idle");
     setTranscript("");
-
-    try {
-      // Read file as base64
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const result = reader.result as string;
-          resolve(result.split(",")[1] ?? "");
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      });
-
-      setTimeout(() => setStage("transcribing"), 1000);
-
-      const result = await uploadTranscribeMutation.mutateAsync({
-        fileBase64: base64, fileName: file.name, apiKey, language
-      });
-
-      setStage("done");
-      setTranscript(result.transcript);
-      if (!title) setTitle(file.name.replace(/\.[^.]+$/, ""));
-      toast.success(`Transcript ready! ${result.wordCount} words extracted.`);
-    } catch {
-      // error handled by mutation onError
+    setTimedWords([]);
+    if (selected && (!title || title === file?.name.replace(/\.[^.]+$/, ""))) {
+      setTitle(selected.name.replace(/\.[^.]+$/, "").slice(0, 512));
     }
   };
 
   const handleProceed = async () => {
     if (!title.trim()) { toast.error("Please enter a title"); return; }
+    if (mode === "upload") {
+      if (!file || stage === "uploading") return;
+      setStage("uploading");
+      setStageError("");
+      const parameters = new URLSearchParams({
+        title: title.trim(),
+        captions: subtitlesOn ? "on" : "off",
+        language,
+      });
+      try {
+        const response = await fetch(`/api/media/upload?${parameters}`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+        const result = await response.json().catch(() => null);
+        if (!response.ok || !result?.id) {
+          throw new Error(result?.error ?? "Upload failed. Check your connection and try again.");
+        }
+        void utils.videos.list.invalidate();
+        if (result.note) toast.info(result.note);
+        onNext({
+          videoId: result.id, title: title.trim(), url: "", duration: result.duration,
+          subtitlesOn, transcript: result.transcript, words: result.words, heatmap: [], chapters: [],
+        });
+      } catch (error) {
+        setStage("error");
+        setStageError(error instanceof Error ? error.message : "Upload failed. Try again.");
+      }
+      return;
+    }
 
     const videoResult = await createVideo.mutateAsync({
       title: title.trim(),
-      sourceType: mode,
-      sourceUrl: mode === "url" ? url.trim() : file?.name,
+      sourceType: "url",
+      sourceUrl: url.trim(),
       transcript: transcript.trim() || undefined,
       duration: videoMeta?.duration || undefined,
       transcriptWords: timedWords.length > 0 ? timedWords : undefined,
       transcriptionEnabled: subtitlesOn,
-    });
+    }).catch(() => null);
+    if (!videoResult) return;
 
     // No video import here — transcript extraction is subtitles-only (fast).
     // The actual video section will be imported later, after the user picks
@@ -336,6 +324,7 @@ function StepInput({ apiKey, onNext }: {
         type="button"
         role="switch"
         aria-checked={subtitlesOn}
+        disabled={isExtracting}
         onClick={() => { setSubtitlesOn(v => !v); setStage("idle"); setTranscript(""); setTimedWords([]); }}
         className="w-full glass rounded-2xl p-4 mb-5 flex items-center gap-3 text-left transition-colors hover:bg-secondary/30">
         <Captions className="w-5 h-5 shrink-0" style={{ color: subtitlesOn ? "var(--coral)" : "var(--muted-foreground)" }} />
@@ -356,7 +345,7 @@ function StepInput({ apiKey, onNext }: {
       {/* Mode toggle */}
       <div className="flex gap-2 p-1 rounded-xl bg-secondary/40 mb-6 w-fit">
         {(["url","upload"] as const).map(m => (
-          <button key={m} onClick={() => { setMode(m); setStage("idle"); setTranscript(""); setVideoMeta(null); }}
+          <button key={m} disabled={isExtracting} onClick={() => { setMode(m); setStage("idle"); setTranscript(""); setTimedWords([]); setVideoMeta(null); setHeatmap([]); setChapters([]); }}
             className={`flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-all duration-200 ${mode === m ? "text-white" : "text-muted-foreground hover:text-foreground"}`}
             style={mode === m ? { background: "var(--cobalt)" } : {}}>
             {m === "url" ? <Link2 className="w-4 h-4" /> : <Upload className="w-4 h-4" />}
@@ -373,7 +362,7 @@ function StepInput({ apiKey, onNext }: {
             <div className="flex gap-2">
               <div className="relative flex-1">
                 <Youtube className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                <input type="url" value={url} onChange={e => { setUrl(e.target.value); setStage("idle"); setTranscript(""); setVideoMeta(null); }}
+                <input type="url" value={url} disabled={isExtracting} onChange={e => { setUrl(e.target.value); setStage("idle"); setTranscript(""); setTimedWords([]); setVideoMeta(null); setHeatmap([]); setChapters([]); }}
                   placeholder="https://youtube.com/watch?v=... or any video URL"
                   className="w-full pl-10 pr-4 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm" />
               </div>
@@ -409,43 +398,52 @@ function StepInput({ apiKey, onNext }: {
             <div
               onDragOver={e => { e.preventDefault(); setDragOver(true); }}
               onDragLeave={() => setDragOver(false)}
-              onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f?.type.startsWith("video/") || f?.type.startsWith("audio/")) { setFile(f); setStage("idle"); setTranscript(""); } else toast.error("Please drop a video or audio file"); }}
-              onClick={() => fileRef.current?.click()}
+              onDrop={e => { e.preventDefault(); setDragOver(false); if (!isExtracting && e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]); }}
+              onClick={() => { if (!isExtracting) fileRef.current?.click(); }}
               className={`relative flex flex-col items-center justify-center gap-3 p-8 rounded-2xl border-2 border-dashed cursor-pointer transition-all duration-200 ${dragOver ? "border-primary bg-primary/5" : "border-border hover:border-primary/50 hover:bg-secondary/30"}`}>
               <input ref={fileRef} type="file" accept="video/*,audio/*" className="hidden"
-                onChange={e => { const f = e.target.files?.[0]; if (f) { setFile(f); setStage("idle"); setTranscript(""); } }} />
+                aria-label="Video or audio file" disabled={isExtracting}
+                onChange={e => { const f = e.target.files?.[0]; if (f) selectFile(f); e.target.value = ""; }} />
               {file ? (
                 <>
                   <CheckCircle2 className="w-8 h-8" style={{ color: "var(--mint)" }} />
                   <p className="text-sm font-semibold text-foreground">{file.name}</p>
                   <p className="text-xs text-muted-foreground">{(file.size / (1024*1024)).toFixed(1)} MB</p>
-                  <button type="button" onClick={e => { e.stopPropagation(); setFile(null); setStage("idle"); setTranscript(""); }}
+                  <button type="button" aria-label="Remove selected file" disabled={isExtracting} onClick={e => { e.stopPropagation(); selectFile(null); }}
                     className="absolute top-3 right-3 p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"><X className="w-4 h-4" /></button>
                 </>
               ) : (
                 <>
                   <FileVideo className="w-8 h-8" style={{ color: "var(--cobalt)" }} />
-                  <p className="text-sm font-semibold text-foreground">Drop your video or audio here</p>
-                  <p className="text-xs text-muted-foreground">MP4, MOV, AVI, WebM, MP3, WAV — any duration</p>
+                  <button type="button" className="text-sm font-semibold text-foreground"
+                    onClick={e => { e.stopPropagation(); fileRef.current?.click(); }}>Choose a video or audio file</button>
+                  <p className="text-xs text-muted-foreground">MP4, MOV, AVI, WebM, MP3, or WAV · up to 500 MB</p>
                 </>
               )}
             </div>
+            {subtitlesOn && (
+              <label className="flex items-center gap-3 text-sm font-medium">
+                Caption language
+                <select value={language} onChange={e => setLanguage(e.target.value)} disabled={isExtracting}
+                  className="rounded-lg border border-border bg-input px-3 py-2">
+                  {LANGUAGES.map(option => <option key={option.code} value={option.code}>{option.label}</option>)}
+                </select>
+              </label>
+            )}
           </div>
         )}
 
         {/* Extract button */}
-        {stage === "idle" || stage === "error" ? (
+        {mode === "url" && (stage === "idle" || stage === "error") && (
           <button
-            onClick={mode === "url" ? handleExtractUrl : handleExtractFile}
-            disabled={(subtitlesOn && !apiKey) || (mode === "url" ? !url.trim() : !file)}
+            onClick={handleExtractUrl}
+            disabled={!url.trim()}
             className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
             style={{ background: "linear-gradient(135deg, var(--coral), oklch(0.65 0.20 300))" }}>
             {subtitlesOn ? <Mic className="w-4 h-4" /> : <FileVideo className="w-4 h-4" />}
-            {subtitlesOn
-              ? (mode === "url" ? "Extract & Transcribe Video" : "Upload & Transcribe")
-              : (mode === "url" ? "Extract Video Info" : "Upload Video")}
+            {subtitlesOn ? "Extract & Transcribe Video" : "Extract Video Info"}
           </button>
-        ) : null}
+        )}
 
         {/* Progress bar */}
         {isExtracting && (
@@ -454,7 +452,7 @@ function StepInput({ apiKey, onNext }: {
               <Loader2 className="w-4 h-4 animate-spin shrink-0" style={{ color: "var(--cobalt)" }} />
               <span className="text-sm font-semibold text-foreground">{STAGE_LABELS[stage]}</span>
             </div>
-            <div className="h-2 rounded-full bg-secondary overflow-hidden">
+            {stage !== "uploading" && <><div className="h-2 rounded-full bg-secondary overflow-hidden">
               <div className="h-full rounded-full transition-all duration-700"
                 style={{ width: `${progress}%`, background: "linear-gradient(90deg, var(--cobalt), var(--coral))" }} />
             </div>
@@ -478,7 +476,7 @@ function StepInput({ apiKey, onNext }: {
                   </div>
                 );
               })}
-            </div>
+            </div></>}
           </div>
         )}
 
@@ -487,7 +485,7 @@ function StepInput({ apiKey, onNext }: {
           <div className="glass rounded-2xl p-4 border border-destructive/30">
             <div className="flex items-center gap-2 mb-1">
               <AlertCircle className="w-4 h-4 text-destructive" />
-              <span className="text-sm font-semibold text-destructive">Extraction failed</span>
+              <span className="text-sm font-semibold text-destructive">{mode === "upload" ? "Upload failed" : "Extraction failed"}</span>
             </div>
             <p className="text-xs text-muted-foreground">{stageError}</p>
           </div>
@@ -524,7 +522,7 @@ function StepInput({ apiKey, onNext }: {
         )}
 
         {/* Manual transcript fallback — kept minimal */}
-        {subtitlesOn && stage === "idle" && !transcript && (
+        {mode === "url" && subtitlesOn && stage === "idle" && !transcript && (
           <div className="space-y-2">
             <label className="text-xs font-medium text-muted-foreground flex items-center gap-2">
               <Captions className="w-3.5 h-3.5" />
@@ -543,7 +541,7 @@ function StepInput({ apiKey, onNext }: {
         {/* Title */}
         <div className="space-y-2">
           <label className="text-sm font-medium text-foreground">Video Title</label>
-          <input type="text" value={title} onChange={e => setTitle(e.target.value)}
+          <input type="text" value={title} disabled={isExtracting} maxLength={512} onChange={e => setTitle(e.target.value)}
             placeholder={videoMeta?.title ?? "e.g. Top 5 Moments from My Podcast"}
             className="w-full px-4 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm" />
         </div>
@@ -551,12 +549,12 @@ function StepInput({ apiKey, onNext }: {
         {/* Proceed button */}
         <button
           onClick={handleProceed}
-          disabled={!title.trim() || createVideo.isPending}
+          disabled={!title.trim() || isExtracting || createVideo.isPending || (mode === "upload" ? !file : !url.trim())}
           className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed glow-blue"
           style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
-          {createVideo.isPending
-            ? <Loader2 className="w-4 h-4 animate-spin" />
-            : <><ArrowRight className="w-4 h-4" /> Continue</>}
+          {createVideo.isPending || stage === "uploading"
+            ? <><Loader2 className="w-4 h-4 animate-spin" /> {stage === "uploading" ? "Preparing upload…" : "Saving…"}</>
+            : <><ArrowRight className="w-4 h-4" /> {mode === "upload" ? "Upload & Continue" : "Continue"}</>}
         </button>
       </div>
     </div>
@@ -570,19 +568,19 @@ function StepInput({ apiKey, onNext }: {
  * captions and no key to transcribe with. Lets the user type the clip range
  * directly so the workflow still reaches the editor.
  */
-function ManualClipPicker({ videoTitle, videoDuration, subtitlesOn, onNext }: {
-  videoTitle: string; videoDuration: number; subtitlesOn: boolean;
+function ManualClipPicker({ videoTitle, videoDuration, onNext }: {
+  videoTitle: string; videoDuration: number;
   onNext: (clips: Highlight[], reelTitle: string) => void;
 }) {
   const [start, setStart] = useState("0:00");
-  const [end, setEnd] = useState(() => fmt(Math.min(45, videoDuration || 45)));
+  const [end, setEnd] = useState(() => String(Number(Math.min(45, videoDuration || 45).toFixed(3))));
   const [reelTitle, setReelTitle] = useState(videoTitle);
 
   // Accepts "m:ss", "h:mm:ss" or a plain number of seconds.
   const parseTime = (s: string): number | null => {
     const t = s.trim();
     if (!t) return null;
-    if (!/^\d+(:\d{1,2}){0,2}$/.test(t)) return null;
+    if (!/^\d+(?::\d{1,2}){0,2}(?:\.\d{1,3})?$/.test(t)) return null;
     const secs = t.split(":").reduce((acc, p) => acc * 60 + Number(p), 0);
     return Number.isFinite(secs) ? secs : null;
   };
@@ -591,7 +589,7 @@ function ManualClipPicker({ videoTitle, videoDuration, subtitlesOn, onNext }: {
   const endSec = parseTime(end);
   const valid =
     startSec !== null && endSec !== null && endSec > startSec &&
-    (videoDuration <= 0 || endSec <= Math.ceil(videoDuration));
+    (videoDuration <= 0 || endSec <= videoDuration + 0.001);
   const length = valid ? endSec! - startSec! : 0;
 
   const proceed = () => {
@@ -616,27 +614,16 @@ function ManualClipPicker({ videoTitle, videoDuration, subtitlesOn, onNext }: {
         <p className="text-sm text-muted-foreground">From: <span className="text-foreground font-medium">{videoTitle}</span></p>
       </div>
 
-      <div className="glass rounded-2xl p-4 mb-5 flex items-start gap-3">
-        <Captions className="w-5 h-5 shrink-0 mt-0.5" style={{ color: "var(--cobalt)" }} />
-        <div className="text-xs text-muted-foreground leading-relaxed">
-          {subtitlesOn ? (
-            <>No transcript is available for this video, so AI highlight detection has nothing to read. Pick the section you want and carry on — you can transcribe just that clip on the next step.</>
-          ) : (
-            <>Subtitles are off for this video, so nothing was transcribed and AI highlight detection is skipped. Pick the section you want to turn into a clip. You can switch subtitles on later from the clip's Subtitles panel.</>
-          )}
-        </div>
-      </div>
-
       <div className="glass rounded-2xl p-5 space-y-4 mb-5">
         <div className="grid grid-cols-2 gap-4">
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">Start</label>
-            <input type="text" value={start} onChange={e => setStart(e.target.value)} placeholder="0:00"
+            <input type="text" aria-label="Clip start" value={start} onChange={e => setStart(e.target.value)} placeholder="0:00"
               className="w-full px-4 py-3 rounded-xl bg-input border border-border text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm" />
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">End</label>
-            <input type="text" value={end} onChange={e => setEnd(e.target.value)} placeholder="0:45"
+            <input type="text" aria-label="Clip end" value={end} onChange={e => setEnd(e.target.value)} placeholder="0:45"
               className="w-full px-4 py-3 rounded-xl bg-input border border-border text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm" />
           </div>
         </div>
@@ -681,12 +668,12 @@ function ManualClipPicker({ videoTitle, videoDuration, subtitlesOn, onNext }: {
 
 // ─── Step 2: Highlights ───────────────────────────────────────────────────────
 function StepHighlights({
-  videoTitle, transcript, apiKey, model, videoDuration, subtitlesOn,
+  videoTitle, transcript, apiKey, model, videoDuration,
   transcriptWords, heatmap, chapters,
   onNext
 }: {
   videoTitle: string; transcript: string; apiKey: string; model: string;
-  videoDuration: number; subtitlesOn: boolean;
+  videoDuration: number;
   /** Word timings, so detected clips land on the words actually spoken. */
   transcriptWords: { word: string; start: number; end: number }[];
   /** YouTube's most-replayed curve, when available — real engagement data. */
@@ -696,6 +683,7 @@ function StepHighlights({
 }) {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [reelTitle, setReelTitle] = useState("");
+  const [manual, setManual] = useState(false);
 
   const detect = trpc.gemini.detectHighlights.useMutation({
     onSuccess: (data) => {
@@ -739,12 +727,11 @@ function StepHighlights({
    * import, and also when a video simply has no captions. Either way the user
    * needs a way to pick a clip range by hand instead of being stuck here.
    */
-  if (!transcript.trim()) {
+  if (manual || !transcript.trim()) {
     return (
       <ManualClipPicker
         videoTitle={videoTitle}
         videoDuration={videoDuration}
-        subtitlesOn={subtitlesOn}
         onNext={onNext}
       />
     );
@@ -757,6 +744,12 @@ function StepHighlights({
         <p className="text-sm text-muted-foreground">Analyzing: <span className="text-foreground font-medium">{videoTitle}</span></p>
       </div>
       {!apiKey && <NoKeyWarning />}
+      {!detect.isPending && (
+        <button type="button" onClick={() => setManual(true)}
+          className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
+          Choose Clip Manually
+        </button>
+      )}
       {!detect.data && !detect.isPending && (
         <button onClick={() => detect.mutate(detectInput)}
           disabled={!apiKey}
@@ -1330,11 +1323,11 @@ function StepEdit({
    */
   const transcribing = useRef<Set<number>>(new Set());
   useEffect(() => {
-    if (hostedStatus !== "ready") return;
+    if (hostedStatus !== "ready" || !captionsOn || video?.sourceType === "upload") return;
     const apiKey = "server";
     for (const h of clips) {
       const e = edits[h.id];
-      if (!e || transcribing.current.has(e.clipId)) continue;
+      if (!e || e.words.length > 0 || transcribing.current.has(e.clipId)) continue;
       transcribing.current.add(e.clipId);
       transcribeClip.mutateAsync({ id: e.clipId, apiKey, language: "en", force: true })
         .then((result: any) => {
@@ -1356,7 +1349,7 @@ function StepEdit({
         .catch(() => { /* fallback to YouTube captions already seeded */ });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostedStatus, clips, edits]);
+  }, [hostedStatus, clips, edits, captionsOn, video?.sourceType]);
 
   // Start the import if it has not begun, so the preview can fill in.
   const importStarted = useRef<number | null>(null);
@@ -1409,8 +1402,10 @@ function StepEdit({
         if (e) await persist(h, e);
       }
       toast.success("Edits saved.");
+      return true;
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not save the edits");
+      return false;
     } finally {
       setSaving(false);
     }
@@ -1707,7 +1702,7 @@ function StepEdit({
 
       <button
         onClick={async () => {
-          await saveAll();
+          if (!await saveAll()) return;
           const ids: Record<number, number> = {};
           for (const h of clips) if (edits[h.id]) ids[h.id] = edits[h.id].clipId;
           onNext(ids);
@@ -1732,9 +1727,12 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
   captionsOn: boolean;
   apiKey: string; model: string;
 }) {
-  const [rendered, setRendered] = useState<Set<number>>(new Set());
   const [rendering, setRendering] = useState<Set<number>>(new Set());
   const utils = trpc.useUtils();
+  const { data: exports = [] } = trpc.clips.list.useQuery(undefined, { refetchInterval: 2500 });
+  const exportById = new Map<number, { status: string; downloadUrl?: string | null; errorMessage?: string | null }>(
+    exports.map(clip => [clip.id, clip]),
+  );
   const startRender = trpc.clips.render.useMutation({ onSuccess: () => utils.clips.list.invalidate() });
   const generateTitle = trpc.gemini.generateTitle.useMutation();
   const [hookTitles, setHookTitles] = useState<Record<number, { title: string; hook: string; hashtags: string[] }>>({});
@@ -1753,8 +1751,6 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
     setRendering(prev => new Set(Array.from(prev).concat(h.id)));
     try {
       await startRender.mutateAsync({ id: clipId, captionsEnabled: captionsOn });
-      setRendered(prev => new Set(Array.from(prev).concat(h.id)));
-      toast.success(`"${h.title}" is rendering — track it on the Clips page.`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not start the render");
     } finally {
@@ -1770,7 +1766,10 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
     } catch { toast.error("Failed to generate hook"); }
   };
 
-  const renderAll = () => clips.forEach(h => { if (!rendered.has(h.id) && !rendering.has(h.id)) renderClip(h); });
+  const renderAll = () => clips.forEach(h => {
+    const status = exportById.get(clipIds[h.id])?.status;
+    if (status !== "done" && status !== "rendering" && !rendering.has(h.id)) void renderClip(h);
+  });
 
   return (
     <div className="animate-slide-up">
@@ -1786,7 +1785,9 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
       </div>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {clips.map(h => {
-          const isRendering = rendering.has(h.id), isDone = rendered.has(h.id);
+          const result = exportById.get(clipIds[h.id]);
+          const isRendering = rendering.has(h.id) || result?.status === "rendering";
+          const file = result?.status === "done" ? result.downloadUrl : null;
           const scoreColor = h.engagementScore >= 90 ? "var(--mint)" : "var(--cobalt)";
           const hook = hookTitles[h.id];
           const ytId = parseYouTubeId(videoUrl);
@@ -1818,14 +1819,15 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
                 )}
                 <div className="flex gap-2 flex-wrap">
                   {!hook && <button onClick={() => genHook(h)} disabled={generateTitle.isPending} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all hover:opacity-80" style={{ background:"rgba(221, 125, 113, 0.1)", color:"var(--coral)" }}><Wand2 className="w-3 h-3" /> AI Hook</button>}
-                  {isDone ? (
-                    <a href="/dashboard/clips" className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Film className="w-3.5 h-3.5" /> View in Clips</a>
+                  {file ? (
+                    <a href={downloadUrl(file)} download className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Download className="w-3.5 h-3.5" /> Download MP4</a>
                   ) : isRendering ? (
                     <div className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground bg-secondary/60"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Rendering…</div>
                   ) : (
-                    <button onClick={() => renderClip(h)} className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80" style={{ background:"var(--cobalt)" }}><Zap className="w-3.5 h-3.5" /> Render</button>
+                    <button onClick={() => renderClip(h)} className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80" style={{ background:"var(--cobalt)" }}><Zap className="w-3.5 h-3.5" /> {result?.status === "error" ? "Retry Render" : "Render"}</button>
                   )}
                 </div>
+                {result?.status === "error" && <p role="alert" className="mt-2 text-xs text-destructive">{result.errorMessage ?? "Rendering failed."}</p>}
               </div>
             </div>
           );
@@ -1878,13 +1880,6 @@ export default function CreatePage() {
   // Framing is per-clip now and lives in the Edit step.
   // Whether captions get burned into the exported clips.
   const [captionsOn, setCaptionsOn] = useState(true);
-  /*
-   * The import-time subtitles decision. Kept so later steps know whether a
-   * transcript is expected at all, and so the highlights step can fall back to
-   * manual clip selection instead of stalling with nothing to analyse.
-   */
-  const [subtitlesOn, setSubtitlesOn] = useState(true);
-
   return (
     <AppLayout title="Create">
       <div className="max-w-4xl mx-auto">
@@ -1895,7 +1890,6 @@ export default function CreatePage() {
             setVideoTitle(v.title); setTranscript(v.transcript); setVideoDuration(v.duration);
             setTranscriptWords(v.words);
             setHeatmap(v.heatmap); setChapters(v.chapters);
-            setSubtitlesOn(v.subtitlesOn);
             // Subtitles off at import means nothing to burn in at export either.
             setCaptionsOn(v.subtitlesOn);
             setStep(2);
@@ -1905,7 +1899,6 @@ export default function CreatePage() {
           <StepHighlights videoTitle={videoTitle} transcript={transcript} apiKey={apiKey} model={model} videoDuration={videoDuration}
             transcriptWords={transcriptWords}
             heatmap={heatmap} chapters={chapters}
-            subtitlesOn={subtitlesOn}
             onNext={(clips, rt) => {
               setSelectedClips(clips);
               setReelTitle(rt);

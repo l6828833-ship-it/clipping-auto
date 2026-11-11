@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Clip Maker</string>
+    <key>ClipMakerServiceURL</key>
+    <string>$(CLIP_MAKER_SERVICE_URL)</string>
+#if CLIP_MAKER_LOCAL
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>127.0.0.1</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+        </dict>
+    </dict>
+#endif
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Clip Maker uses on-device speech recognition to generate captions for your selected clip.</string>
+</dict>
+</plist>

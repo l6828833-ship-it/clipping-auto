@@ -11,6 +11,7 @@ import {
   removeSegmentAt, setSegmentKeyframe, setSegmentMoving, setSegmentEase,
   chainToNext, hasJumpAfter, isAnimated, segmentTarget, framingAt,
   DEFAULT_ZOOM_LENGTH,
+  segmentAt,
 } from "@shared/framing";
 
 export type { FramingSegment };
@@ -34,7 +35,7 @@ export type Keyframe = "from" | "to";
  * All times are clip-relative seconds, matching what the renderer expects.
  */
 
-export type TimelineWord = { word: string; start: number; end: number };
+export type TimelineWord = { word: string; start: number; end: number; posX?: number; posY?: number };
 
 /** A text overlay block that appears at a specific time range on the clip. */
 export type TextOverlay = {
@@ -434,29 +435,32 @@ export function ClipTimeline({
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
       setDragging(null);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
   }, [pxPerSec]);
 
   // ─── Framing operations ────────────────────────────────────────────────────
 
   const addZoom = (t: number) => {
-    const result = insertZoomAt(list, t, safeDuration, baseFraming, {
-      length: Math.min(DEFAULT_ZOOM_LENGTH, safeDuration),
-    });
-    if (result.selectIndex == null) return;
-    onSegmentsChange(result.segments);
-    onSelectSegment(result.selectIndex);
+    const length = Math.min(DEFAULT_ZOOM_LENGTH, safeDuration);
+    const start = Math.max(0, Math.min(t, safeDuration - length));
+    const current = segmentAt(list, start);
+    const crop = current === undefined ? baseFraming : framingAt(list[current], start);
+    const next = insertZoomAt(list, start, crop, length);
+    onSegmentsChange(next);
+    onSelectSegment(next.findIndex(segment => segment.start === start));
     onEditingKeyframeChange?.("to");
   };
 
   const splitFramingAt = (t: number) => {
-    const result = splitSegmentAt(list, t, safeDuration, baseFraming);
-    if (result.selectIndex == null) return;
-    onSegmentsChange(result.segments);
-    onSelectSegment(result.selectIndex);
+    const next = splitSegmentAt(list, t);
+    if (next === list) return;
+    onSegmentsChange(next);
+    onSelectSegment(next.findIndex(segment => segment.start === t));
   };
 
   const removeSegment = (index: number) => {
@@ -465,11 +469,19 @@ export function ClipTimeline({
   };
 
   const trimSegment = (index: number, edge: "start" | "end", time: number) => {
-    onSegmentsChange(trimSegmentEdge(list, index, edge, snapSegment(time, index), safeDuration));
+    const previousEnd = list[index - 1]?.end ?? 0;
+    const nextStart = list[index + 1]?.start ?? safeDuration;
+    const snapped = Math.max(previousEnd, Math.min(nextStart, snapSegment(time, index)));
+    onSegmentsChange(trimSegmentEdge(list, index, edge, snapped));
   };
 
   const moveSegment = (index: number, newStart: number) => {
-    onSegmentsChange(shiftSegment(list, index, snapSegment(newStart, index), safeDuration));
+    const segment = list[index];
+    const previousEnd = list[index - 1]?.end ?? 0;
+    const nextStart = list[index + 1]?.start ?? safeDuration;
+    const latest = nextStart - (segment.end - segment.start);
+    const start = Math.max(previousEnd, Math.min(latest, snapSegment(newStart, index)));
+    onSegmentsChange(shiftSegment(list, index, start - segment.start));
   };
 
   const setKeyframe = (index: number, which: Keyframe, crop: Crop) => {

@@ -1,26 +1,28 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import AppLayout from "@/components/AppLayout";
+import { formatTime } from "@/lib/videoSource";
+import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import {
-  Plus, X, Play, Zap, Download, Loader2, ChevronUp, ChevronDown,
-  Palette, Type, Music, Film, CheckCircle2, Edit3, RotateCcw
+  X, Play, Zap, Download, Loader2, ChevronUp, ChevronDown,
+  Palette, Type, Film, CheckCircle2, Edit3, RotateCcw
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface Slot {
   id: number;
   title: string;
-  url: string;
+  clipId: number | null;
   duration: string;
   active: boolean;
 }
 
 const DEFAULT_SLOTS: Slot[] = [
-  { id: 1, title: "Slot 1 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 2, title: "Slot 2 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 3, title: "Slot 3 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 4, title: "Slot 4 — Add clip", url: "", duration: "0:00", active: false },
-  { id: 5, title: "Slot 5 — Add clip", url: "", duration: "0:00", active: false },
+  { id: 1, title: "", clipId: null, duration: "", active: false },
+  { id: 2, title: "", clipId: null, duration: "", active: false },
+  { id: 3, title: "", clipId: null, duration: "", active: false },
+  { id: 4, title: "", clipId: null, duration: "", active: false },
+  { id: 5, title: "", clipId: null, duration: "", active: false },
 ];
 
 const ACCENT_COLORS = [
@@ -32,13 +34,15 @@ const ACCENT_COLORS = [
 ];
 
 const BG_GRADIENTS = [
-  { label: "Deep Space",  value: "linear-gradient(180deg, #0a0a1a 0%, #1a0a2e 100%)" },
-  { label: "Midnight",    value: "linear-gradient(180deg, #000000 0%, #0d1117 100%)" },
-  { label: "Dark Ocean",  value: "linear-gradient(180deg, #0a1628 0%, #0d2137 100%)" },
-  { label: "Dark Forest", value: "linear-gradient(180deg, #0a1a0a 0%, #0d2a0d 100%)" },
+  { label: "Deep Space",  colors: ["#0a0a1a", "#1a0a2e"] },
+  { label: "Midnight",    colors: ["#000000", "#0d1117"] },
+  { label: "Dark Ocean",  colors: ["#0a1628", "#0d2137"] },
+  { label: "Dark Forest", colors: ["#0a1a0a", "#0d2a0d"] },
 ];
 
 const TITLE_FONTS = ["Montserrat", "Impact", "Arial Black", "Oswald", "Inter"];
+const DEFAULT_TITLE = "TOP 5 INSANE MOMENTS";
+type LibraryClip = { id: number; title: string | null; startTime: number | null; endTime: number | null };
 
 // ─── 9:16 Preview ─────────────────────────────────────────────────────────────
 function ReelPreview({
@@ -111,28 +115,34 @@ function ReelPreview({
 
 // ─── Slot Editor Row ──────────────────────────────────────────────────────────
 function SlotRow({
-  slot, index, accentColor, onUpdate, onMoveUp, onMoveDown, isFirst, isLast
+  slot, index, accentColor, library, onUpdate, onMoveUp, onMoveDown, isFirst, isLast
 }: {
   slot: Slot; index: number; accentColor: string;
+  library: LibraryClip[];
   onUpdate: (id: number, data: Partial<Slot>) => void;
   onMoveUp: (id: number) => void; onMoveDown: (id: number) => void;
   isFirst: boolean; isLast: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [localTitle, setLocalTitle] = useState(slot.title);
-  const [localUrl, setLocalUrl] = useState(slot.url);
+  const [localClipId, setLocalClipId] = useState(slot.clipId);
 
   const save = () => {
-    onUpdate(slot.id, { title: localTitle, url: localUrl, active: localTitle.trim() !== "" && localTitle !== `Slot ${index + 1} — Add clip` });
+    const selected = library.find(clip => clip.id === localClipId);
+    const title = localTitle.trim();
+    if (!title) return;
+    onUpdate(slot.id, {
+      title, clipId: localClipId, active: true,
+      duration: selected ? formatTime(Math.min(60, (selected.endTime ?? 0) - (selected.startTime ?? 0))) : "0:03",
+    });
     setEditing(false);
     toast.success(`Slot ${index + 1} updated`);
   };
 
   const clear = () => {
-    const def = `Slot ${index + 1} — Add clip`;
-    setLocalTitle(def);
-    setLocalUrl("");
-    onUpdate(slot.id, { title: def, url: "", active: false });
+    setLocalTitle("");
+    setLocalClipId(null);
+    onUpdate(slot.id, { title: "", clipId: null, duration: "", active: false });
     setEditing(false);
   };
 
@@ -149,27 +159,27 @@ function SlotRow({
           <div className="text-sm font-semibold text-foreground truncate">
             {slot.active ? slot.title : <span className="text-muted-foreground italic">Empty slot — click Edit to add</span>}
           </div>
-          {slot.url && <div className="text-xs text-muted-foreground truncate">{slot.url}</div>}
+          {slot.active && <div className="text-xs text-muted-foreground">{slot.clipId ? slot.duration : "Title card · 3 seconds"}</div>}
         </div>
         {/* Status */}
         {slot.active && <CheckCircle2 className="w-4 h-4 shrink-0" style={{ color: "var(--mint)" }} />}
         {/* Actions */}
         <div className="flex items-center gap-1 shrink-0">
-          <button onClick={() => onMoveUp(slot.id)} disabled={isFirst}
+          <button aria-label={`Move slot ${index + 1} up`} onClick={() => onMoveUp(slot.id)} disabled={isFirst}
             className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors disabled:opacity-30">
             <ChevronUp className="w-3.5 h-3.5" />
           </button>
-          <button onClick={() => onMoveDown(slot.id)} disabled={isLast}
+          <button aria-label={`Move slot ${index + 1} down`} onClick={() => onMoveDown(slot.id)} disabled={isLast}
             className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors disabled:opacity-30">
             <ChevronDown className="w-3.5 h-3.5" />
           </button>
-          <button onClick={() => setEditing(v => !v)}
+          <button aria-label={`Edit slot ${index + 1}`} onClick={() => { setLocalTitle(slot.title); setLocalClipId(slot.clipId); setEditing(v => !v); }}
             className="p-1.5 rounded-lg transition-colors hover:bg-secondary/60"
             style={{ color: editing ? accentColor : "var(--muted-foreground)" }}>
             <Edit3 className="w-3.5 h-3.5" />
           </button>
           {slot.active && (
-            <button onClick={clear}
+            <button aria-label={`Clear slot ${index + 1}`} onClick={clear}
               className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors">
               <X className="w-3.5 h-3.5" />
             </button>
@@ -180,20 +190,28 @@ function SlotRow({
       {editing && (
         <div className="px-4 pb-4 pt-1 border-t border-border space-y-3 animate-slide-up">
           <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Clip Title</label>
-            <input type="text" value={localTitle} onChange={e => setLocalTitle(e.target.value)}
+            <label className="text-xs text-muted-foreground mb-1 block" htmlFor={`slot-title-${slot.id}`}>Clip Title</label>
+            <input id={`slot-title-${slot.id}`} type="text" value={localTitle} maxLength={120} onChange={e => setLocalTitle(e.target.value)}
               placeholder="e.g. The Most Shocking Moment"
               className="w-full px-3 py-2 rounded-lg bg-input border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all" />
           </div>
           <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Video URL or file path</label>
-            <input type="text" value={localUrl} onChange={e => setLocalUrl(e.target.value)}
-              placeholder="https://... or leave blank for placeholder"
-              className="w-full px-3 py-2 rounded-lg bg-input border border-border text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all" />
+            <label className="text-xs text-muted-foreground mb-1 block" htmlFor={`slot-source-${slot.id}`}>Source</label>
+            <select id={`slot-source-${slot.id}`} value={localClipId ?? ""}
+              onChange={e => {
+                const id = e.target.value ? Number(e.target.value) : null;
+                setLocalClipId(id);
+                if (!localTitle.trim()) setLocalTitle(library.find(clip => clip.id === id)?.title?.slice(0, 120) ?? "");
+              }}
+              className="w-full px-3 py-2 rounded-lg bg-input border border-border text-foreground text-sm">
+              <option value="">Title card</option>
+              {library.map(clip => <option key={clip.id} value={clip.id}>{clip.title ?? "Untitled clip"}</option>)}
+            </select>
+            {library.length === 0 && <p className="mt-1 text-xs text-muted-foreground">Render a clip to add it from your library.</p>}
           </div>
           <div className="flex gap-2">
-            <button onClick={save}
-              className="flex-1 py-2 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80"
+            <button onClick={save} disabled={!localTitle.trim()}
+              className="flex-1 py-2 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80 disabled:opacity-40"
               style={{ background: accentColor }}>
               Save
             </button>
@@ -211,13 +229,27 @@ function SlotRow({
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function Top5ReelsPage() {
   const [slots, setSlots] = useState<Slot[]>(DEFAULT_SLOTS);
-  const [reelTitle, setReelTitle] = useState("TOP 5 INSANE MOMENTS");
+  const [reelTitle, setReelTitle] = useState(DEFAULT_TITLE);
   const [accentColor, setAccentColor] = useState("#00B4FF");
-  const [bgGradient, setBgGradient] = useState(BG_GRADIENTS[0].value);
+  const [background, setBackground] = useState(BG_GRADIENTS[0]);
   const [titleFont, setTitleFont] = useState("Montserrat");
   const [activeSlot, setActiveSlot] = useState(1);
   const [rendering, setRendering] = useState(false);
-  const [rendered, setRendered] = useState(false);
+  const [output, setOutput] = useState<{ url: string; options: string; expiresAt: number } | null>(null);
+  const { data: clips = [] } = trpc.clips.list.useQuery();
+  const library: LibraryClip[] = clips.filter(clip => clip.status === "done" && clip.downloadUrl);
+  const reelSlots = slots.flatMap((slot, index) => slot.active
+    ? [{ rank: index + 1, title: slot.title, clipId: slot.clipId }]
+    : []);
+  const options = JSON.stringify({ title: reelTitle, accent: accentColor, background: background.colors, font: titleFont, slots: reelSlots });
+  const download = output?.options === options ? output.url : null;
+  const bgGradient = `linear-gradient(180deg, ${background.colors[0]}, ${background.colors[1]})`;
+
+  useEffect(() => {
+    if (!output) return;
+    const timer = setTimeout(() => setOutput(null), Math.max(0, output.expiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [output]);
 
   // Auto-cycle active slot for preview animation
   const cycleSlot = () => setActiveSlot(prev => prev >= 5 ? 1 : prev + 1);
@@ -246,12 +278,35 @@ export default function Top5ReelsPage() {
     });
   };
 
-  const handleRender = () => {
+  const handleRender = async () => {
     setRendering(true);
-    setTimeout(() => { setRendering(false); setRendered(true); toast.success("Top 5 Reel rendered and ready!"); }, 3000);
+    try {
+      const response = await fetch("/api/reels/render", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: options,
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.url) throw new Error(data?.error ?? "Couldn’t render this reel.");
+      setOutput({ url: data.url, options, expiresAt: data.expiresAt });
+      toast.success("Reel ready to download.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Couldn’t render this reel.");
+    } finally {
+      setRendering(false);
+    }
   };
 
-  const reset = () => { setSlots(DEFAULT_SLOTS); setRendered(false); toast.info("Reset to defaults"); };
+  const reset = () => {
+    setSlots(DEFAULT_SLOTS);
+    setReelTitle(DEFAULT_TITLE);
+    setAccentColor(ACCENT_COLORS[0].value);
+    setBackground(BG_GRADIENTS[0]);
+    setTitleFont(TITLE_FONTS[0]);
+    setActiveSlot(1);
+    setOutput(null);
+  };
 
   const filledCount = slots.filter(s => s.active).length;
 
@@ -267,17 +322,17 @@ export default function Top5ReelsPage() {
             <p className="text-sm text-muted-foreground">Build a viral "Top 5" countdown reel with a 9:16 vertical format.</p>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={reset} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors">
+            <button onClick={reset} disabled={rendering} className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-muted-foreground hover:text-foreground hover:bg-secondary/60 transition-colors">
               <RotateCcw className="w-3.5 h-3.5" /> Reset
             </button>
-            {rendered ? (
-              <a href="#" onClick={e => { e.preventDefault(); toast.info("In production, this downloads the rendered Top 5 Reel."); }}
+            {download ? (
+              <a href={download} download
                 className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold transition-all hover:opacity-80 glow-green"
                 style={{ background: "rgba(89, 164, 133, 0.1)", color: "var(--mint)" }}>
                 <Download className="w-4 h-4" /> Download Reel
               </a>
             ) : (
-              <button onClick={handleRender} disabled={rendering || filledCount === 0}
+              <button onClick={handleRender} disabled={rendering || filledCount === 0 || !reelTitle.trim()}
                 className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed glow-blue"
                 style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
                 {rendering ? <><Loader2 className="w-4 h-4 animate-spin" /> Rendering…</> : <><Zap className="w-4 h-4" /> Render Reel</>}
@@ -292,7 +347,7 @@ export default function Top5ReelsPage() {
             {/* Reel title */}
             <div className="glass rounded-2xl p-5">
               <label className="text-sm font-medium text-foreground mb-2 block">Reel Title</label>
-              <input type="text" value={reelTitle} onChange={e => setReelTitle(e.target.value)}
+              <input type="text" value={reelTitle} maxLength={100} onChange={e => setReelTitle(e.target.value)}
                 placeholder="TOP 5 INSANE MOMENTS"
                 className="w-full px-4 py-3 rounded-xl bg-input border border-border text-foreground text-sm font-bold uppercase focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all" />
             </div>
@@ -304,7 +359,7 @@ export default function Top5ReelsPage() {
                 <span className="text-xs text-muted-foreground">{filledCount}/5 filled</span>
               </div>
               {slots.map((slot, i) => (
-                <SlotRow key={slot.id} slot={slot} index={i} accentColor={accentColor}
+                <SlotRow key={slot.id} slot={slot} index={i} accentColor={accentColor} library={library}
                   onUpdate={updateSlot} onMoveUp={moveUp} onMoveDown={moveDown}
                   isFirst={i === 0} isLast={i === slots.length - 1} />
               ))}
@@ -331,9 +386,9 @@ export default function Top5ReelsPage() {
                 <label className="text-xs text-muted-foreground mb-2 block">Background</label>
                 <div className="grid grid-cols-4 gap-2">
                   {BG_GRADIENTS.map(g => (
-                    <button key={g.label} onClick={() => setBgGradient(g.value)}
-                      className={`h-10 rounded-lg border-2 transition-all ${bgGradient === g.value ? "border-white scale-105" : "border-transparent hover:border-border"}`}
-                      style={{ background: g.value }} title={g.label} />
+                    <button key={g.label} onClick={() => setBackground(g)}
+                      className={`h-10 rounded-lg border-2 transition-all ${background.label === g.label ? "border-white scale-105" : "border-transparent hover:border-border"}`}
+                      style={{ background: `linear-gradient(180deg, ${g.colors[0]}, ${g.colors[1]})` }} title={g.label} />
                   ))}
                 </div>
               </div>
@@ -386,13 +441,13 @@ export default function Top5ReelsPage() {
             </div>
 
             {/* Render status */}
-            {rendered && (
+            {download && (
               <div className="glass rounded-2xl p-4 animate-scale-in" style={{ border: "1px solid oklch(0.75 0.20 145 / 0.4)" }}>
                 <div className="flex items-center gap-2 mb-2">
                   <CheckCircle2 className="w-4 h-4" style={{ color: "var(--mint)" }} />
                   <span className="text-sm font-semibold" style={{ color: "var(--mint)" }}>Ready to download</span>
                 </div>
-                <p className="text-xs text-muted-foreground">Your Top 5 Reel has been rendered with all {filledCount} clips and your custom style.</p>
+                <p className="text-xs text-muted-foreground">The download is available for one hour.</p>
               </div>
             )}
           </div>

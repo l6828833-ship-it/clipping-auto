@@ -120,7 +120,7 @@ export default function AppLayout({ children, title }: AppLayoutProps) {
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         <header className="h-14 shrink-0 flex items-center justify-between px-6 border-b border-border bg-background/90 backdrop-blur-sm">
           <div className="flex items-center gap-3">
-            <button className="lg:hidden p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" onClick={() => setMobileOpen(true)}>
+            <button aria-label="Open navigation" aria-expanded={mobileOpen} className="lg:hidden p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors" onClick={() => setMobileOpen(true)}>
               <Menu className="w-4 h-4" />
             </button>
             {title && <h1 className="text-base font-bold text-foreground">{title}</h1>}

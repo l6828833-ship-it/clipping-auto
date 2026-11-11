@@ -4,6 +4,9 @@ import express2 from "express";
 import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
+import { registerMediaUpload } from "../server/media-upload.mjs";
+import { registerReelRoutes } from "../server/reels.mjs";
+import { registerNativeYouTube } from "../server/native-youtube.mjs";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -137,6 +140,9 @@ var clips = mysqlTable("clips", {
    * clip. When absent, the single zoom/offsetX/offsetY above applies throughout.
    */
   framingSegments: json("framingSegments"),
+  scale: float("scale").default(1).notNull(),
+  barColor: varchar("barColor", { length: 9 }).default("#000000").notNull(),
+  textOverlays: json("textOverlays"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
 });
@@ -152,7 +158,7 @@ var subtitles = mysqlTable("subtitles", {
 
 // server/_core/env.ts
 var ENV = {
-  appId: process.env.VITE_APP_ID ?? "",
+  appId: process.env.VITE_APP_ID || "shortspro-ai",
   cookieSecret: process.env.JWT_SECRET ?? "",
   databaseUrl: process.env.DATABASE_URL ?? "",
   oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
@@ -729,7 +735,7 @@ var RENDER_TMP_DIR = path.join(DATA_DIR, "render");
 var FONTS_DIR = path.resolve(process.cwd(), "assets", "fonts");
 var MEDIA_URL_PREFIX = "/api/media";
 var MEDIA_NAME = {
-  video: /^video-\d+-[a-f0-9]{10}\.mp4$/,
+  video: /^video-\d+-(?:[a-f0-9]{10}|[a-f0-9]{32})\.mp4$/,
   clip: /^clip-\d+-[a-f0-9]{10}\.mp4$/
 };
 function dirFor(kind) {
@@ -783,6 +789,21 @@ function registerMediaRoutes(app) {
       res.status(400).json({ error: "Invalid media file name" });
       return;
     }
+    const user = await sdk.authenticateRequest(req).catch(() => null);
+    if (!user) return res.status(401).json({ error: "Sign in to access this media." });
+    const db = await getDb();
+    if (!db) return res.status(503).json({ error: "Media storage is unavailable." });
+    const mediaUrl = urlFor(kind, req.params.name);
+    const table = kind === "video" ? videos : clips;
+    const urlColumn = kind === "video" ? videos.hostedUrl : clips.downloadUrl;
+    try {
+      const [owned] = await db.select({ id: table.id }).from(table)
+        .where(and(eq(table.userId, user.id), eq(urlColumn, mediaUrl))).limit(1);
+      if (!owned) return res.status(404).json({ error: "Media not found." });
+    } catch (error) {
+      console.error("[Media] Could not verify file ownership:", error);
+      return res.status(503).json({ error: "Media storage is unavailable." });
+    }
     let stat;
     try {
       stat = await fs2.stat(filePath);
@@ -793,7 +814,7 @@ function registerMediaRoutes(app) {
     const total = stat.size;
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    res.setHeader("Cache-Control", "private, no-store");
     if (req.query.download === "1") {
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.name}"`);
     }
@@ -873,7 +894,7 @@ import path3 from "path";
 import os2 from "os";
 
 // server/binaries.ts
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { promisify } from "util";
 import { promises as fs3 } from "fs";
 import path2 from "path";
@@ -963,6 +984,7 @@ var YT_DLP_MISSING = "yt-dlp is not installed on the server. Install it with `pi
  */
 var BGUTIL_NODE = process.env.BGUTIL_NODE ?? path3.join(os2.homedir(), "local", "node22", "bin", "node");
 var BGUTIL_POT_SCRIPT = process.env.BGUTIL_POT_SCRIPT ?? path3.join(os2.homedir(), "local", "bgutil-server", "build", "generate_once.js");
+var YT_DLP_COOKIE_ARGS = process.env.YT_DLP_COOKIE_FILE ? ["--cookies", process.env.YT_DLP_COOKIE_FILE] : [];
 var YT_CLIENT_ARGS = [
   "--js-runtimes",
   `node:${BGUTIL_NODE}`,
@@ -1176,8 +1198,8 @@ async function inworldTranscribe(audioPath, apiKey, language = "en") {
 }
 async function getVideoInfo(url) {
   const ytDlp = await getYtDlp();
-  const { stdout } = await execAsync(
-    `${q(ytDlp)} --no-playlist ${YT_CLIENT_ARGS_STR} --print-json --skip-download --no-warnings "${url}"`,
+  const { stdout } = await promisify(execFile)(ytDlp,
+    ["--no-playlist", ...YT_DLP_COOKIE_ARGS, ...YT_CLIENT_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
     { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
   );
   const info = JSON.parse(stdout.trim());
@@ -1200,7 +1222,7 @@ async function whisperTranscribe(url, apiKey, language, tmpDir) {
   const audioPath = path3.join(tmpDir, "audio.mp3");
   const downloadCmd = [
     q(ytDlp),
-    "--no-playlist", "--cookies-from-browser", "brave",
+    "--no-playlist",
     YT_CLIENT_ARGS_STR,
     "--no-warnings",
     "-x",
@@ -2115,7 +2137,7 @@ function synthesiseWordTimings(text2, durationSeconds) {
     return { word, start, end: Math.min(durationSeconds, elapsed) };
   });
 }
-function buildAssFile(words, style, clipDuration, synced = true) {
+function buildAssFile(words, style, clipDuration, synced = true, overlays = []) {
   const s = { ...DEFAULT_CAPTION_STYLE, ...style };
   const alignment = s.position === "top" ? 8 : s.position === "center" ? 5 : 2;
   const marginV = s.position === "center" ? 0 : Math.round(CAPTION_CANVAS_H * 0.12);
@@ -2135,6 +2157,7 @@ function buildAssFile(words, style, clipDuration, synced = true) {
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
     `Style: Default,${s.font},${fontSize},${primary},${primary},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,${outlineWidth},0,${alignment},60,60,${marginV},1`,
+    "Style: Overlay,Montserrat,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,5,60,60,0,1",
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
@@ -2180,6 +2203,14 @@ function buildAssFile(words, style, clipDuration, synced = true) {
       events.push(`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text2}`);
     }
   }
+  for (const overlay of overlays) {
+    const end = Math.min(overlay.end, clipDuration);
+    if (end <= overlay.start || !overlay.text.trim()) continue;
+    const x = Math.round(overlay.posX * CAPTION_CANVAS_W);
+    const y = Math.round(overlay.posY * CAPTION_CANVAS_H);
+    const tag = `{\\an5\\pos(${x},${y})\\fs${overlay.fontSize}\\c${toAssColor(overlay.color)}}`;
+    events.push(`Dialogue: 1,${toAssTime(overlay.start)},${toAssTime(end)},Overlay,,0,0,0,,${tag}${escapeAssText(overlay.text)}`);
+  }
   return `${header.join("\n")}
 ${events.join("\n")}
 `;
@@ -2207,8 +2238,8 @@ function buildClipCaptions(input) {
   const duration = input.clipEnd - input.clipStart;
   if (!(duration > 0)) return null;
   const style = { ...DEFAULT_CAPTION_STYLE, ...input.savedStyle ?? {} };
-  const rebase = (words) => words.map((w) => ({ word: cleanWord(w.word), start: w.start - input.clipStart, end: w.end - input.clipStart })).filter((w) => w.end > 0 && w.start < duration && w.word).map((w) => ({
-    word: w.word,
+  const rebase = (words) => words.map((w) => ({ ...w, word: cleanWord(w.word), start: w.start - input.clipStart, end: w.end - input.clipStart })).filter((w) => w.end > 0 && w.start < duration && w.word).map((w) => ({
+    ...w,
     start: Math.max(0, w.start),
     end: Math.min(duration, w.end)
   })).filter((w) => w.end > w.start);
@@ -2649,7 +2680,7 @@ async function hostVideo(opts) {
   let effectiveOffset = offset;
   try {
     const commonArgs = [
-      "--no-playlist", "--cookies-from-browser", "brave",
+      "--no-playlist", ...YT_DLP_COOKIE_ARGS,
       ...YT_CLIENT_ARGS,
       "--no-warnings",
       // Parallel fragments are the single biggest speed win on YouTube DASH.
@@ -2671,7 +2702,8 @@ async function hostVideo(opts) {
       [
         `bv*[height<=${maxHeight}][vcodec^=avc1]+ba[acodec^=mp4a]`,
         `bv*[height<=${maxHeight}]+ba`,
-        `b[height<=${maxHeight}]`
+        `b[height<=${maxHeight}]`,
+        `b*[height<=?${maxHeight}]`
       ].join("/"),
       /*
        * Sort: highest resolution wins, then fps, then codec preference, then
@@ -2715,13 +2747,13 @@ async function hostVideo(opts) {
     };
     const downloadFull = () => runStreaming(
       ytDlp,
-      [...commonArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
+      [...commonArgs, "--match-filter", `duration <? ${maxMinutes * 60}`, sourceUrl],
       { timeout: 18e5, onLine: makeProgressHandler() }
     );
     const downloadProgressive = () => runStreaming(
       ytDlp,
       [
-        "--no-playlist", "--cookies-from-browser", "brave",
+        "--no-playlist", ...YT_DLP_COOKIE_ARGS,
         "--no-warnings",
         "-f", "18/best",
         "--merge-output-format", "mp4",
@@ -2729,7 +2761,7 @@ async function hostVideo(opts) {
         "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
         "--newline", "--progress",
         "-o", `${stem}.%(ext)s`,
-        "--match-filter", `duration < ${maxMinutes * 60}`,
+        "--match-filter", `duration <? ${maxMinutes * 60}`,
         sourceUrl
       ],
       { timeout: 18e5, onLine: makeProgressHandler() }
@@ -2766,6 +2798,10 @@ async function hostVideo(opts) {
       throw new MediaError(
         `The video could not be downloaded. It may be longer than the ${maxMinutes}-minute limit.`
       );
+    }
+    const downloadedInfo = await probeMedia(downloaded);
+    if (downloadedInfo.duration > maxMinutes * 60) {
+      throw new MediaError(`Choose a source shorter than ${maxMinutes} minutes.`);
     }
     const normaliseCmd = [
       q(ffmpeg),
@@ -3049,6 +3085,9 @@ async function renderClipFromHosted(opts) {
   const end = opts.endTime - offset;
   const crop = opts.crop ?? DEFAULT_CROP;
   const captions = opts.captions && hasCaptions(opts.captions.words) ? opts.captions : null;
+  const scale = opts.scale ?? 1;
+  const barColor = opts.barColor ?? "#000000";
+  const overlays = Array.isArray(opts.textOverlays) ? opts.textOverlays : [];
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
     throw new MediaError("Clip end time must be after the start time.");
   }
@@ -3077,9 +3116,12 @@ async function renderClipFromHosted(opts) {
   ) : normalised;
   const moving = segments.some(isAnimated);
   const segmentKey = segments.length > 1 || moving ? crypto2.createHash("sha1").update(JSON.stringify(segments)).digest("hex").slice(0, 8) : "static";
+  const effectsKey = scale !== 1 || overlays.length
+    ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays })).digest("hex").slice(0, 8)
+    : "";
   const fileName = clipFileName(
     opts.clipId,
-    `${path5.basename(opts.hostedPath)}:${captionKey}:${segmentKey}`,
+    `${path5.basename(opts.hostedPath)}:${captionKey}:${segmentKey}${effectsKey ? `:${effectsKey}` : ""}`,
     start,
     end,
     crop.zoom,
@@ -3097,10 +3139,15 @@ async function renderClipFromHosted(opts) {
   const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, `clip-${opts.clipId}-`));
   try {
     const captionFilter = [];
-    if (captions) {
+    if (scale < 1) {
+      const width = 2 * Math.round(TARGET_W * scale / 2);
+      const height = 2 * Math.round(TARGET_H * scale / 2);
+      captionFilter.push(`scale=${width}:${height}:flags=lanczos`, `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=0x${barColor.slice(1)}`);
+    }
+    if (captions || overlays.length) {
       await fs6.writeFile(
         path5.join(tmpDir, CAPTION_FILE),
-        buildAssFile(captions.words, captions.style, duration, captions.synced ?? true),
+        buildAssFile(captions?.words ?? [], captions?.style ?? DEFAULT_CAPTION_STYLE, duration, captions?.synced ?? true, overlays),
         "utf8"
       );
       const fontsRel = filterRelativePath(tmpDir, FONTS_DIR);
@@ -3544,6 +3591,9 @@ var appRouter = router({
       endTime: z4.number(),
       engagementScore: z4.number().optional()
     })).mutation(async ({ input, ctx }) => {
+      if (!await getVideoById(input.videoId, ctx.user.id)) {
+        throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
+      }
       const id = await createClip({ ...input, userId: ctx.user.id, status: "pending" });
       return { id };
     }),
@@ -3560,6 +3610,18 @@ var appRouter = router({
       zoom: z4.number().min(0.1).max(10).optional(),
       offsetX: z4.number().min(-1).max(1).optional(),
       offsetY: z4.number().min(-1).max(1).optional(),
+      scale: z4.number().min(0.1).max(1).optional(),
+      barColor: z4.string().regex(/^#[0-9a-f]{6}$/i).optional(),
+      textOverlays: z4.array(z4.object({
+        id: z4.string().max(100),
+        text: z4.string().max(300),
+        start: z4.number().min(0),
+        end: z4.number().min(0),
+        posX: z4.number().min(0).max(1),
+        posY: z4.number().min(0).max(1),
+        fontSize: z4.number().min(8).max(200),
+        color: z4.string().regex(/^#[0-9a-f]{6}$/i),
+      })).max(100).optional(),
       /** Burn subtitles into the export, or leave the clip clean. */
       captionsEnabled: z4.boolean().optional(),
       /**
@@ -3607,6 +3669,9 @@ var appRouter = router({
         ...input.zoom !== void 0 ? { zoom: input.zoom } : {},
         ...input.offsetX !== void 0 ? { offsetX: input.offsetX } : {},
         ...input.offsetY !== void 0 ? { offsetY: input.offsetY } : {},
+        ...input.scale !== void 0 ? { scale: input.scale } : {},
+        ...input.barColor !== void 0 ? { barColor: input.barColor } : {},
+        ...input.textOverlays !== void 0 ? { textOverlays: input.textOverlays } : {},
         ...input.captionsEnabled !== void 0 ? { captionsEnabled: input.captionsEnabled } : {},
         // An empty array means "no timeline", stored as null.
         ...input.framingSegments !== void 0 ? { framingSegments: input.framingSegments.length > 0 ? input.framingSegments : null } : {}
@@ -3705,8 +3770,8 @@ var appRouter = router({
        * This gives much better lip sync than YouTube captions which have
        * 3-7s segment-level timing that drifts from actual speech.
        */
-      var finalCaptions = null;
-      if (captionsEnabled && actualHostedPath) {
+      var finalCaptions = captionsEnabled ? await captionsForClip(clip, video) : null;
+      if (captionsEnabled && !finalCaptions && actualHostedPath) {
         console.log(`[Render] Transcribing clip ${clip.id} audio for subtitles (${(clip.endTime - clip.startTime).toFixed(0)}s)...`);
         const apiKey = process.env.INWORLD_API_KEY;
         if (apiKey) {
@@ -3848,6 +3913,9 @@ var appRouter = router({
             crop,
             // Time-varying framing, when the clip has a timeline.
             segments: clip.framingSegments,
+            scale: clip.scale,
+            barColor: clip.barColor,
+            textOverlays: clip.textOverlays,
             captions: finalCaptions
           });
           await updateClip(clip.id, {
@@ -3899,6 +3967,9 @@ var appRouter = router({
                   hostedOffset: reResult.offset,
                   crop,
                   segments: clip.framingSegments,
+                  scale: clip.scale,
+                  barColor: clip.barColor,
+                  textOverlays: clip.textOverlays,
                   captions: finalCaptions
                 });
                 await updateClip(clip.id, {
@@ -4130,7 +4201,10 @@ var appRouter = router({
      * GET /api/trpc/subtitles.get
      * Returns subtitle data for a specific clip.
      */
-    get: protectedProcedure.input(z4.object({ clipId: z4.number() })).query(async ({ input }) => {
+    get: protectedProcedure.input(z4.object({ clipId: z4.number() })).query(async ({ input, ctx }) => {
+      if (!await getClipById(input.clipId, ctx.user.id)) {
+        throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
+      }
       return getSubtitleByClip(input.clipId);
     }),
     /**
@@ -4162,6 +4236,9 @@ var appRouter = router({
         posY: z4.number().min(0).max(100).optional()
       }).optional()
     })).mutation(async ({ input, ctx }) => {
+      if (!await getClipById(input.clipId, ctx.user.id)) {
+        throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
+      }
       await upsertSubtitle({ clipId: input.clipId, userId: ctx.user.id, words: input.words, style: input.style });
       return { success: true };
     })
@@ -4390,18 +4467,18 @@ function serveStatic(app) {
 }
 
 // server/_core/index.ts
-function isPortAvailable(port) {
+function isPortAvailable(port, host) {
   return new Promise((resolve) => {
     const server = net.createServer();
-    server.listen(port, () => {
+    server.listen(port, host, () => {
       server.close(() => resolve(true));
     });
     server.on("error", () => resolve(false));
   });
 }
-async function findAvailablePort(startPort = 3e3) {
+async function findAvailablePort(startPort, host) {
   for (let port = startPort; port < startPort + 20; port++) {
-    if (await isPortAvailable(port)) {
+    if (await isPortAvailable(port, host)) {
       return port;
     }
   }
@@ -4418,11 +4495,26 @@ async function startServer() {
   }
   const app = express2();
   const server = createServer(app);
+  app.use("/api/native/youtube", express2.json({ limit: "2kb" }));
+  registerNativeYouTube(app, { findYtDlp, findFfmpeg });
   app.use(express2.json({ limit: "50mb" }));
   app.use(express2.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
   registerMediaRoutes(app);
+  registerMediaUpload(app, {
+    authenticate: req => sdk.authenticateRequest(req),
+    ensureDirs, findFfmpeg, probeMedia, transcribe: localWhisperWords,
+    storeVideo: createVideo, videoDirectory: VIDEOS_DIR, workDirectory: RENDER_TMP_DIR
+  });
+  registerReelRoutes(app, {
+    authenticate: req => sdk.authenticateRequest(req),
+    findFfmpeg, probeMedia, fontsDirectory: FONTS_DIR,
+    getClipPath: async (id, userId) => {
+      const clip = await getClipById(id, userId);
+      return clip?.status === "done" ? localPathFromUrl(clip.downloadUrl) : null;
+    }
+  });
   app.use(
     "/api/trpc",
     createExpressMiddleware({
@@ -4436,11 +4528,12 @@ async function startServer() {
     serveStatic(app);
   }
   const preferredPort = parseInt(process.env.PORT || "3000");
-  const port = await findAvailablePort(preferredPort);
+  const host = process.env.HOST || void 0;
+  const port = await findAvailablePort(preferredPort, host);
   if (port !== preferredPort) {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
-  server.listen(port, () => {
+  server.listen(port, host, () => {
     console.log(`Server running on http://localhost:${port}/`);
   });
 }

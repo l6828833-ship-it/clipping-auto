@@ -96,7 +96,7 @@ export default function DashboardPage() {
           <p className="text-sm text-muted-foreground mb-4 max-w-lg">
             Upload a long-form video or paste a YouTube URL. Our AI detects the most engaging moments and generates ready-to-post clips with auto-subtitles.
           </p>
-          <Link href="/dashboard/video-input">
+          <Link href="/dashboard/create">
             <button className="ink-button ink-button-large">
               <Upload className="w-4 h-4" /> Start Creating <ArrowRight className="w-4 h-4" />
             </button>
@@ -135,7 +135,7 @@ export default function DashboardPage() {
                 <Film className="w-6 h-6 text-muted-foreground" />
               </div>
               <p className="text-sm text-muted-foreground">No videos yet</p>
-              <Link href="/dashboard/video-input">
+              <Link href="/dashboard/create">
                 <button className="text-xs font-semibold px-4 py-2 rounded-lg transition-colors hover:opacity-80" style={{ color: "var(--cobalt)", background: "rgba(49, 94, 245, 0.08)" }}>
                   Upload your first video
                 </button>
@@ -187,7 +187,7 @@ export default function DashboardPage() {
           </div>
           <div className="p-4 space-y-2">
             {[
-              { href: "/dashboard/video-input",      icon: Upload,   label: "Upload Video",      desc: "Start from a file or URL", color: "var(--cobalt)" },
+              { href: "/dashboard/create",           icon: Upload,   label: "Upload Video",      desc: "Start from a file or URL", color: "var(--cobalt)" },
               { href: "/dashboard/highlights",       icon: Sparkles, label: "AI Highlights",     desc: "Detect viral moments",     color: "var(--coral)" },
               { href: "/dashboard/subtitle-editor",  icon: TrendingUp, label: "Edit Subtitles", desc: "Style your captions",      color: "var(--mint)" },
               { href: "/dashboard/clips",            icon: Film,     label: "View Clips",        desc: "Download your shorts",     color: "var(--amber)" },

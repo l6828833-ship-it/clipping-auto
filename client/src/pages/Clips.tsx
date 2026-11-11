@@ -272,7 +272,7 @@ function ClipEditorModal({
     if (timelineWords) return timelineWords;
     if (!Array.isArray(storedWords)) return [];
     return storedWords
-      .map(w => ({ word: w.word, start: w.start - clipStartAbs, end: w.end - clipStartAbs }))
+      .map(w => ({ ...w, start: w.start - clipStartAbs, end: w.end - clipStartAbs }))
       .filter(w => w.end > 0);
   }, [timelineWords, storedWords, clipStartAbs]);
 
@@ -395,18 +395,19 @@ function ClipEditorModal({
       ...framing, captionsEnabled: captionsOn,
       scale: videoScale, barColor,
       framingSegments: segments,
-      textOverlays: textOverlays.length > 0 ? textOverlays : undefined,
+      textOverlays,
     });
 
     // Persist edited words back as absolute source times.
-    if (timelineWords) {
+    if (timelineWords || Object.keys(captionPositions).length > 0) {
       await saveSubtitles.mutateAsync({
         clipId: clip.id,
         style: captionStyle,
-        words: timelineWords.map(w => ({
-          word: w.word,
+        words: effectiveWords.map((w, index) => ({
+          ...w,
           start: w.start + clipStartAbs,
           end: w.end + clipStartAbs,
+          ...captionPositions[index],
         })),
       });
     }
@@ -482,7 +483,9 @@ function ClipEditorModal({
                       anywhere on the frame. */}
                   {captionsOn && visibleCaption && (() => {
                     const captionIdx = visibleCaption.wordIndex;
-                    const posOverride = captionIdx >= 0 ? captionPositions[captionIdx] : undefined;
+                    const word = effectiveWords[captionIdx];
+                    const savedPosition = word?.posX != null && word.posY != null ? { posX: word.posX, posY: word.posY } : undefined;
+                    const posOverride = captionPositions[captionIdx] ?? savedPosition;
                     return (
                       <SubtitleOverlay
                         words={visibleCaption.words}
@@ -501,13 +504,13 @@ function ClipEditorModal({
                   {textOverlays.filter(o => playhead >= o.start && playhead < o.end).map(o => (
                     <div
                       key={o.id}
-                      className="absolute left-0 right-0 flex justify-center pointer-events-none z-30"
-                      style={{ top: `${o.posY * 100}%` }}
+                      className="absolute w-max max-w-[90%] -translate-x-1/2 -translate-y-1/2 pointer-events-none z-30"
+                      style={{ left: `${o.posX * 100}%`, top: `${o.posY * 100}%` }}
                     >
                       <span
                         className="font-black text-center px-2"
                         style={{
-                          fontSize: `${o.fontSize * 0.6}%`,
+                          fontSize: `${o.fontSize / 10.8}cqw`,
                           color: o.color,
                           textShadow: "0 2px 8px rgba(0,0,0,0.8), 0 0 2px rgba(0,0,0,0.9)",
                           fontFamily: "Montserrat, Inter, sans-serif",
@@ -710,6 +713,9 @@ function ClipEditorModal({
                   });
                   // Also discard timeline edits, so Reset is a true revert.
                   setSegments((clip.framingSegments as TimelineSegment[] | null) ?? []);
+                  setVideoScale(clip.scale ?? 1);
+                  setBarColor(clip.barColor ?? "#000000");
+                  setTextOverlays((clip.textOverlays as TextOverlay[] | null) ?? []);
                   setSelectedSegment(null);
                   setTimelineWords(null);
                   setCaptionPositions({});
