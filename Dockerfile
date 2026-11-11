@@ -8,10 +8,13 @@ RUN apt-get update \
 
 COPY scripts/requirements-whisper.txt /tmp/requirements-whisper.txt
 RUN python3 -m venv /opt/media-tools \
+    && /opt/media-tools/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 'torch==2.8.0' \
     && /opt/media-tools/bin/pip install --no-cache-dir \
         'yt-dlp[default,curl-cffi]==2026.10.26' -r /tmp/requirements-whisper.txt
 
-ENV PATH="/opt/media-tools/bin:${PATH}"
+ENV PATH="/opt/media-tools/bin:${PATH}" XDG_CACHE_HOME=/opt/clip-maker-cache
+RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
+    && chown -R node:node /opt/clip-maker-cache
 
 COPY package.json package-lock.json ./
 RUN npm ci --include=dev --legacy-peer-deps

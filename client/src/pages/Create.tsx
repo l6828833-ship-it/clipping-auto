@@ -8,6 +8,7 @@ import SubtitleOverlay, {
 } from "@/components/SubtitleOverlay";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { trpc } from "@/lib/trpc";
+import { useSourceTranscription, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
 import { toast } from "sonner";
 import {
   Upload, Link2, Sparkles, Type, Download, CheckCircle2,
@@ -75,20 +76,20 @@ function NoKeyWarning() {
 }
 
 // ─── Extraction progress stages ───────────────────────────────────────────────
-type Stage = "idle" | "fetching-info" | "downloading" | "extracting-audio" | "transcribing" | "uploading" | "done" | "error";
+type Stage = "idle" | SourceTranscriptionStage | "uploading" | "done" | "error";
 const STAGE_LABELS: Record<Stage, string> = {
   idle: "",
   "fetching-info": "Fetching video info…",
-  downloading: "Looking for YouTube transcript…",
-  "extracting-audio": "Extracting & encoding audio…",
-  transcribing: "Transcribing with Whisper (fallback)…",
+  "checking-captions": "Checking for YouTube captions…",
+  downloading: "Downloading source audio…",
+  transcribing: "Transcribing with local Whisper…",
   uploading: "Uploading and preparing your file…",
   done: "Transcript ready!",
   error: "Extraction failed",
 };
 const STAGE_PROGRESS: Record<Stage, number> = {
-  idle: 0, "fetching-info": 15, downloading: 40,
-  "extracting-audio": 65, transcribing: 85, uploading: 0, done: 100, error: 0,
+  idle: 0, "fetching-info": 15, "checking-captions": 35, downloading: 55,
+  transcribing: 75, uploading: 0, done: 100, error: 0,
 };
 
 // ─── Step bar ─────────────────────────────────────────────────────────────────
@@ -132,8 +133,7 @@ function StepInput({ apiKey, onNext }: {
   /*
    * Whether this video should get subtitles at all.
    *
-   * Off means no speech-to-text runs anywhere — no Inworld credits are spent —
-   * and the export is a clean video with no burned-in captions. It can be
+   * Off skips speech-to-text and exports without burned-in captions. It can be
    * turned back on later from the clip's Subtitles panel.
    */
   const [subtitlesOn, setSubtitlesOn] = useState(true);
@@ -168,13 +168,7 @@ function StepInput({ apiKey, onNext }: {
     onError: (err) => toast.error(err.message),
   });
 
-  const transcribeMutation = trpc.extract.transcribe.useMutation({
-    onError: (err) => {
-      setStage("error");
-      setStageError(err.message);
-      toast.error(err.message);
-    },
-  });
+  const transcribeSource = useSourceTranscription();
 
   const handleExtractUrl = async () => {
     if (!url.trim()) { toast.error("Please enter a video URL"); return; }
@@ -183,28 +177,15 @@ function StepInput({ apiKey, onNext }: {
     setStageError("");
     setVideoMeta(null);
     setTranscript("");
-
-    /*
-     * Stage hints while the server works. Cleared as soon as we get a result.
-     * With subtitles off there is no transcribe stage to hint at.
-     */
-    const timers = [
-      setTimeout(() => setStage("downloading"), 800),
-      setTimeout(() => setStage("extracting-audio"), 3000),
-      ...(subtitlesOn ? [setTimeout(() => setStage("transcribing"), 6000)] : []),
-    ];
+    setTimedWords([]);
 
     try {
-      const result = await transcribeMutation.mutateAsync({
+      const result = await transcribeSource({
         url: url.trim(),
-        // Only send a key when the user has one — the server skips Whisper without it.
-        apiKey: apiKey || undefined,
         language,
-        // Hard stop on paid speech-to-text when the user turned subtitles off.
         allowSpeechToText: subtitlesOn,
-      });
+      }, setStage);
 
-      timers.forEach(clearTimeout);
       setStage("done");
       setTranscript(result.transcript);
       setTimedWords(result.words ?? []);
@@ -217,18 +198,16 @@ function StepInput({ apiKey, onNext }: {
       if (!subtitlesOn) {
         toast.success(`Video ready — ${result.title}. Subtitles are off, so nothing was transcribed.`);
       } else if (result.transcript) {
-        const label = result.source === "youtube" ? "YouTube captions" : "Whisper";
-        const synced = (result.words ?? []).length > 0;
-        toast.success(
-          `Transcript ready from ${label}! ${result.wordCount} words` +
-          (synced ? " with speech timings." : " (timings estimated).")
-        );
+        const label = result.source === "youtube" ? "YouTube captions" : "local Whisper";
+        toast.success(`Transcript ready from ${label}. ${result.wordCount} timed words.`);
       } else {
         toast.info(result.note || "No captions found. You can paste a transcript manually below.");
       }
-    } catch {
-      timers.forEach(clearTimeout);
-      // error handled by mutation onError
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Video analysis failed.";
+      setStage("error");
+      setStageError(message);
+      toast.error(message);
     }
   };
 
@@ -458,11 +437,11 @@ function StepInput({ apiKey, onNext }: {
             </div>
             <div className="flex items-center gap-4 text-xs text-muted-foreground">
               {[
-                { s: "downloading", label: "Download" },
-                { s: "extracting-audio", label: "Audio" },
+                { s: "checking-captions", label: "Captions" },
+                { s: "downloading", label: "Audio" },
                 { s: "transcribing", label: "Transcribe" },
               ].map(({ s, label }) => {
-                const stageOrder = ["downloading","extracting-audio","transcribing","done"];
+                const stageOrder = ["checking-captions", "downloading", "transcribing", "done"];
                 const currentIdx = stageOrder.indexOf(stage);
                 const thisIdx = stageOrder.indexOf(s);
                 const done = currentIdx > thisIdx;
@@ -1317,19 +1296,16 @@ function StepEdit({
   }, [video?.transcriptWords, clips]);
 
   /*
-   * Auto-transcribe each clip when the video is hosted.
-   * This gives accurate Inworld STT words instead of YouTube's coarse captions.
-   * Runs once per clip, costs ~$0.001 per clip (30-60s audio).
+   * Fill missing captions with local Whisper once the video is hosted.
    */
   const transcribing = useRef<Set<number>>(new Set());
   useEffect(() => {
     if (hostedStatus !== "ready" || !captionsOn || video?.sourceType === "upload") return;
-    const apiKey = "server";
     for (const h of clips) {
       const e = edits[h.id];
       if (!e || e.words.length > 0 || transcribing.current.has(e.clipId)) continue;
       transcribing.current.add(e.clipId);
-      transcribeClip.mutateAsync({ id: e.clipId, apiKey, language: "en", force: true })
+      transcribeClip.mutateAsync({ id: e.clipId, force: true })
         .then((result: any) => {
           if (result?.words?.length > 0) {
             const clipWords = result.words.map((w: any) => ({

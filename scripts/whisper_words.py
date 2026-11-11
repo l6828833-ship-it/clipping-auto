@@ -1,90 +1,50 @@
 #!/usr/bin/env python3
-"""
-Word-level transcription helper.
+"""Transcribe audio with OpenAI Whisper and print JSON with word timings."""
 
-Inworld's synchronous STT returns the transcript text but leaves
-`wordTimestamps` empty, so captions built from it can only ever be
-interpolated. faster-whisper returns a real start/end for every word, which is
-what caption timing needs.
-
-Usage:
-    whisper_words.py <audio-path> [language] [model]
-
-Prints a single JSON object to stdout:
-    {"text": "...", "words": [{"word": "hi", "start": 0.12, "end": 0.31}, ...]}
-
-Any failure exits non-zero with the reason on stderr so the caller can fall
-back to its previous behaviour instead of losing the render.
-"""
 import json
+import math
 import os
 import sys
 
 
-def main() -> int:
+def main() -> None:
     if len(sys.argv) < 2:
-        print("usage: whisper_words.py <audio-path> [language] [model]", file=sys.stderr)
-        return 2
+        raise ValueError("usage: whisper_words.py <audio-path> [language] [model]")
 
     audio_path = sys.argv[1]
-    language = (sys.argv[2] if len(sys.argv) > 2 else "en") or "en"
-    model_name = (
-        sys.argv[3]
-        if len(sys.argv) > 3
-        else os.environ.get("WHISPER_MODEL", "base.en")
-    )
-
     if not os.path.isfile(audio_path):
-        print(f"audio file not found: {audio_path}", file=sys.stderr)
-        return 2
+        raise FileNotFoundError(audio_path)
 
-    from faster_whisper import WhisperModel
+    language = sys.argv[2] if len(sys.argv) > 2 else "auto"
+    model_name = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("WHISPER_MODEL", "base")
+    if model_name in {"tiny.en", "base.en", "small.en", "medium.en"} and language not in {"en", "english"}:
+        model_name = model_name.removesuffix(".en")
 
-    # int8 on CPU keeps this fast enough to sit inside a render without a GPU.
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    import torch
+    import whisper
 
-    # English-only models reject an explicit language argument.
-    transcribe_kwargs = {
-        "word_timestamps": True,
-        # Trims silence before decoding, which stops the model inventing words
-        # in the quiet parts.
-        "vad_filter": True,
-        "vad_parameters": {"min_silence_duration_ms": 300},
-    }
-    if not model_name.endswith(".en"):
-        transcribe_kwargs["language"] = language
-
-    segments, _info = model.transcribe(audio_path, **transcribe_kwargs)
-
-    words = []
-    text_parts = []
-    for segment in segments:
-        if segment.text:
-            text_parts.append(segment.text.strip())
-        for word in (segment.words or []):
-            token = (word.word or "").strip()
-            if not token:
-                continue
-            start = float(word.start)
-            end = float(word.end)
-            if end <= start:
-                # Keep it renderable rather than dropping the word entirely.
-                end = start + 0.08
-            words.append(
-                {"word": token, "start": round(start, 3), "end": round(end, 3)}
-            )
-
-    json.dump(
-        {"text": " ".join(text_parts).strip(), "words": words},
-        sys.stdout,
-        ensure_ascii=False,
+    torch.set_num_threads(2)
+    model = whisper.load_model(model_name, device="cpu")
+    result = model.transcribe(
+        audio_path,
+        language=None if language in {"", "auto"} else language,
+        word_timestamps=True,
+        fp16=False,
+        verbose=None,
     )
-    return 0
+    words = []
+    for segment in result["segments"]:
+        for word in segment.get("words", []):
+            token = word["word"].strip()
+            start, end = float(word["start"]), float(word["end"])
+            if token and math.isfinite(start) and math.isfinite(end) and end > start:
+                words.append({"word": token, "start": round(start, 3), "end": round(end, 3)})
+    json.dump({"text": result["text"].strip(), "words": words}, sys.stdout, ensure_ascii=False)
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
-    except Exception as exc:  # noqa: BLE001 - surfaced to the caller as stderr
+        main()
+    except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         sys.exit(1)

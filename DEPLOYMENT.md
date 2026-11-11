@@ -17,3 +17,5 @@ The project root contains a Dockerfile that builds the Vite website and starts t
 6. Open the assigned HTTPS URL and test web sign-in, video import, and clip export. Then set the Xcode target’s `CLIP_MAKER_SERVICE_URL` to that HTTPS origin. The iOS YouTube flow does not require a Clip Maker account.
 
 Rundploy advertises GitHub and folder uploads. Docker builds and persistent volumes need to be confirmed in the app dashboard before publishing the full project.
+
+The image includes OpenAI Whisper and its multilingual `base` model. When a source has no usable captions, the server downloads its audio and transcribes it on the CPU. Allow the app to finish background analysis before stopping the instance. The Inworld key is used for AI highlights. Whisper transcription runs with the model installed in the container.

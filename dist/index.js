@@ -965,24 +965,18 @@ var YT_PUBLIC_FALLBACK_CLIENT_ARGS = [
  */
 var YTDLP_COOKIE_FILE = (process.env.YTDLP_COOKIE_FILE ?? process.env.YT_DLP_COOKIE_FILE ?? "").trim();
 var YTDLP_COOKIE_ARGS = YTDLP_COOKIE_FILE ? ["--cookies", YTDLP_COOKIE_FILE] : [];
-var YTDLP_COOKIE_ARGS_STR = YTDLP_COOKIE_FILE ? `--cookies ${q(YTDLP_COOKIE_FILE)}` : "";
-/*
- * Word-level timings.
- *
- * Inworld's synchronous STT returns the transcript but always an empty
- * `wordTimestamps`, so anything built from it can only estimate where each
- * word falls. faster-whisper reports a real start/end per word, which is what
- * caption timing actually needs, so it is used as the timing engine and
- * Inworld is kept as the fallback.
- */
 var WHISPER_PYTHON = process.env.WHISPER_PYTHON ?? "python3";
 var WHISPER_SCRIPT = process.env.WHISPER_SCRIPT ?? path3.join(process.cwd(), "scripts", "whisper_words.py");
-var WHISPER_MODEL = process.env.WHISPER_MODEL ?? "base.en";
-async function localWhisperWords(audioPath, language = "en") {
-  const { stdout } = await execAsync(
-    `${q(WHISPER_PYTHON)} ${q(WHISPER_SCRIPT)} ${q(audioPath)} ${q(language)} ${q(WHISPER_MODEL)}`,
+var WHISPER_MODEL = process.env.WHISPER_MODEL ?? "base";
+var whisperQueue = Promise.resolve();
+async function localWhisperWords(audioPath, language = "auto") {
+  // Keep PyTorch inference to one process at a time on the shared server.
+  const transcription = whisperQueue.then(() => promisify(execFile)(
+    WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
     { timeout: 9e5, maxBuffer: 64 * 1024 * 1024 }
-  );
+  ));
+  whisperQueue = transcription.then(() => {}, () => {});
+  const { stdout } = await transcription;
   const parsed = JSON.parse(stdout);
   const words = (Array.isArray(parsed.words) ? parsed.words : []).filter(
     (w) => w && typeof w.word === "string" && w.word.trim() && Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start
@@ -1105,15 +1099,24 @@ async function getYtDlp() {
   return found;
 }
 var getFfmpeg = findFfmpeg;
-async function tryYouTubeTranscript(url, language = "en", tmpDir) {
+async function tryYouTubeTranscript(url, language = "en") {
   try {
     /* Use youtube-transcript package — doesn't need PO token or cookies */
     const { YoutubeTranscript } = await import("youtube-transcript");
-    const videoIdMatch = url.match(/(?:v=|youtu\.be\/|\/embed\/|\/v\/)([a-zA-Z0-9_-]{11})/);
-    if (!videoIdMatch) return null;
-    const videoId = videoIdMatch[1];
-    const segments = await YoutubeTranscript.fetchTranscript(videoId, { lang: language }).catch(() => null);
-    if (!segments || segments.length < 3) return null;
+    const source = new URL(url);
+    const host = source.hostname.toLowerCase();
+    const videoId = host === "youtu.be"
+      ? source.pathname.split("/")[1]
+      : host === "youtube.com" || host.endsWith(".youtube.com")
+        ? source.searchParams.get("v") || /^\/(?:embed|shorts|live|v)\/([^/]+)/.exec(source.pathname)?.[1]
+        : null;
+    if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId ?? "")) return null;
+    const signal = AbortSignal.timeout(8000);
+    const segments = await YoutubeTranscript.fetchTranscript(videoId, {
+      lang: language === "auto" ? undefined : language,
+      fetch: (input, init) => fetch(input, { ...init, signal })
+    });
+    if (!segments?.length) return null;
     const words = [];
     const textParts = [];
     for (const seg of segments) {
@@ -1126,7 +1129,7 @@ async function tryYouTubeTranscript(url, language = "en", tmpDir) {
       for (const w of distributeWords(splitWords(text), start, end)) words.push(w);
     }
     const fullText = textParts.join(" ").replace(/\s+/g, " ").trim();
-    if (fullText.length < 10) return null;
+    if (!fullText || !words.length) return null;
     console.log(`[Extract] youtube-transcript fetched ${segments.length} segments, ${words.length} timed words`);
     return { text: fullText, words };
   } catch (err) {
@@ -1164,7 +1167,7 @@ async function inworldTranscribe(audioPath, apiKey, language = "en") {
 async function getVideoInfo(url) {
   const ytDlp = await getYtDlp();
   const { stdout } = await promisify(execFile)(ytDlp,
-    ["--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_CLIENT_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
+    ["--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
     { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
   );
   const info = JSON.parse(stdout.trim());
@@ -1176,160 +1179,72 @@ async function getVideoInfo(url) {
     description: info.description ?? ""
   };
 }
-async function whisperTranscribe(url, apiKey, language, tmpDir) {
+async function downloadSourceAudio(url, tmpDir) {
   const ytDlp = await getYtDlp();
   const ffmpeg = await getFfmpeg();
-  if (!ffmpeg) {
-    throw new Error(
-      "ffmpeg is not installed on the server, which is required for Whisper transcription."
-    );
-  }
-  const audioPath = path3.join(tmpDir, "audio.mp3");
-  const downloadCmd = [
-    q(ytDlp),
-    "--no-playlist", YTDLP_COOKIE_ARGS_STR,
-    ...YT_CLIENT_ARGS.map(q),
-    "--no-warnings",
-    "-x",
-    "--audio-format mp3",
-    "--audio-quality 5",
-    `--ffmpeg-location "${path3.dirname(ffmpeg)}"`,
-    `-o "${audioPath}"`,
-    `"${url}"`
-  ].join(" ");
-  await execAsync(downloadCmd, { timeout: 3e5 });
-  const reencoded = path3.join(tmpDir, "audio_16k.mp3");
-  await execAsync(
-    `${q(ffmpeg)} -i "${audioPath}" -ar 16000 -ac 1 -b:a 64k "${reencoded}" -y -loglevel error`,
-    { timeout: 12e4 }
-  );
-  /*
-   * Inworld's synchronous STT models return the transcript text but leave
-   * `wordTimestamps` empty, so there are no real per-word timings to use.
-   *
-   * Splitting on silence recovers most of that accuracy. Each speech run is
-   * transcribed on its own, so its words are only spread across the time
-   * someone is actually talking. Silent stretches produce no segment at all,
-   * which keeps captions off the screen while nobody is speaking.
-   */
-  const MAX_SEGMENT_SECONDS = 30;
-  const MIN_SPEECH_SECONDS = 0.25;
-  const MERGE_GAP_SECONDS = 0.8;
-  const runFfmpeg = async (args, timeout) => {
-    const res = await execAsync(`${q(ffmpeg)} ${args} 2>&1`, {
-      timeout,
-      maxBuffer: 32 * 1024 * 1024
-    }).catch((e) => ({ stdout: e?.stdout ?? "", stderr: e?.stderr ?? "" }));
-    return `${res.stdout ?? ""}${res.stderr ?? ""}`;
-  };
-  const parseDuration = (blob) => {
-    const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(blob);
-    return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
-  };
-  /* One pass gives both the duration and the silence map. */
-  const analysis = await runFfmpeg(
-    `-i ${q(reencoded)} -af "silencedetect=noise=-30dB:d=0.35" -f null -`,
-    6e5
-  );
-  const totalDuration = parseDuration(analysis);
-  const silenceStarts = [];
-  const silenceEnds = [];
-  for (const line of analysis.split(/\r?\n/)) {
-    const s = /silence_start:\s*(-?\d+(?:\.\d+)?)/.exec(line);
-    if (s) silenceStarts.push(Math.max(0, Number(s[1])));
-    const e = /silence_end:\s*(-?\d+(?:\.\d+)?)/.exec(line);
-    if (e) silenceEnds.push(Math.max(0, Number(e[1])));
-  }
-  const limit = totalDuration > 0 ? totalDuration : Infinity;
-  const silences = silenceStarts.map((start, i) => ({ start, end: silenceEnds[i] ?? limit })).filter((s) => s.end > s.start);
-  /* Speech is whatever the silence map leaves behind. */
-  const rawSpeech = [];
-  let cursor = 0;
-  for (const sil of silences) {
-    if (sil.start > cursor) rawSpeech.push({ start: cursor, end: Math.min(sil.start, limit) });
-    cursor = Math.max(cursor, sil.end);
-  }
-  if (totalDuration > 0 && cursor < totalDuration) {
-    rawSpeech.push({ start: cursor, end: totalDuration });
-  } else if (totalDuration === 0 && rawSpeech.length === 0) {
-    rawSpeech.push({ start: 0, end: 0 });
-  }
-  /* Stitch runs split by a short breath back together, drop the slivers. */
-  const merged = [];
-  for (const sp of rawSpeech) {
-    if (sp.end - sp.start < MIN_SPEECH_SECONDS) continue;
-    const last = merged[merged.length - 1];
-    if (last && sp.start - last.end < MERGE_GAP_SECONDS) last.end = sp.end;
-    else merged.push({ start: sp.start, end: sp.end });
-  }
-  /* Keep every request inside the model's comfortable window. */
-  const segments = [];
-  for (const run of merged) {
-    const span = run.end - run.start;
-    if (span <= MAX_SEGMENT_SECONDS) {
-      segments.push(run);
-      continue;
-    }
-    const parts = Math.ceil(span / MAX_SEGMENT_SECONDS);
-    const width = span / parts;
-    for (let i = 0; i < parts; i++) {
-      segments.push({
-        start: run.start + i * width,
-        end: i === parts - 1 ? run.end : run.start + (i + 1) * width
-      });
-    }
-  }
-  if (segments.length === 0) {
-    const only = cleanCaptionText(await inworldTranscribe(reencoded, apiKey, language));
-    return { text: only, words: [] };
-  }
-  const segDir = path3.join(tmpDir, "segments");
-  await fs4.mkdir(segDir, { recursive: true });
-  const results = new Array(segments.length).fill("");
-  const CONCURRENCY = 4;
-  let next = 0;
-  const worker = async () => {
-    for (;;) {
-      const i = next++;
-      if (i >= segments.length) return;
-      const seg = segments[i];
-      const segPath = path3.join(segDir, `seg_${String(i).padStart(4, "0")}.mp3`);
-      try {
-        await execAsync(
-          `${q(ffmpeg)} -ss ${seg.start.toFixed(3)} -t ${(seg.end - seg.start).toFixed(3)} -i ${q(reencoded)} -ar 16000 -ac 1 -b:a 64k ${q(segPath)} -y -loglevel error`,
-          { timeout: 12e4 }
-        );
-        results[i] = await inworldTranscribe(segPath, apiKey, language);
-      } catch (err) {
-        console.warn(
-          `[STT] Segment ${i + 1}/${segments.length} failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-        results[i] = "";
-      } finally {
-        await fs4.rm(segPath, { force: true }).catch(() => {
-        });
-      }
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(CONCURRENCY, segments.length) }, () => worker())
-  );
-  const words = [];
-  const textParts = [];
-  for (let i = 0; i < results.length; i++) {
-    const clean = cleanCaptionText(results[i]);
-    if (!clean) continue;
-    const seg = segments[i];
-    if (seg.end <= seg.start) continue;
-    textParts.push(clean);
-    for (const w of distributeWords(splitWords(clean), seg.start, seg.end)) words.push(w);
-  }
-  const spokenSeconds = segments.reduce((sum, s) => sum + (s.end - s.start), 0);
-  console.log(
-    `[STT] ${segments.length} speech segment(s) covering ${spokenSeconds.toFixed(1)}s of ${totalDuration.toFixed(1)}s \u2192 ${words.length} words timed to speech`
-  );
-  return { text: textParts.join(" ").replace(/\s+/g, " ").trim(), words };
+  if (!ffmpeg) throw new Error(FFMPEG_MISSING);
+  await runStreaming(ytDlp, [
+    "--no-playlist", "--no-warnings", "--socket-timeout", "20", "--retries", "2",
+    ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS,
+    "--format", "bestaudio/best", "--extract-audio", "--audio-format", "mp3",
+    "--ffmpeg-location", path3.dirname(ffmpeg),
+    "--output", path3.join(tmpDir, "source.%(ext)s"), "--", url
+  ], { timeout: 3e5 });
+  return path3.join(tmpDir, "source.mp3");
 }
+var sourceTranscriptionInput = z.object({
+  url: z.string().url("Invalid URL"),
+  language: z.string().default("en"),
+  allowSpeechToText: z.boolean().default(true)
+});
+async function transcribeSource(input, reportStage = () => {}) {
+  const url = assertSafeUrl(input.url);
+  let meta = { title: "Untitled", duration: 0, uploader: "" };
+  try {
+    const { title, duration, uploader } = await getVideoInfo(url);
+    meta = { title, duration, uploader };
+  } catch (error) {
+    if (error instanceof TRPCError2) throw error;
+    if (/unsupported url|is not a valid url|unable to download webpage/i.test(error.message)) {
+      throw new TRPCError2({ code: "BAD_REQUEST", message: "Enter a public video link that Clip Maker can open." });
+    }
+  }
+
+  const result = (source, transcript = "", words = [], note = "") => ({
+    success: true, ...meta, source, transcript, words, wordCount: words.length, note
+  });
+  reportStage("checking-captions");
+  const captions = await tryYouTubeTranscript(url, input.language);
+  if (captions) return result("youtube", captions.text, captions.words);
+  if (!input.allowSpeechToText) {
+    return result("none", "", [], "Subtitles are off for this import.");
+  }
+
+  const tmpDir = await fs4.mkdtemp(path3.join(os2.tmpdir(), "clip-maker-source-"));
+  try {
+    reportStage("downloading");
+    let audioPath;
+    try {
+      audioPath = await downloadSourceAudio(url, tmpDir);
+    } catch (error) {
+      console.warn("[Extract] Source audio download failed:", error.message);
+      return result("none", "", [], "Clip Maker couldn’t download the source audio for Whisper. Try uploading the original video file.");
+    }
+    reportStage("transcribing");
+    try {
+      const { text, words } = await localWhisperWords(audioPath, input.language);
+      if (text && words.length) return result("whisper", text, words);
+      return result("none", "", [], "Whisper didn’t detect speech in this video.");
+    } catch (error) {
+      console.warn("[Extract] Local Whisper failed:", String(error.stderr || error.message).slice(0, 600));
+      return result("none", "", [], "Local Whisper couldn’t transcribe this video. Try again with a shorter source or paste a transcript.");
+    }
+  } finally {
+    await fs4.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+var sourceTranscriptionJobs = new Map();
+var runningSourceTranscriptions = 0;
 var extractRouter = router({
   /**
    * POST /api/trpc/extract.videoInfo
@@ -1344,123 +1259,33 @@ var extractRouter = router({
       throw new TRPCError2({ code: "BAD_REQUEST", message: `Could not fetch video info: ${msg}` });
     }
   }),
-  /**
-   * POST /api/trpc/extract.transcribe
-   *
-   * Strategy:
-   *  1. Try to get YouTube's existing transcript (manual or auto-generated subtitles)
-   *  2. If no transcript found, fall back to downloading audio + Inworld Whisper STT
-   *
-   * No duration limit — YouTube transcripts work for any length,
-   * and Whisper splits long audio into chunks automatically.
-   */
-  transcribe: protectedProcedure.input(z.object({
-    url: z.string().url("Invalid URL"),
-    // Optional: without a key we simply skip the Whisper fallback.
-    apiKey: z.string().optional(),
-    language: z.string().default("en"),
-    /**
-     * When false, no speech-to-text is attempted at all — not even the
-     * fallback. Used by the "subtitles off" import path so no Inworld credits
-     * are spent.
-     */
-    allowSpeechToText: z.boolean().default(true)
-  })).mutation(async ({ input }) => {
-    const tmpDir = await fs4.mkdtemp(path3.join(os2.tmpdir(), "shortspro-"));
-    try {
-      let title = "Untitled", duration = 0, uploader = "";
-      try {
-        const info = await getVideoInfo(input.url);
-        title = info.title;
-        duration = info.duration;
-        uploader = info.uploader;
-      } catch (err) {
-        if (err instanceof TRPCError2) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/unsupported url|is not a valid url|unable to download webpage/i.test(msg)) {
-          throw new TRPCError2({
-            code: "BAD_REQUEST",
-            message: "Could not process this URL. Make sure it is a public YouTube, Vimeo, or direct video link."
-          });
-        }
-      }
-      console.log(`[Extract] Looking for an existing transcript: ${title}`);
-      const ytTranscript = await tryYouTubeTranscript(input.url, input.language, tmpDir);
-      if (ytTranscript) {
-        console.log(
-          `[Extract] Using existing captions (${ytTranscript.words.length} timed words)`
-        );
-        return {
-          success: true,
-          transcript: ytTranscript.text,
-          // Real timings from the caption track, so burned-in subtitles
-          // follow the speech instead of being spread evenly.
-          words: ytTranscript.words,
-          title,
-          duration,
-          uploader,
-          wordCount: ytTranscript.words.length,
-          source: "youtube",
-          note: ""
-        };
-      }
-
-      if (!input.allowSpeechToText) {
-        console.log("[Extract] Speech-to-text disabled for this import \u2014 no STT call made.");
-        return {
-          success: true,
-          transcript: "",
-          words: [],
-          title,
-          duration,
-          uploader,
-          wordCount: 0,
-          source: "none",
-          note: "Subtitles are off for this import, so no transcript was generated."
-        };
-      }
-      if (!input.apiKey || input.apiKey === "server") {
-        const envKey = process.env.INWORLD_API_KEY;
-        if (envKey) {
-          input.apiKey = envKey;
-        } else {
-        console.log("[Extract] No transcript available and no Inworld key set \u2014 continuing without one.");
-        return {
-          success: true,
-          transcript: "",
-          words: [],
-          title,
-          duration,
-          uploader,
-          wordCount: 0,
-          source: "none",
-          note: "This video has no captions. Add an Inworld API key to auto-transcribe with Whisper, or paste a transcript manually."
-        };
-        }
-      }
-      console.log("[Extract] No existing transcript \u2014 skipping full-video STT to save costs. Clips will be individually transcribed.");
-      return {
-        success: true,
-        transcript: "",
-        words: [],
-        title,
-        duration,
-        uploader,
-        wordCount: 0,
-        source: "none",
-        note: "No YouTube captions found. AI highlights will use video info. Individual clips will be transcribed on render for subtitles."
-      };
-    } catch (err) {
-      if (err instanceof TRPCError2) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/unsupported url|is not a valid url/i.test(msg)) {
-        throw new TRPCError2({ code: "BAD_REQUEST", message: "Could not process this URL. Make sure it is a public YouTube, Vimeo, or direct video link." });
-      }
-      throw new TRPCError2({ code: "INTERNAL_SERVER_ERROR", message: `Extraction failed: ${msg}` });
-    } finally {
-      await fs4.rm(tmpDir, { recursive: true, force: true }).catch(() => {
-      });
+  transcribe: protectedProcedure.input(sourceTranscriptionInput).mutation(({ input }) => transcribeSource(input)),
+  startTranscription: protectedProcedure.input(sourceTranscriptionInput).mutation(({ input, ctx }) => {
+    if (runningSourceTranscriptions >= 4) {
+      throw new TRPCError2({ code: "TOO_MANY_REQUESTS", message: "Whisper is busy. Try again in a moment." });
     }
+    const id = crypto.randomUUID();
+    const job = { userId: ctx.user.id, stage: "fetching-info", result: null, error: null };
+    sourceTranscriptionJobs.set(id, job);
+    runningSourceTranscriptions++;
+    void transcribeSource(input, (stage) => { job.stage = stage; }).then((result) => {
+      job.result = result;
+    }, (error) => {
+      job.error = error instanceof TRPCError2 ? error.message : "Couldn’t analyse this video. Try again.";
+      console.warn("[Extract] Transcription job failed:", error.message);
+    }).finally(() => {
+      runningSourceTranscriptions--;
+      setTimeout(() => sourceTranscriptionJobs.delete(id), 5 * 60_000).unref();
+    });
+    return { id };
+  }),
+  transcriptionStatus: protectedProcedure.input(z.object({ id: z.string().uuid() })).query(({ input, ctx }) => {
+    const job = sourceTranscriptionJobs.get(input.id);
+    if (!job || job.userId !== ctx.user.id) {
+      throw new TRPCError2({ code: "NOT_FOUND", message: "This analysis expired. Start it again." });
+    }
+    ctx.res.setHeader("Cache-Control", "no-store");
+    return { stage: job.stage, result: job.result, error: job.error };
   }),
   /**
    * POST /api/trpc/extract.uploadTranscribe
@@ -1743,6 +1568,7 @@ var geminiRouter = router({
    */
   detectHighlights: protectedProcedure.input(z2.object({
     transcript: z2.string().min(10, "Transcript is too short"),
+    transcriptWords: z2.array(z2.object({ word: z2.string(), start: z2.number().nonnegative() })).optional(),
     videoDuration: z2.number().optional(),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
     apiKey: z2.string().min(1, "Inworld API key is required"),
@@ -1751,6 +1577,15 @@ var geminiRouter = router({
     rank: z2.number().int().min(1).max(99).optional(),
     sourceTitle: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
+    const timedLines = new Map();
+    for (const { word, start } of input.transcriptWords ?? []) {
+      const interval = Math.floor(start / 10) * 10;
+      if (!timedLines.has(interval)) timedLines.set(interval, []);
+      timedLines.get(interval).push(word);
+    }
+    const transcript = timedLines.size
+      ? [...timedLines].map(([start, words]) => `[${start}s] ${words.join(" ")}`).join("\n")
+      : input.transcript;
     const defaultSystemPrompt = `You are an expert viral video editor and content strategist specializing in short-form content for TikTok, YouTube Shorts, and Instagram Reels.
 
 Analyze the transcript and identify the TOP 5 most viral and engaging moments that would make excellent short clips (15-60 seconds each).
@@ -1766,7 +1601,7 @@ Return ONLY valid JSON \u2014 no markdown, no code fences, no extra text.`;
     const defaultUserPrompt = `Analyze this transcript and identify the 5 best moments for viral short-form clips.
 
 TRANSCRIPT:
-${input.transcript}
+${transcript}
 ${input.videoDuration ? `
 Total video duration: ${Math.floor(input.videoDuration / 60)}m ${Math.floor(input.videoDuration % 60)}s` : ""}
 
@@ -1799,7 +1634,7 @@ Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT R
       ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 8-15 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates.
 
 TRANSCRIPT:
-${input.transcript}
+${transcript}
 ${input.videoDuration ? `\nTotal video duration: ${Math.floor(input.videoDuration / 60)}m ${Math.floor(input.videoDuration % 60)}s` : ""}
 
 Return exactly this JSON:
@@ -2268,22 +2103,22 @@ async function extractAudioRange(mediaPath, startSeconds, durationSeconds) {
   await ensureDirs();
   const dir = await fs5.mkdtemp(path4.join(RENDER_TMP_DIR, "stt-"));
   const out = path4.join(dir, "audio.mp3");
-  await execAsync(
-    `${q(ffmpeg)} -ss ${Math.max(0, startSeconds)} -i ${q(mediaPath)} -t ${durationSeconds} -vn -ac 1 -ar 16000 -b:a 64k -y -loglevel error ${q(out)}`,
-    { timeout: 3e5, maxBuffer: 16 * 1024 * 1024 }
-  );
-  const stat = await fs5.stat(out).catch(() => null);
-  if (!stat || stat.size === 0) {
-    await fs5.rm(dir, { recursive: true, force: true }).catch(() => {
-    });
-    throw new SttError("Could not extract audio for transcription.");
+  try {
+    await promisify(execFile)(ffmpeg, [
+      "-ss", String(Math.max(0, startSeconds)), "-i", mediaPath,
+      "-t", String(durationSeconds), "-vn", "-ac", "1", "-ar", "16000",
+      "-b:a", "64k", "-y", "-loglevel", "error", out
+    ], { timeout: 3e5, maxBuffer: 16 * 1024 * 1024 });
+    const stat = await fs5.stat(out);
+    if (!stat.size) throw new SttError("Could not extract audio for transcription.");
+    if (stat.size > MAX_AUDIO_MB * 1024 * 1024) {
+      throw new SttError("This clip's audio is too long to transcribe in one request.");
+    }
+    return out;
+  } catch (error) {
+    await cleanupAudio(out);
+    throw error;
   }
-  if (stat.size / (1024 * 1024) > MAX_AUDIO_MB) {
-    await fs5.rm(dir, { recursive: true, force: true }).catch(() => {
-    });
-    throw new SttError("This clip's audio is too long to transcribe in one request.");
-  }
-  return out;
 }
 function toSeconds(value) {
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -4027,145 +3862,38 @@ var appRouter = router({
         offsetY: crop.offsetY,
         captionsEnabled
       });
-      /*
-       * Always transcribe the clip's own audio for subtitles.
-       * This gives much better lip sync than YouTube captions which have
-       * 3-7s segment-level timing that drifts from actual speech.
-       */
-      var finalCaptions = captionsEnabled ? await captionsForClip(clip, video) : null;
-      if (captionsEnabled && !finalCaptions && actualHostedPath) {
-        console.log(`[Render] Transcribing clip ${clip.id} audio for subtitles (${(clip.endTime - clip.startTime).toFixed(0)}s)...`);
-        const apiKey = process.env.INWORLD_API_KEY;
-        if (apiKey) {
-          const clipTmpDir = await fs6.mkdtemp(path5.join(os3.tmpdir(), `shortspro-clip-stt-${clip.id}-`));
-          try {
-            const ffmpegBin = await findFfmpeg();
-            const clipAudio = path5.join(clipTmpDir, "clip.mp3");
-            const seekStart = Math.max(0, clip.startTime - actualHostedOffset);
-            const seekDur = clip.endTime - clip.startTime;
-            await execAsync(
-              `${q(ffmpegBin)} -ss ${seekStart.toFixed(3)} -t ${seekDur.toFixed(3)} -i ${q(actualHostedPath)} -vn -ar 16000 -ac 1 -b:a 64k ${q(clipAudio)} -y -loglevel error`,
-              { timeout: 6e4 }
-            );
-            /*
-             * Real per-word timings first. faster-whisper reports an actual
-             * start/end for every word, so captions land on the syllable
-             * instead of being spread across a guessed region.
-             */
-            let localWords = [];
-            try {
-              const local = await localWhisperWords(clipAudio, "en");
-              localWords = local.words;
-              if (localWords.length > 0) {
-                finalCaptions = { words: localWords, style: DEFAULT_CAPTION_STYLE };
-                try {
-                  const existing = await db.select().from(subtitles).where(eq(subtitles.clipId, clip.id));
-                  const payload = JSON.stringify(localWords.map((w) => ({ ...w, start: w.start + clip.startTime, end: w.end + clip.startTime })));
-                  if (existing.length > 0) {
-                    await db.update(subtitles).set({ words: payload }).where(eq(subtitles.clipId, clip.id));
-                  } else {
-                    await db.insert(subtitles).values({ clipId: clip.id, userId: ctx.user.id, words: payload });
-                  }
-                } catch {}
-                console.log(`[Render] Clip ${clip.id}: ${localWords.length} words with real per-word timings (faster-whisper)`);
-              }
-            } catch (localErr) {
-              console.warn(`[Render] Local word timing unavailable, falling back to Inworld + estimated timing: ${localErr instanceof Error ? localErr.message : String(localErr)}`);
-            }
-            /*
-             * Fallback only. Inworld returns no word timings, so the positions
-             * below are estimated from silence regions and will drift.
-             */
-            const fullText = localWords.length > 0 ? "" : await inworldTranscribe(clipAudio, apiKey, "en");
-            const fullClean = localWords.length > 0 ? "" : cleanCaptionText(fullText);
-            if (!fullClean) {
-              if (localWords.length === 0) console.warn(`[Render] Clip ${clip.id}: STT returned empty text`);
-            } else {
-              const allWords = splitWords(fullClean);
-              /* Step 2: Detect speech regions */
-              const silOutput = await execAsync(`${q(ffmpegBin)} -i ${q(clipAudio)} -af "silencedetect=noise=-30dB:d=0.3" -f null - 2>&1`, {
-                timeout: 6e4, maxBuffer: 32 * 1024 * 1024
-              }).catch((e) => ({ stdout: e?.stdout ?? "", stderr: e?.stderr ?? "" }));
-              const silBlob = `${silOutput.stdout ?? ""}${silOutput.stderr ?? ""}`;
-              const silStarts = [], silEndsArr = [];
-              for (const line of silBlob.split(/\r?\n/)) {
-                const sm = /silence_start:\s*(-?[\d.]+)/.exec(line);
-                if (sm) silStarts.push(Math.max(0, +sm[1]));
-                const em = /silence_end:\s*(-?[\d.]+)/.exec(line);
-                if (em) silEndsArr.push(Math.max(0, +em[1]));
-              }
-              const silences = silStarts.map((s, i) => ({ start: s, end: silEndsArr[i] ?? seekDur })).filter(x => x.end > x.start);
-              const speechRuns = [];
-              let cur = 0;
-              for (const sil of silences) { if (sil.start > cur) speechRuns.push({ start: cur, end: sil.start }); cur = Math.max(cur, sil.end); }
-              if (cur < seekDur) speechRuns.push({ start: cur, end: seekDur });
-              /* Merge short gaps, drop slivers, trim start by 0.15s */
-              const merged = [];
-              for (const sp of speechRuns) {
-                const trimmed = { start: Math.min(sp.start + 0.15, sp.end), end: sp.end };
-                if (trimmed.end - trimmed.start < 0.2) continue;
-                const l = merged[merged.length - 1];
-                if (l && trimmed.start - l.end < 0.5) l.end = trimmed.end;
-                else merged.push({...trimmed});
-              }
-              /* Step 3: Distribute words across regions proportionally by duration */
-              const totalSpeechDur = merged.reduce((s, r) => s + (r.end - r.start), 0);
-              const clipWords = [];
-              let wordCursor = 0;
-              for (let ri = 0; ri < merged.length; ri++) {
-                const run = merged[ri];
-                const runDur = run.end - run.start;
-                const proportion = totalSpeechDur > 0 ? runDur / totalSpeechDur : 1 / merged.length;
-                /* How many words belong to this region */
-                const wordsForRun = ri === merged.length - 1
-                  ? allWords.slice(wordCursor)
-                  : allWords.slice(wordCursor, wordCursor + Math.round(proportion * allWords.length));
-                wordCursor += wordsForRun.length;
-                if (wordsForRun.length === 0) continue;
-                /* Step 4: Split region into max 3s sub-chunks for tighter timing */
-                const MAX_CHUNK = 3;
-                const numChunks = Math.ceil(runDur / MAX_CHUNK);
-                const chunkDur = runDur / numChunks;
-                const wordsPerChunk = Math.ceil(wordsForRun.length / numChunks);
-                for (let ci = 0; ci < numChunks; ci++) {
-                  const chunkStart = run.start + ci * chunkDur;
-                  const chunkEnd = ci === numChunks - 1 ? run.end : chunkStart + chunkDur;
-                  const chunkWords = wordsForRun.slice(ci * wordsPerChunk, (ci + 1) * wordsPerChunk);
-                  if (chunkWords.length === 0) continue;
-                  for (const w of distributeWords(chunkWords, chunkStart, chunkEnd)) clipWords.push(w);
-                }
-              }
-              if (clipWords.length > 0) {
-                finalCaptions = { words: clipWords, style: DEFAULT_CAPTION_STYLE };
-                /* Save to subtitles table so Edit section can show them too */
-                try {
-                  const existing = await db.select().from(subtitles).where(eq(subtitles.clipId, clip.id));
-                  if (existing.length > 0) {
-                    await db.update(subtitles).set({ words: JSON.stringify(clipWords) }).where(eq(subtitles.clipId, clip.id));
-                  } else {
-                    await db.insert(subtitles).values({ clipId: clip.id, userId: ctx.user.id, words: JSON.stringify(clipWords) });
-                  }
-                } catch {}
-                console.log(`[Render] Clip ${clip.id}: ${clipWords.length} words across ${merged.length} speech regions (${totalSpeechDur.toFixed(1)}s speech of ${seekDur.toFixed(1)}s)`);
-              }
-            }
-          } catch (sttErr) {
-            console.warn(`[Render] Clip STT failed: ${sttErr instanceof Error ? sttErr.message : String(sttErr)}`);
-          } finally {
-            await fs6.rm(clipTmpDir, { recursive: true, force: true }).catch(() => {});
-          }
-        }
-      }
-      if (!finalCaptions && captionsEnabled) {
-        finalCaptions = await captionsForClip(clip, video);
-      }
-      if (captionsEnabled && !finalCaptions) {
-        console.warn(
-          `[Render] Clip ${clip.id} has no captions to burn in (video ${video.id} transcript ${video.transcript ? "present" : "missing"})`
-        );
-      }
       void (async () => {
+        let finalCaptions = null;
         try {
+          finalCaptions = captionsEnabled ? await captionsForClip(clip, video) : null;
+          if (captionsEnabled && !finalCaptions && actualHostedPath) {
+            let audioPath;
+            try {
+              const seekStart = Math.max(0, clip.startTime - actualHostedOffset);
+              const duration = clip.endTime - clip.startTime;
+              audioPath = await extractAudioRange(actualHostedPath, seekStart, duration);
+              const { words } = await localWhisperWords(audioPath);
+              if (words.length) {
+                const saved = await getSubtitleByClip(clip.id);
+                finalCaptions = { words, style: saved?.style ?? DEFAULT_CAPTION_STYLE };
+                await upsertSubtitle({
+                  clipId: clip.id,
+                  userId: ctx.user.id,
+                  words: words.map(word => ({ ...word, start: word.start + clip.startTime, end: word.end + clip.startTime })),
+                });
+                await recordSttUsage(video.id, duration);
+              }
+            } catch (error) {
+              console.warn("[Render] Local Whisper failed:", String(error.stderr || error.message).slice(0, 600));
+            } finally {
+              if (audioPath) await cleanupAudio(audioPath);
+            }
+          }
+          if (captionsEnabled && !finalCaptions) {
+            console.warn(
+              `[Render] Clip ${clip.id} has no captions to burn in (video ${video.id} transcript ${video.transcript ? "present" : "missing"})`
+            );
+          }
           const result = await renderClipFromHosted({
             clipId: clip.id,
             hostedPath: actualHostedPath,
@@ -4270,8 +3998,7 @@ var appRouter = router({
      */
     transcribe: protectedProcedure.input(z4.object({
       id: z4.number(),
-      apiKey: z4.string().min(1, "Inworld API key is required"),
-      language: z4.string().default("en"),
+      language: z4.string().default("auto"),
       /**
        * Transcribe even though the video has subtitles switched off, and turn
        * them on. Used by the explicit "generate transcript now" action.
@@ -4303,128 +4030,23 @@ var appRouter = router({
       let audioPath = null;
       try {
         audioPath = await extractAudioRange(hostedPath, localStart, duration);
-        const resolvedKey = (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey);
-        /*
-         * Real per-word timings first, so the editor shows captions on the
-         * syllable rather than estimated positions.
-         */
-        try {
-          const local = await localWhisperWords(audioPath, input.language);
-          if (local.words.length > 0) {
-            const absolute = local.words.map((w) => ({
-              word: w.word,
-              start: w.start + clip.startTime,
-              end: w.end + clip.startTime
-            }));
-            await recordSttUsage(video.id, duration);
-            const existingSub = await getSubtitleByClip(clip.id);
-            await upsertSubtitle({
-              clipId: clip.id,
-              userId: ctx.user.id,
-              style: existingSub?.style ?? void 0,
-              words: absolute
-            });
-            if (input.force && !video.transcriptionEnabled) {
-              await updateVideo(video.id, { transcriptionEnabled: true });
-            }
-            console.log(`[STT] Clip ${clip.id}: ${absolute.length} words with real per-word timings (faster-whisper)`);
-            return {
-              success: true,
-              wordCount: absolute.length,
-              timed: true,
-              text: local.text,
-              words: absolute
-            };
-          }
-        } catch (localErr) {
-          console.warn(`[STT] Local word timing unavailable, falling back to Inworld + estimated timing: ${localErr instanceof Error ? localErr.message : String(localErr)}`);
+        const local = await localWhisperWords(audioPath, input.language);
+        if (!local.words.length) {
+          throw new TRPCError5({ code: "BAD_REQUEST", message: "Whisper didn’t detect speech in this clip." });
         }
-        /* Fallback: Inworld text with timings estimated from silence regions. */
-        const fullText = await inworldTranscribe(audioPath, resolvedKey, input.language);
-        const cleanText = cleanCaptionText(fullText);
-        if (!cleanText) {
-          throw new TRPCError5({
-            code: "INTERNAL_SERVER_ERROR",
-            message: "No speech was detected in this clip."
-          });
-        }
-        const allWords = splitWords(cleanText);
-        /* Detect speech regions for timing alignment */
-        const ffmpegBin = await findFfmpeg();
-        const silOutput = await execAsync(`${q(ffmpegBin)} -i ${q(audioPath)} -af "silencedetect=noise=-30dB:d=0.3" -f null - 2>&1`, {
-          timeout: 6e4, maxBuffer: 32 * 1024 * 1024
-        }).catch((e) => ({ stdout: e?.stdout ?? "", stderr: e?.stderr ?? "" }));
-        const silBlob = `${silOutput.stdout ?? ""}${silOutput.stderr ?? ""}`;
-        const silStarts = [], silEndsArr = [];
-        for (const line of silBlob.split(/\r?\n/)) {
-          const sm = /silence_start:\s*(-?[\d.]+)/.exec(line);
-          if (sm) silStarts.push(Math.max(0, +sm[1]));
-          const em = /silence_end:\s*(-?[\d.]+)/.exec(line);
-          if (em) silEndsArr.push(Math.max(0, +em[1]));
-        }
-        const silences = silStarts.map((s, i) => ({ start: s, end: silEndsArr[i] ?? duration })).filter(x => x.end > x.start);
-        const speechRuns = [];
-        let cur2 = 0;
-        for (const sil of silences) { if (sil.start > cur2) speechRuns.push({ start: cur2, end: sil.start }); cur2 = Math.max(cur2, sil.end); }
-        if (cur2 < duration) speechRuns.push({ start: cur2, end: duration });
-        const merged = [];
-        for (const sp of speechRuns) {
-          const trimmed = { start: Math.min(sp.start + 0.15, sp.end), end: sp.end };
-          if (trimmed.end - trimmed.start < 0.2) continue;
-          const l = merged[merged.length - 1];
-          if (l && trimmed.start - l.end < 0.5) l.end = trimmed.end;
-          else merged.push({...trimmed});
-        }
-        /* Distribute words across speech regions with 3s sub-chunks */
-        const totalSpeechDur = merged.reduce((s, r) => s + (r.end - r.start), 0);
-        const timedWords = [];
-        let wordCursor = 0;
-        for (let ri = 0; ri < merged.length; ri++) {
-          const run = merged[ri];
-          const runDur = run.end - run.start;
-          const proportion = totalSpeechDur > 0 ? runDur / totalSpeechDur : 1 / merged.length;
-          const wordsForRun = ri === merged.length - 1
-            ? allWords.slice(wordCursor)
-            : allWords.slice(wordCursor, wordCursor + Math.round(proportion * allWords.length));
-          wordCursor += wordsForRun.length;
-          if (wordsForRun.length === 0) continue;
-          const MAX_CHUNK = 3;
-          const numChunks = Math.ceil(runDur / MAX_CHUNK);
-          const chunkDur = runDur / numChunks;
-          const wordsPerChunk = Math.ceil(wordsForRun.length / numChunks);
-          for (let ci = 0; ci < numChunks; ci++) {
-            const chunkStart = run.start + ci * chunkDur;
-            const chunkEnd = ci === numChunks - 1 ? run.end : chunkStart + chunkDur;
-            const chunkWords = wordsForRun.slice(ci * wordsPerChunk, (ci + 1) * wordsPerChunk);
-            if (chunkWords.length === 0) continue;
-            for (const w of distributeWords(chunkWords, chunkStart + clip.startTime, chunkEnd + clip.startTime)) timedWords.push(w);
-          }
-        }
+        const words = local.words.map(word => ({
+          ...word, start: word.start + clip.startTime, end: word.end + clip.startTime
+        }));
+        await upsertSubtitle({ clipId: clip.id, userId: ctx.user.id, words });
         await recordSttUsage(video.id, duration);
-        console.log(
-          `[STT] Clip ${clip.id} (video ${video.id}): ${duration.toFixed(1)}s audio, ${timedWords.length} words aligned to ${merged.length} speech regions`
-        );
-        const existing = await getSubtitleByClip(clip.id);
-        await upsertSubtitle({
-          clipId: clip.id,
-          userId: ctx.user.id,
-          style: existing?.style ?? void 0,
-          words: timedWords.length > 0 ? timedWords : void 0
-        });
         if (input.force && !video.transcriptionEnabled) {
           await updateVideo(video.id, { transcriptionEnabled: true });
         }
-        return {
-          success: true,
-          wordCount: timedWords.length,
-          timed: true,
-          text: cleanText,
-          words: timedWords
-        };
-      } catch (err) {
-        if (err instanceof TRPCError5) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        throw new TRPCError5({ code: "INTERNAL_SERVER_ERROR", message: `Transcription failed: ${msg}` });
+        return { success: true, wordCount: words.length, timed: true, text: local.text, words };
+      } catch (error) {
+        if (error instanceof TRPCError5) throw error;
+        console.warn("[STT] Local Whisper failed:", String(error.stderr || error.message).slice(0, 600));
+        throw new TRPCError5({ code: "INTERNAL_SERVER_ERROR", message: "Local Whisper couldn’t transcribe this clip. Try again." });
       } finally {
         if (audioPath) await cleanupAudio(audioPath);
       }

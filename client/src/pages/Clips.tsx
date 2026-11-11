@@ -84,12 +84,10 @@ type VideoRow = {
 
 // ─── Live preview + trim editor ───────────────────────────────────────────────
 function ClipEditorModal({
-  clip, video, apiKey, onDelete, onClose,
+  clip, video, onDelete, onClose,
 }: {
   clip: ClipRow;
   video: VideoRow | undefined;
-  /** Needed for speech-to-text. */
-  apiKey: string;
   onDelete: () => void;
   onClose: () => void;
 }) {
@@ -216,11 +214,7 @@ function ClipEditorModal({
       await utils.subtitles.get.invalidate({ clipId: clip.id });
       // Transcribing on demand turns subtitles back on for the video.
       await utils.videos.list.invalidate();
-      toast.success(
-        res.timed
-          ? `Transcribed ${res.wordCount} words with speech timings. Re-render to burn them in.`
-          : `Transcribed, but the provider returned no word timings (${res.wordCount}).`
-      );
+      toast.success(`Whisper transcribed ${res.wordCount} timed words. Re-render to burn them in.`);
     },
     onError: err => toast.error(err.message),
   });
@@ -836,10 +830,7 @@ function ClipEditorModal({
                 request, which is also what re-enables subtitles for a video
                 that was imported with them switched off. */}
             {captionsOn && <button
-              onClick={() => {
-                if (!apiKey) { return; }
-                transcribeClip.mutate({ id: clip.id, apiKey, force: true });
-              }}
+              onClick={() => transcribeClip.mutate({ id: clip.id, force: true })}
               disabled={hostedStatus !== "ready" || transcribeClip.isPending}
               className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-bold transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
               style={{ background: "rgba(221, 125, 113, 0.1)", color: "var(--coral)" }}
@@ -997,8 +988,6 @@ function TrimControl({
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 export default function ClipsPage() {
-  // API key is now handled server-side via .env
-  const apiKey = "server";
   // Poll so newly created clips appear live without a manual refresh.
   const { data: clips, isLoading } = trpc.clips.list.useQuery(undefined, {
     refetchInterval: 5000,
@@ -1057,7 +1046,6 @@ export default function ClipsPage() {
         <ClipEditorModal
           clip={editingClip}
           video={videoFor(editingClip)}
-          apiKey={apiKey}
           onDelete={() => confirmDelete(editingClip)}
           onClose={() => setEditingId(null)}
         />

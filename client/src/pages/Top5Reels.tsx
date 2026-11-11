@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import AppLayout from "@/components/AppLayout";
 import { trpc } from "@/lib/trpc";
+import { useSourceTranscription } from "@/hooks/useSourceTranscription";
 import { parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { toast } from "sonner";
 import { Link } from "wouter";
@@ -364,7 +365,8 @@ export default function Top5ReelsPage() {
   const autoPreviewKeyRef = useRef<string | null>(null);
   const utils = trpc.useUtils();
 
-  const extract = trpc.extract.transcribe.useMutation();
+  const transcribeSource = useSourceTranscription();
+  const isAnalyzing = ranks.some(entry => entry.state === "analyzing");
   const createVideo = trpc.videos.create.useMutation();
   const detectHighlights = trpc.gemini.detectHighlights.useMutation();
   const createClip = trpc.clips.create.useMutation();
@@ -459,20 +461,20 @@ export default function Top5ReelsPage() {
     setFinalUrl(null);
     patchRank(rank, { state: "analyzing", error: undefined, candidates: [], selectedId: undefined, clipId: undefined, clipUrl: undefined });
     try {
-      const source: any = await extract.mutateAsync({
+      const source = await transcribeSource({
         url: entry.url.trim(),
-        apiKey: API_KEY,
-        language: "en",
+        language: "auto",
         allowSpeechToText: true,
       });
       const sourceTitle = source.title || `Rank ${rank} source`;
       const transcript = String(source.transcript || "").trim();
       if (transcript.length < 10) {
-        throw new Error("No usable transcript was returned. Choose another source or use a video with speech/captions.");
+        throw new Error(source.note || "No usable transcript was returned. Choose a source with speech or captions.");
       }
 
       const analysis: any = await detectHighlights.mutateAsync({
         transcript,
+        transcriptWords: source.words,
         videoDuration: source.duration || undefined,
         model: MODEL,
         apiKey: API_KEY,
@@ -482,7 +484,7 @@ export default function Top5ReelsPage() {
       });
       const candidates: Candidate[] = (analysis.highlights || []).slice(0, 3).map((candidate: Candidate) => limitToShortClip(candidate, source.duration));
       if (!candidates.length) throw new Error("The AI did not return a usable highlight from this source.");
-      const transcriptEnd = Math.max(0, ...(Array.isArray(source.words) ? source.words.map((word: any) => Number(word.end) || Number(word.start) || 0) : []));
+      const transcriptEnd = source.words.reduce((end, word) => Math.max(end, word.end), 0);
       const highlightEnd = Math.max(0, ...candidates.map((candidate) => candidate.endTime));
       /* Provider duration is preferred; caption and highlight timing keep the
        * full editor usable if a provider omits its duration metadata. */
@@ -740,8 +742,8 @@ export default function Top5ReelsPage() {
                   <h2 className="text-base font-black text-foreground">1. Add only the ranks you want</h2>
                   <p className="mt-1 text-xs text-muted-foreground">Each rank is optional. Remove an unused rank instead of adding a link; the final video uses only the remaining ranks.</p>
                 </div>
-                <button type="button" onClick={analyseAll} disabled={extract.isPending || detectHighlights.isPending} className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45" style={{ background: accent }}>
-                  {extract.isPending || detectHighlights.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
+                <button type="button" onClick={analyseAll} disabled={isAnalyzing} className="inline-flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-black text-black transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45" style={{ background: accent }}>
+                  {isAnalyzing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
                   Analyse sources
                 </button>
               </div>
