@@ -7,7 +7,6 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
-import { registerSupabaseOAuth } from "../server/supabase-oauth.mjs";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -3571,7 +3570,13 @@ var appRouter = router({
      * GET /api/trpc/auth.me
      * Returns the currently authenticated user or null.
      */
-    me: publicProcedure.query((opts) => opts.ctx.user),
+    me: publicProcedure.query(({ ctx }) => {
+      ctx.res.setHeader("Cache-Control", "no-store");
+      const user = ctx.user;
+      if (!user) return null;
+      const { id, name, email, role, loginMethod, createdAt } = user;
+      return { id, name, email, role, loginMethod, createdAt };
+    }),
     /**
      * POST /api/trpc/auth.register
      * Register a new user with name, email, and password.
@@ -4794,7 +4799,6 @@ async function startServer() {
   app.use(express2.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
-  registerSupabaseOAuth(app, { findUser: getUserByOpenId, saveUser: upsertUser, setSession: setWebSession });
   registerMediaRoutes(app);
   registerMediaUpload(app, {
     authenticate: req => sdk.authenticateRequest(req),

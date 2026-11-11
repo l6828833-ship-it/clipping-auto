@@ -8,6 +8,12 @@ import App from "./App";
 import { startLogin } from "./const";
 import "./index.css";
 
+try {
+  localStorage.removeItem("manus-runtime-user-info");
+} catch {
+  // Storage can be unavailable in private browsing or embedded views.
+}
+
 const queryClient = new QueryClient();
 
 const redirectToLoginIfUnauthorized = (error: unknown) => {
