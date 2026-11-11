@@ -1099,21 +1099,24 @@ async function getYtDlp() {
   return found;
 }
 var getFfmpeg = findFfmpeg;
-async function tryYouTubeTranscript(url, language = "en") {
+function youtubeSourceId(url) {
+  const source = new URL(url);
+  const host = source.hostname.toLowerCase();
+  const id = host === "youtu.be"
+    ? source.pathname.split("/")[1]
+    : host === "youtube.com" || host.endsWith(".youtube.com")
+      ? source.searchParams.get("v") || /^\/(?:embed|shorts|live|v)\/([^/]+)/.exec(source.pathname)?.[1]
+      : null;
+  return /^[a-zA-Z0-9_-]{11}$/.test(id ?? "") ? id : null;
+}
+async function tryYouTubeTranscript(url, language) {
   try {
-    /* Use youtube-transcript package — doesn't need PO token or cookies */
+    const videoId = youtubeSourceId(url);
+    if (!videoId) return null;
     const { YoutubeTranscript } = await import("youtube-transcript");
-    const source = new URL(url);
-    const host = source.hostname.toLowerCase();
-    const videoId = host === "youtu.be"
-      ? source.pathname.split("/")[1]
-      : host === "youtube.com" || host.endsWith(".youtube.com")
-        ? source.searchParams.get("v") || /^\/(?:embed|shorts|live|v)\/([^/]+)/.exec(source.pathname)?.[1]
-        : null;
-    if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId ?? "")) return null;
     const signal = AbortSignal.timeout(8000);
     const segments = await YoutubeTranscript.fetchTranscript(videoId, {
-      lang: language === "auto" ? undefined : language,
+      lang: language === "auto" ? undefined : language.split("-")[0],
       fetch: (input, init) => fetch(input, { ...init, signal })
     });
     if (!segments?.length) return null;
@@ -1167,7 +1170,7 @@ async function inworldTranscribe(audioPath, apiKey, language = "en") {
 async function getVideoInfo(url) {
   const ytDlp = await getYtDlp();
   const { stdout } = await promisify(execFile)(ytDlp,
-    ["--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
+    ["--ignore-config", "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
     { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
   );
   const info = JSON.parse(stdout.trim());
@@ -1176,33 +1179,55 @@ async function getVideoInfo(url) {
     duration: info.duration ?? 0,
     uploader: info.uploader ?? "Unknown",
     thumbnail: info.thumbnail ?? "",
-    description: info.description ?? ""
+    description: info.description ?? "",
+    language: /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(info.language ?? "") ? info.language.toLowerCase() : "auto"
   };
 }
 async function downloadSourceAudio(url, tmpDir) {
   const ytDlp = await getYtDlp();
   const ffmpeg = await getFfmpeg();
   if (!ffmpeg) throw new Error(FFMPEG_MISSING);
-  await runStreaming(ytDlp, [
-    "--no-playlist", "--no-warnings", "--socket-timeout", "20", "--retries", "2",
-    ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS,
-    "--format", "bestaudio/best", "--extract-audio", "--audio-format", "mp3",
-    "--ffmpeg-location", path3.dirname(ffmpeg),
-    "--output", path3.join(tmpDir, "source.%(ext)s"), "--", url
-  ], { timeout: 3e5 });
-  return path3.join(tmpDir, "source.mp3");
+  const download = async (stem, format, clientArgs = []) => {
+    await runStreaming(ytDlp, [
+      "--ignore-config", "--no-playlist", "--no-warnings", "--no-progress",
+      "--socket-timeout", "15", "--retries", "1", "--fragment-retries", "1", "--abort-on-unavailable-fragment",
+      ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...clientArgs,
+      "--format", format, "--ffmpeg-location", path3.dirname(ffmpeg),
+      "--output", path3.join(tmpDir, `${stem}.%(ext)s`), "--", url
+    ], { timeout: 15e4 });
+    const mediaPath = await findWritten(tmpDir, `${stem}.`);
+    if (!mediaPath) throw new Error("No source audio or video file was downloaded.");
+    return mediaPath;
+  };
+  let mediaPath;
+  try {
+    mediaPath = await download("source-audio", "bestaudio/best");
+  } catch (error) {
+    if (!youtubeSourceId(url) || !/403|429|forbidden|format|SABR|sign in|download video data|fragment/i.test(error.message)) throw error;
+    console.warn("[Extract] Preferred YouTube audio failed. Trying a public stream with audio and video:", error.message.slice(0, 350));
+    mediaPath = await download("source-muxed", "b[height<=480]/b", YT_PUBLIC_FALLBACK_CLIENT_ARGS);
+  }
+
+  const audioPath = path3.join(tmpDir, "source.wav");
+  await promisify(execFile)(ffmpeg, [
+    "-nostdin", "-hide_banner", "-loglevel", "error", "-i", mediaPath,
+    "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", audioPath
+  ], { timeout: 12e4 });
+  return audioPath;
 }
 var sourceTranscriptionInput = z.object({
   url: z.string().url("Invalid URL"),
-  language: z.string().default("en"),
+  language: z.string().regex(/^(?:auto|[a-z]{2,3}(?:-[a-z]{2})?)$/i).transform(value => value.toLowerCase()).default("auto"),
   allowSpeechToText: z.boolean().default(true)
 });
 async function transcribeSource(input, reportStage = () => {}) {
   const url = assertSafeUrl(input.url);
   let meta = { title: "Untitled", duration: 0, uploader: "" };
+  let language = input.language;
   try {
-    const { title, duration, uploader } = await getVideoInfo(url);
+    const { title, duration, uploader, language: sourceLanguage } = await getVideoInfo(url);
     meta = { title, duration, uploader };
+    if (language === "auto") language = sourceLanguage;
   } catch (error) {
     if (error instanceof TRPCError2) throw error;
     if (/unsupported url|is not a valid url|unable to download webpage/i.test(error.message)) {
@@ -1214,7 +1239,7 @@ async function transcribeSource(input, reportStage = () => {}) {
     success: true, ...meta, source, transcript, words, wordCount: words.length, note
   });
   reportStage("checking-captions");
-  const captions = await tryYouTubeTranscript(url, input.language);
+  const captions = await tryYouTubeTranscript(url, language);
   if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
     return result("none", "", [], "Subtitles are off for this import.");
@@ -1227,12 +1252,17 @@ async function transcribeSource(input, reportStage = () => {}) {
     try {
       audioPath = await downloadSourceAudio(url, tmpDir);
     } catch (error) {
-      console.warn("[Extract] Source audio download failed:", error.message);
-      return result("none", "", [], "Clip Maker couldn’t download the source audio for Whisper. Try uploading the original video file.");
+      const details = String(error.stderr || error.message).slice(0, 600);
+      console.warn("[Extract] Source audio unavailable:", details);
+      const youtubeDenied = youtubeSourceId(url) && /403|429|forbidden|sign in|not a bot/i.test(details);
+      const note = youtubeDenied
+        ? "YouTube refused the media request from this server. Upload the original video to transcribe it with Whisper."
+        : "Clip Maker couldn’t prepare audio for Whisper. Try again or upload the original video.";
+      return result("none", "", [], note);
     }
     reportStage("transcribing");
     try {
-      const { text, words } = await localWhisperWords(audioPath, input.language);
+      const { text, words } = await localWhisperWords(audioPath, language);
       if (text && words.length) return result("whisper", text, words);
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {

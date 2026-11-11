@@ -15,19 +15,22 @@ def main() -> None:
     if not os.path.isfile(audio_path):
         raise FileNotFoundError(audio_path)
 
-    language = sys.argv[2] if len(sys.argv) > 2 else "auto"
+    locale = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "auto"
+    language = locale.split("-", 1)[0]
     model_name = sys.argv[3] if len(sys.argv) > 3 else os.environ.get("WHISPER_MODEL", "base")
     if model_name in {"tiny.en", "base.en", "small.en", "medium.en"} and language not in {"en", "english"}:
         model_name = model_name.removesuffix(".en")
 
     import torch
     import whisper
+    from whisper.tokenizer import LANGUAGES
 
     torch.set_num_threads(2)
     model = whisper.load_model(model_name, device="cpu")
     result = model.transcribe(
         audio_path,
-        language=None if language in {"", "auto"} else language,
+        language=language if language in LANGUAGES else None,
+        initial_prompt="هاد الهضرة بالدارجة المغربية." if locale == "ar-ma" else None,
         word_timestamps=True,
         fp16=False,
         verbose=None,

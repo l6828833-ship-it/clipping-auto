@@ -58,6 +58,7 @@ const SAMPLE_WORDS = [
   { word:"go",    start:1.0, end:1.2 }, { word:"VIRAL", start:1.2, end:1.8 },
 ];
 const LANGUAGES = [
+  { code: "auto", label: "Auto-detect" }, { code: "ar-ma", label: "Moroccan Darija" },
   { code: "en", label: "English" }, { code: "es", label: "Spanish" },
   { code: "fr", label: "French"  }, { code: "de", label: "German"  },
   { code: "pt", label: "Portuguese" }, { code: "ja", label: "Japanese" },
@@ -151,7 +152,7 @@ function StepInput({ apiKey, onNext }: {
   const [url, setUrl] = useState("");
   const [title, setTitle] = useState("");
   const [transcript, setTranscript] = useState("");
-  const [language, setLanguage] = useState("en");
+  const [language, setLanguage] = useState("auto");
   const [showLangPicker, setShowLangPicker] = useState(false);
   const [file, setFile] = useState<File|null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -508,6 +509,7 @@ function StepInput({ apiKey, onNext }: {
               Or paste a transcript manually
             </label>
             <textarea
+              dir="auto"
               value={transcript}
               onChange={e => setTranscript(e.target.value)}
               rows={3}

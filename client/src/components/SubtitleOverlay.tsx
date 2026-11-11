@@ -146,7 +146,7 @@ export function SubtitleOverlay({
         />
       )}
 
-      <div className="inline-flex flex-wrap justify-center items-baseline gap-x-[0.25em] gap-y-[0.1em]">
+      <div dir="auto" className="inline-flex flex-wrap justify-center items-baseline gap-x-[0.25em] gap-y-[0.1em]">
         {words.map((word, i) => (
           <span
             key={`${word}-${i}`}

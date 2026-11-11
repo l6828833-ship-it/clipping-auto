@@ -81,9 +81,9 @@ export function registerMediaUpload(app, {
     const user = await authenticate(request).catch(() => null);
     if (!user) return response.status(401).json({ error: "Sign in to upload a video." });
 
-    const { title, language = "en", captions } = request.query;
+    const { title, language = "auto", captions } = request.query;
     if (typeof title !== "string" || !title.trim() || title.trim().length > 512
-        || typeof language !== "string" || !/^[a-z]{2,3}$/.test(language)
+        || typeof language !== "string" || !/^(?:auto|[a-z]{2,3}(?:-[a-z]{2})?)$/i.test(language)
         || !["on", "off"].includes(captions) || !request.is("application/octet-stream")) {
       return response.status(400).json({ error: "Choose a media file and enter a title of up to 512 characters." });
     }
