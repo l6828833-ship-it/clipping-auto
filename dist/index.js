@@ -7,6 +7,7 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
+import { registerSupabaseOAuth } from "../server/supabase-oauth.mjs";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -34,7 +35,7 @@ var decodeOAuthState = (state) => {
 import { parse as parseCookieHeader2 } from "cookie";
 
 // server/db.ts
-import { eq, desc, and, sql } from "drizzle-orm";
+import { eq, desc, and, isNotNull, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 
 // drizzle/schema.ts
@@ -197,10 +198,12 @@ async function getUserByOpenId(openId) {
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result.length > 0 ? result[0] : void 0;
 }
-async function getUserByEmail(email) {
+async function getUserByEmail(email, { passwordOnly = false } = {}) {
   const db = await getDb();
   if (!db) return void 0;
-  const result = await db.select().from(users).where(eq(users.email, email)).limit(1);
+  const matchesEmail = eq(users.email, email);
+  const condition = passwordOnly ? and(matchesEmail, isNotNull(users.passwordHash)) : matchesEmail;
+  const result = await db.select().from(users).where(condition).limit(1);
   return result.length > 0 ? result[0] : void 0;
 }
 async function getUserById(id) {
@@ -3464,6 +3467,10 @@ async function signJwt(payload, secret) {
   const key = new TextEncoder().encode(secret);
   return new SignJWT2(payload).setProtectedHeader({ alg: "HS256" }).setIssuedAt().setExpirationTime("30d").sign(key);
 }
+async function setWebSession(req, res, user, secure = isSecureRequest(req)) {
+  const token = await signJwt({ sub: String(user.id), openId: user.openId, appId: ENV.appId, name: user.name || "Clip Maker user" }, ENV.cookieSecret);
+  res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(req), secure, maxAge: 30 * 24 * 60 * 60 * 1e3 });
+}
 
 async function renderTop5Countdown(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
@@ -3587,11 +3594,9 @@ var appRouter = router({
         passwordHash,
         lastSignedIn: /* @__PURE__ */ new Date()
       });
-      const user = await getUserByEmail(input.email);
+      const user = await getUserByOpenId(openId);
       if (!user) throw new TRPCError5({ code: "INTERNAL_SERVER_ERROR" });
-      const token = await signJwt({ sub: String(user.id), openId: user.openId, appId: ENV.appId, name: user.name ?? "" }, ENV.cookieSecret);
-      const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.cookie(COOKIE_NAME, token, { ...cookieOptions, maxAge: 30 * 24 * 60 * 60 * 1e3 });
+      await setWebSession(ctx.req, ctx.res, user);
       return { success: true, user: { id: user.id, name: user.name, email: user.email, role: user.role } };
     }),
     /**
@@ -3602,14 +3607,12 @@ var appRouter = router({
       email: z4.string().email(),
       password: z4.string().min(1)
     })).mutation(async ({ input, ctx }) => {
-      const user = await getUserByEmail(input.email);
+      const user = await getUserByEmail(input.email, { passwordOnly: true });
       if (!user || !user.passwordHash) throw new TRPCError5({ code: "UNAUTHORIZED", message: "Invalid email or password" });
       const valid = await bcrypt.compare(input.password, user.passwordHash);
       if (!valid) throw new TRPCError5({ code: "UNAUTHORIZED", message: "Invalid email or password" });
       await updateUser(user.id, { lastSignedIn: /* @__PURE__ */ new Date() });
-      const token = await signJwt({ sub: String(user.id), openId: user.openId, appId: ENV.appId, name: user.name ?? "" }, ENV.cookieSecret);
-      const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.cookie(COOKIE_NAME, token, { ...cookieOptions, maxAge: 30 * 24 * 60 * 60 * 1e3 });
+      await setWebSession(ctx.req, ctx.res, user);
       return { success: true, user: { id: user.id, name: user.name, email: user.email, role: user.role } };
     }),
     /**
@@ -4791,6 +4794,7 @@ async function startServer() {
   app.use(express2.urlencoded({ limit: "50mb", extended: true }));
   registerStorageProxy(app);
   registerOAuthRoutes(app);
+  registerSupabaseOAuth(app, { findUser: getUserByOpenId, saveUser: upsertUser, setSession: setWebSession });
   registerMediaRoutes(app);
   registerMediaUpload(app, {
     authenticate: req => sdk.authenticateRequest(req),

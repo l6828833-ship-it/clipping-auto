@@ -4,6 +4,7 @@ import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { Eye, EyeOff, Zap, ArrowRight, Loader2 } from "lucide-react";
 import { useRedirectIfAuth } from "@/hooks/useCustomAuth";
+import SocialSignIn from "@/components/SocialSignIn";
 
 export default function LoginPage() {
   useRedirectIfAuth();
@@ -57,6 +58,7 @@ export default function LoginPage() {
 
         {/* Card */}
         <div className="glass rounded-2xl p-8">
+          <SocialSignIn />
           <form onSubmit={handleSubmit} className="space-y-5">
             {/* Email */}
             <div className="space-y-2">
