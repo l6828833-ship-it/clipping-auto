@@ -1,62 +1,33 @@
-# syntax=docker/dockerfile:1
-
-# The repository contains a precompiled Express/tRPC server in dist/index.js.
-# We only rebuild the Vite client so the deployed image contains the current UI.
-FROM node:22-bookworm-slim AS frontend-build
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --legacy-peer-deps
-
-COPY client ./client
-COPY server ./server
-COPY shared ./shared
-COPY vite.config.ts tsconfig.json components.json ./
-RUN npx vite build
-
-FROM node:22-bookworm-slim AS runtime
-
-ENV NODE_ENV=production \
-    PORT=8080 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# FFmpeg and yt-dlp are required by the hosted-video, subtitle, and render paths.
-# Nightly yt-dlp plus its official default/curl-cffi extras keeps YouTube
-# extractor fixes and browser-style TLS impersonation current in this image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-      ca-certificates \
-      ffmpeg \
-      python3 \
-      python3-pip \
-    && pip3 install --no-cache-dir --break-system-packages -U --pre "yt-dlp[default,curl-cffi]" \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg fonts-dejavu-core libgomp1 python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+COPY scripts/requirements-whisper.txt /tmp/requirements-whisper.txt
+RUN python3 -m venv /opt/media-tools \
+    && /opt/media-tools/bin/pip install --no-cache-dir \
+        'yt-dlp[default,curl-cffi]==2026.10.26' -r /tmp/requirements-whisper.txt
+
+ENV PATH="/opt/media-tools/bin:${PATH}"
 
 COPY package.json package-lock.json ./
-# dist/index.js statically imports the server's Vite integration, including
-# Vite and its configured plugins, even in production. Keep the full dependency
-# tree in this runtime image so Node can link the compiled server at startup.
 RUN npm ci --include=dev --legacy-peer-deps
 
-# The backend is precompiled in the repository. Bring in the original bundle
-# and replace the static frontend assets with the freshly built Vite output.
-COPY dist/index.js ./dist/index.js
-COPY --from=frontend-build /app/dist/public ./dist/public
+COPY client ./client
+COPY shared ./shared
+COPY server ./server
+COPY scripts ./scripts
 COPY assets ./assets
-# Keep the schema tooling available for Supabase database setup:
-# fly ssh console -a clipping-auto -C "npx drizzle-kit migrate"
 COPY drizzle ./drizzle
-COPY drizzle.config.ts ./drizzle.config.ts
+COPY dist/index.js ./dist/index.js
+COPY vite.config.ts tsconfig.json drizzle.config.ts ./
 
-RUN mkdir -p /app/.data/videos /app/.data/clips /app/.data/render \
-    && chown -R node:node /app
+RUN npm run build && install -d -o node -g node /app/.data
 
+ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000
+EXPOSE 3000
 USER node
-
-EXPOSE 8080
-
 CMD ["node", "dist/index.js"]

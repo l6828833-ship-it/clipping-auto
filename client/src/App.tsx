@@ -9,6 +9,7 @@ import RegisterPage from "./pages/Register";
 import DashboardPage from "./pages/Dashboard";
 import CreatePage from "./pages/Create";
 import Top5ReelsPage from "./pages/Top5Reels";
+import Top5SavedClipsPage from "./pages/Top5SavedClips";
 import SubtitleEditorPage from "./pages/SubtitleEditor";
 import ClipsPage from "./pages/Clips";
 import ProfilePage from "./pages/Profile";
@@ -23,6 +24,7 @@ function Router() {
       <Route path="/dashboard"                 component={DashboardPage} />
       <Route path="/dashboard/create"          component={CreatePage} />
       <Route path="/dashboard/top5-reels"      component={Top5ReelsPage} />
+      <Route path="/dashboard/top5-reels/saved-clips" component={Top5SavedClipsPage} />
       <Route path="/dashboard/subtitle-editor" component={SubtitleEditorPage} />
       <Route path="/dashboard/clips"           component={ClipsPage} />
       <Route path="/dashboard/profile"         component={ProfilePage} />
