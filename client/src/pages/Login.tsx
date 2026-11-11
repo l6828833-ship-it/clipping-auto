@@ -46,7 +46,7 @@ export default function LoginPage() {
               <Zap className="w-5 h-5 text-white" />
             </div>
             <span className="text-2xl font-black tracking-tight text-foreground">
-              ShortsPro AI
+              Clip Maker
             </span>
           </div>
           <h1 className="text-3xl font-bold text-foreground mb-2">

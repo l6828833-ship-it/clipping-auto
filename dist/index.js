@@ -35,129 +35,88 @@ import { parse as parseCookieHeader2 } from "cookie";
 
 // server/db.ts
 import { eq, desc, and, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/mysql2";
+import { drizzle } from "drizzle-orm/node-postgres";
 
 // drizzle/schema.ts
-import { int, mysqlEnum, mysqlTable, text, timestamp, varchar, float, json, boolean } from "drizzle-orm/mysql-core";
-var users = mysqlTable("users", {
-  /**
-   * Surrogate primary key. Auto-incremented numeric value managed by the database.
-   * Use this for relations between tables.
-   */
-  id: int("id").autoincrement().primaryKey(),
-  /** Custom auth: email used as unique identifier */
+import { boolean, integer, jsonb, pgEnum, pgTable, real, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
+var userRole = pgEnum("user_role", ["user", "admin"]);
+var sourceType = pgEnum("source_type", ["upload", "url"]);
+var videoStatus = pgEnum("video_status", ["pending", "transcribing", "analyzing", "done", "error"]);
+var hostedStatus = pgEnum("hosted_status", ["none", "downloading", "ready", "error"]);
+var clipStatus = pgEnum("clip_status", ["pending", "rendering", "done", "error"]);
+var users = pgTable("users", {
+  id: serial("id").primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   passwordHash: varchar("passwordHash", { length: 255 }),
-  role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
-  lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull()
+  role: userRole("role").default("user").notNull(),
+  createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
+  lastSignedIn: timestamp("lastSignedIn", { withTimezone: true }).defaultNow().notNull()
 });
-var videos = mysqlTable("videos", {
-  id: int("id").autoincrement().primaryKey(),
-  userId: int("userId").notNull(),
+var videos = pgTable("videos", {
+  id: serial("id").primaryKey(),
+  userId: integer("userId").notNull(),
   title: varchar("title", { length: 512 }),
-  sourceType: mysqlEnum("sourceType", ["upload", "url"]).notNull(),
+  sourceType: sourceType("sourceType").notNull(),
   sourceUrl: text("sourceUrl"),
-  status: mysqlEnum("status", ["pending", "transcribing", "analyzing", "done", "error"]).default("pending").notNull(),
-  duration: float("duration"),
+  status: videoStatus("status").default("pending").notNull(),
+  duration: real("duration"),
   transcript: text("transcript"),
-  /**
-   * Word-level timings from the source caption track, when it had them.
-   * Shape: [{ word, start, end }] in absolute video seconds. Present only for
-   * sources with real timestamps; otherwise captions are spread by length.
-   */
-  transcriptWords: json("transcriptWords"),
-  /**
-   * Whether the user wants subtitles for this video.
-   *
-   * Off means no speech-to-text is performed anywhere in the pipeline — no
-   * Inworld credits are spent — and the transcript-dependent highlight step is
-   * skipped. It can be turned on later, which transcribes on demand.
-   */
+  transcriptWords: jsonb("transcriptWords"),
   transcriptionEnabled: boolean("transcriptionEnabled").default(true).notNull(),
-  /** Number of speech-to-text requests billed against this video. */
-  sttCalls: int("sttCalls").default(0).notNull(),
-  /** Total audio seconds sent for speech-to-text, for cost monitoring. */
-  sttSeconds: float("sttSeconds").default(0).notNull(),
-  /**
-   * Local hosting. The source is downloaded to our own storage so all preview,
-   * editing and rendering runs against our file rather than an external player.
-   */
-  hostedStatus: mysqlEnum("hostedStatus", ["none", "downloading", "ready", "error"]).default("none").notNull(),
-  /** Path served by /api/media/video/<name> once hosting completes. */
+  sttCalls: integer("sttCalls").default(0).notNull(),
+  sttSeconds: real("sttSeconds").default(0).notNull(),
+  hostedStatus: hostedStatus("hostedStatus").default("none").notNull(),
   hostedUrl: text("hostedUrl"),
-  /** 0-100 while downloading, so the UI can show real progress. */
-  hostProgress: int("hostProgress").default(0).notNull(),
-  /**
-   * Original-video time (seconds) corresponding to t=0 in the hosted file.
-   *
-   * Partial imports download only a section, so the hosted file's timeline is
-   * shifted relative to the source. Clip times are stored as absolute source
-   * times, so this offset must be subtracted before seeking into the hosted
-   * file. 0 for a full import.
-   */
-  hostedOffset: float("hostedOffset").default(0).notNull(),
-  /** Native pixel size of the hosted file, used to seed the reframing UI. */
-  width: int("width"),
-  height: int("height"),
+  hostProgress: integer("hostProgress").default(0).notNull(),
+  hostedOffset: real("hostedOffset").default(0).notNull(),
+  width: integer("width"),
+  height: integer("height"),
   hostError: text("hostError"),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
-var clips = mysqlTable("clips", {
-  id: int("id").autoincrement().primaryKey(),
-  videoId: int("videoId").notNull(),
-  userId: int("userId").notNull(),
+var clips = pgTable("clips", {
+  id: serial("id").primaryKey(),
+  videoId: integer("videoId").notNull(),
+  userId: integer("userId").notNull(),
   title: varchar("title", { length: 512 }),
-  startTime: float("startTime"),
-  endTime: float("endTime"),
-  engagementScore: float("engagementScore"),
-  status: mysqlEnum("status", ["pending", "rendering", "done", "error"]).default("pending").notNull(),
+  startTime: real("startTime"),
+  endTime: real("endTime"),
+  engagementScore: real("engagementScore"),
+  status: clipStatus("status").default("pending").notNull(),
   downloadUrl: text("downloadUrl"),
   thumbnailUrl: text("thumbnailUrl"),
-  /** Why the last render failed, surfaced to the user. Cleared on success. */
   errorMessage: text("errorMessage"),
-  /**
-   * Reframing for the vertical crop, set by dragging/zooming the preview.
-   * zoom 1 = fit the source width; offsets are -1..1 fractions of the slack
-   * remaining after zooming, so 0,0 is always centred.
-   */
-  zoom: float("zoom").default(1).notNull(),
-  offsetX: float("offsetX").default(0).notNull(),
-  offsetY: float("offsetY").default(0).notNull(),
-  /**
-   * Whether to burn subtitles into the exported MP4. Off produces a clean clip
-   * with no text, for cases where captions are added elsewhere or not wanted.
-   */
+  zoom: real("zoom").default(1).notNull(),
+  offsetX: real("offsetX").default(0).notNull(),
+  offsetY: real("offsetY").default(0).notNull(),
   captionsEnabled: boolean("captionsEnabled").default(true).notNull(),
-  /**
-   * Optional time-varying framing: [{ start, end, zoom, offsetX, offsetY }] in
-   * clip-relative seconds. Lets the crop follow different subjects across the
-   * clip. When absent, the single zoom/offsetX/offsetY above applies throughout.
-   */
-  framingSegments: json("framingSegments"),
-  scale: float("scale").default(1).notNull(),
+  framingSegments: jsonb("framingSegments"),
+  music: jsonb("music"),
+  scale: real("scale").default(1).notNull(),
   barColor: varchar("barColor", { length: 9 }).default("#000000").notNull(),
-  textOverlays: json("textOverlays"),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+  textOverlays: jsonb("textOverlays"),
+  createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
-var subtitles = mysqlTable("subtitles", {
-  id: int("id").autoincrement().primaryKey(),
-  clipId: int("clipId").notNull(),
-  userId: int("userId").notNull(),
-  words: json("words"),
-  style: json("style"),
-  createdAt: timestamp("createdAt").defaultNow().notNull(),
-  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull()
+var subtitles = pgTable("subtitles", {
+  id: serial("id").primaryKey(),
+  clipId: integer("clipId").notNull(),
+  userId: integer("userId").notNull(),
+  words: jsonb("words"),
+  style: jsonb("style"),
+  createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
 
 // server/_core/env.ts
 var ENV = {
+  // Custom email/password auth runs without a Manus app ID in standalone deployments.
+  // Keep a stable non-empty identifier because the session verifier requires one.
   appId: process.env.VITE_APP_ID || "shortspro-ai",
   cookieSecret: process.env.JWT_SECRET ?? "",
   databaseUrl: process.env.DATABASE_URL ?? "",
@@ -187,8 +146,7 @@ async function upsertUser(user) {
   }
   const db = await getDb();
   if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
-    return;
+      throw new Error("Database is not configured. Set DATABASE_URL to the Supabase PostgreSQL connection string.");
   }
   try {
     const values = {
@@ -221,7 +179,8 @@ async function upsertUser(user) {
     if (Object.keys(updateSet).length === 0) {
       updateSet.lastSignedIn = /* @__PURE__ */ new Date();
     }
-    await db.insert(users).values(values).onDuplicateKeyUpdate({
+    await db.insert(users).values(values).onConflictDoUpdate({
+      target: users.openId,
       set: updateSet
     });
   } catch (error) {
@@ -258,8 +217,8 @@ async function updateUser(id, data) {
 async function createVideo(data) {
   const db = await getDb();
   if (!db) throw new Error("DB not available");
-  const result = await db.insert(videos).values(data);
-  return result[0].insertId;
+  const result = await db.insert(videos).values(data).returning({ id: videos.id });
+  return result[0]?.id;
 }
 async function getVideosByUser(userId) {
   const db = await getDb();
@@ -300,8 +259,8 @@ async function resetOrphanedJobs() {
 async function createClip(data) {
   const db = await getDb();
   if (!db) throw new Error("DB not available");
-  const result = await db.insert(clips).values(data);
-  return result[0].insertId;
+  const result = await db.insert(clips).values(data).returning({ id: clips.id });
+  return result[0]?.id;
 }
 async function getClipsByUser(userId) {
   const db = await getDb();
@@ -332,8 +291,8 @@ async function upsertSubtitle(data) {
     await db.update(subtitles).set(data).where(eq(subtitles.clipId, data.clipId));
     return existing.id;
   } else {
-    const result = await db.insert(subtitles).values(data);
-    return result[0].insertId;
+    const result = await db.insert(subtitles).values(data).returning({ id: subtitles.id });
+    return result[0]?.id;
   }
 }
 async function getClipById(id, userId) {
@@ -728,7 +687,7 @@ import { createReadStream, promises as fs2 } from "fs";
 import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
-var DATA_DIR = path.resolve(process.cwd(), ".data");
+var DATA_DIR = path.resolve(process.env.CLIP_MAKER_DATA_DIR || ".data");
 var VIDEOS_DIR = path.join(DATA_DIR, "videos");
 var CLIPS_DIR = path.join(DATA_DIR, "clips");
 var RENDER_TMP_DIR = path.join(DATA_DIR, "render");
@@ -750,8 +709,8 @@ function shortHash(...parts) {
 function videoFileName(videoId, sourceUrl) {
   return `video-${videoId}-${shortHash(sourceUrl)}.mp4`;
 }
-function clipFileName(clipId, sourceKey, start, end, zoom, offsetX, offsetY) {
-  return `clip-${clipId}-${shortHash(sourceKey, start, end, zoom, offsetX, offsetY)}.mp4`;
+function clipFileName(clipId, sourceKey, start, end, zoom, offsetX, offsetY, barColor = "black") {
+  return `clip-${clipId}-${shortHash(sourceKey, start, end, zoom, offsetX, offsetY, barColor)}.mp4`;
 }
 async function ensureDirs() {
   await fs.mkdir(VIDEOS_DIR, { recursive: true });
@@ -814,7 +773,10 @@ function registerMediaRoutes(app) {
     const total = stat.size;
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "private, no-store");
+    /* Render URLs can be reused after a retry. Never let a browser retain a
+     * cached partial MP4 under the same URL. */
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("X-Content-Type-Options", "nosniff");
     if (req.query.download === "1") {
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.name}"`);
     }
@@ -889,7 +851,7 @@ var adminProcedure = t.procedure.use(
 
 // server/routers/extract.ts
 import { TRPCError as TRPCError2 } from "@trpc/server";
-import { promises as fs4 } from "fs";
+import { existsSync, promises as fs4 } from "fs";
 import path3 from "path";
 import os2 from "os";
 
@@ -973,34 +935,35 @@ async function findFfmpeg() {
   return ffmpegPath;
 }
 var YT_DLP_MISSING = "yt-dlp is not installed on the server. Install it with `pip install -U yt-dlp` and restart the dev server.";
-/*
- * YouTube now serves the good formats only over SABR to the default clients,
- * which yt-dlp cannot read, leaving a single 360p muxed stream. The `mweb`
- * client still hands out normal DASH URLs, but only when the request carries a
- * PO Token, so a token provider has to be wired in for 1080p to appear at all.
- *
- * The provider script runs under its own Node because its jsdom dependency
- * needs require(ESM), which only landed in Node 22.12.
- */
-var BGUTIL_NODE = process.env.BGUTIL_NODE ?? path3.join(os2.homedir(), "local", "node22", "bin", "node");
-var BGUTIL_POT_SCRIPT = process.env.BGUTIL_POT_SCRIPT ?? path3.join(os2.homedir(), "local", "bgutil-server", "build", "generate_once.js");
-var YT_DLP_COOKIE_ARGS = process.env.YT_DLP_COOKIE_FILE ? ["--cookies", process.env.YT_DLP_COOKIE_FILE] : [];
-var YT_CLIENT_ARGS = [
-  "--js-runtimes",
-  `node:${BGUTIL_NODE}`,
+var localBgutilNode = path3.join(os2.homedir(), "local", "node22", "bin", "node");
+var localBgutilScript = path3.join(os2.homedir(), "local", "bgutil-server", "build", "generate_once.js");
+var BGUTIL_NODE = process.env.BGUTIL_NODE || (existsSync(localBgutilNode) ? localBgutilNode : process.execPath);
+var BGUTIL_POT_SCRIPT = process.env.BGUTIL_POT_SCRIPT || (existsSync(localBgutilScript) ? localBgutilScript : null);
+var YT_RUNTIME_ARGS = ["--js-runtimes", `node:${BGUTIL_NODE}`];
+var YT_CLIENT_ARGS = [...YT_RUNTIME_ARGS];
+// mweb requires a PO Token provider for its formats to be usable.
+if (BGUTIL_POT_SCRIPT) {
+  YT_CLIENT_ARGS.push(
+    "--extractor-args", `youtubepot-bgutilscript:script_path=${BGUTIL_POT_SCRIPT}`,
+    "--extractor-args", "youtube:player_client=mweb"
+  );
+}
+/* Public fallback clients used only after the default compatible source gets a
+ * 403. They do not require a user cookie and are kept bounded to one retry. */
+var YT_PUBLIC_FALLBACK_CLIENT_ARGS = [
+  "--impersonate",
+  "chrome",
   "--extractor-args",
-  `youtubepot-bgutilscript:script_path=${BGUTIL_POT_SCRIPT}`,
-  "--extractor-args",
-  "youtube:player_client=mweb"
+  "youtube:player_client=web_embedded,web,tv"
 ];
-var YT_CLIENT_ARGS_STR = [
-  "--js-runtimes",
-  q(`node:${BGUTIL_NODE}`),
-  "--extractor-args",
-  q(`youtubepot-bgutilscript:script_path=${BGUTIL_POT_SCRIPT}`),
-  "--extractor-args",
-  q("youtube:player_client=mweb")
-].join(" ");
+/*
+ * Cloud containers have no browser profile. Never try to read a local Chrome,
+ * Brave, or Firefox cookie database. Private/restricted sources can optionally
+ * use an explicitly mounted Netscape cookie file via YTDLP_COOKIE_FILE.
+ */
+var YTDLP_COOKIE_FILE = (process.env.YTDLP_COOKIE_FILE ?? process.env.YT_DLP_COOKIE_FILE ?? "").trim();
+var YTDLP_COOKIE_ARGS = YTDLP_COOKIE_FILE ? ["--cookies", YTDLP_COOKIE_FILE] : [];
+var YTDLP_COOKIE_ARGS_STR = YTDLP_COOKIE_FILE ? `--cookies ${q(YTDLP_COOKIE_FILE)}` : "";
 /*
  * Word-level timings.
  *
@@ -1199,7 +1162,7 @@ async function inworldTranscribe(audioPath, apiKey, language = "en") {
 async function getVideoInfo(url) {
   const ytDlp = await getYtDlp();
   const { stdout } = await promisify(execFile)(ytDlp,
-    ["--no-playlist", ...YT_DLP_COOKIE_ARGS, ...YT_CLIENT_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
+    ["--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_CLIENT_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
     { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
   );
   const info = JSON.parse(stdout.trim());
@@ -1222,8 +1185,8 @@ async function whisperTranscribe(url, apiKey, language, tmpDir) {
   const audioPath = path3.join(tmpDir, "audio.mp3");
   const downloadCmd = [
     q(ytDlp),
-    "--no-playlist",
-    YT_CLIENT_ARGS_STR,
+    "--no-playlist", YTDLP_COOKIE_ARGS_STR,
+    ...YT_CLIENT_ARGS.map(q),
     "--no-warnings",
     "-x",
     "--audio-format mp3",
@@ -1780,9 +1743,13 @@ var geminiRouter = router({
     transcript: z2.string().min(10, "Transcript is too short"),
     videoDuration: z2.number().optional(),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
-    apiKey: z2.string().min(1, "Inworld API key is required")
+    apiKey: z2.string().min(1, "Inworld API key is required"),
+    /** Pick candidates for one ranked source instead of five moments from one video. */
+    rankingMode: z2.boolean().default(false),
+    rank: z2.number().int().min(1).max(99).optional(),
+    sourceTitle: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
-    const systemPrompt = `You are an expert viral video editor and content strategist specializing in short-form content for TikTok, YouTube Shorts, and Instagram Reels.
+    const defaultSystemPrompt = `You are an expert viral video editor and content strategist specializing in short-form content for TikTok, YouTube Shorts, and Instagram Reels.
 
 Analyze the transcript and identify the TOP 5 most viral and engaging moments that would make excellent short clips (15-60 seconds each).
 
@@ -1794,7 +1761,7 @@ For each highlight, evaluate:
 - Audio energy and pacing
 
 Return ONLY valid JSON \u2014 no markdown, no code fences, no extra text.`;
-    const userPrompt = `Analyze this transcript and identify the 5 best moments for viral short-form clips.
+    const defaultUserPrompt = `Analyze this transcript and identify the 5 best moments for viral short-form clips.
 
 TRANSCRIPT:
 ${input.transcript}
@@ -1821,6 +1788,34 @@ Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT R
 2. Vary durations: mix short (15-25s), medium (25-40s), and long (40-60s). Do NOT make all clips the same length.
 3. Each startTime must be at least 30 seconds apart from any other clip's startTime.
 4. If the video is longer than 10 minutes, at least 2 clips MUST come from the second half.`;
+    const rankingMode = input.rankingMode === true;
+    const rank = input.rank ?? 1;
+    const systemPrompt = rankingMode
+      ? `You are an expert short-form ranking editor. Select the strongest self-contained video moments from ONE source for a ranked countdown reel. The selected moment must make sense without the surrounding video, open with a clear hook, and end on a payoff. Generate clean, short, all-caps display titles. Return only valid JSON.`
+      : defaultSystemPrompt;
+    const userPrompt = rankingMode
+      ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 8-15 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates.
+
+TRANSCRIPT:
+${input.transcript}
+${input.videoDuration ? `\nTotal video duration: ${Math.floor(input.videoDuration / 60)}m ${Math.floor(input.videoDuration % 60)}s` : ""}
+
+Return exactly this JSON:
+{
+  "highlights": [
+    {
+      "id": 1,
+      "title": "SHORT ALL-CAPS TITLE, MAX 8 WORDS",
+      "startTime": <integer seconds>,
+      "endTime": <integer seconds>,
+      "engagementScore": <integer 60-99>,
+      "reason": "One sentence explaining why this works at rank #${rank}"
+    }
+  ],
+  "reelTitle": "A SHORT ALL-CAPS LABEL FOR THIS RANK"
+}
+Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTime must be no more than 15 seconds after its startTime.`
+      : defaultUserPrompt;
     try {
       const { response, modelUsed, substituted } = await inworldChatResilient({
         model: input.model,
@@ -1851,7 +1846,7 @@ Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT R
       const ordered = highlights.sort((a, b) => b.engagementScore - a.engagementScore).map((h, i) => ({ ...h, id: i + 1 }));
       return {
         highlights: ordered,
-        reelTitle: parsed.reelTitle?.trim() || "TOP MOMENTS",
+        reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : "TOP MOMENTS"),
         modelUsed,
         modelSubstituted: substituted,
         metadata: response.metadata
@@ -2522,6 +2517,9 @@ function classifyFailure(msg) {
   if (/requested format|no video formats|format is not available/i.test(msg)) {
     return "No downloadable video format was available for this source.";
   }
+  if (/HTTP Error 403|403:\s*Forbidden|unable to download video data/i.test(msg)) {
+    return "The source website rejected this server's download request (HTTP 403). Try a different public source link for this rank; this specific video may require browser access that a cloud server cannot use.";
+  }
   if (/timed out|ETIMEDOUT/i.test(msg)) {
     return "The operation timed out. Try a shorter video.";
   }
@@ -2585,6 +2583,20 @@ function runStreaming(bin, args, opts) {
       reject(new Error(unique || `exited with code ${code}`));
     });
   });
+}
+async function assertPlayableMp4(filePath, label = "Rendered video") {
+  const stat = await fs6.stat(filePath).catch(() => null);
+  if (!stat || stat.size < 4096) throw new MediaError(`${label} is empty or incomplete.`);
+  const meta = await probeMedia(filePath).catch(() => null);
+  if (!meta || meta.duration <= 0.05 || !meta.width || !meta.height) {
+    throw new MediaError(`${label} has no readable video stream.`);
+  }
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) throw new MediaError(FFMPEG_MISSING);
+  /* Decode a frame before publishing. This catches a truncated MP4/MOOV atom
+   * even when the output file has a non-zero size. */
+  await runStreaming(ffmpeg, ["-v", "error", "-i", filePath, "-frames:v", "1", "-f", "null", "-"], { timeout: 3e4 });
+  return { stat, meta };
 }
 async function findWritten(dir, stem) {
   const files = await fs6.readdir(dir).catch(() => []);
@@ -2678,14 +2690,45 @@ async function hostVideo(opts) {
   const stem = path5.join(tmpDir, "source");
   const ffmpegDir = path5.dirname(ffmpeg);
   let effectiveOffset = offset;
+  /* Set when a selected clip falls back to one complete muxed source file.
+   * That file is trimmed locally into the same padded interval as a section. */
+  let compatibleFullSource = false;
+  /* A predictable quality ladder keeps Top 5 responsive. We never wait for
+   * unavailable 1440p/4K streams: the first available level is 1080p, then
+   * 720p, 480p, and finally 360p. The last selector remains only as a
+   * last-resort "do not get stuck" option for unusual source platforms. */
+  const qualityLadder = [1080, 720, 480, 360].filter((height) => height <= maxHeight);
+  const adaptiveFormatSelector = [
+    ...qualityLadder.flatMap((height) => [
+      `bv*[height=${height}][vcodec^=avc1]+ba[acodec^=mp4a]`,
+      `bv*[height=${height}]+ba`,
+      `b[height=${height}]`
+    ]),
+    "b[height<=360]",
+    "b"
+  ].join("/");
+  const compatibleFormatSelector = [
+    ...qualityLadder.flatMap((height) => [
+      `b[ext=mp4][height=${height}]`,
+      `b[height=${height}]`
+    ]),
+    "b[ext=mp4][height<=360]",
+    "b[height<=360]",
+    "b"
+  ].join("/");
   try {
     const commonArgs = [
-      "--no-playlist", ...YT_DLP_COOKIE_ARGS,
+      "--no-playlist", ...YTDLP_COOKIE_ARGS,
       ...YT_CLIENT_ARGS,
       "--no-warnings",
+      // Fail quickly when a provider leaves a media connection hanging.
+      "--socket-timeout", "20",
+      "--retries", "2",
+      "--fragment-retries", "2",
+      "--abort-on-unavailable-fragment",
       // Parallel fragments are the single biggest speed win on YouTube DASH.
       "--concurrent-fragments",
-      "8",
+      process.env.YTDLP_CONCURRENT_FRAGMENTS ?? "2",
       /*
        * Adaptive-first format selection.
        *
@@ -2693,31 +2736,15 @@ async function hostVideo(opts) {
        * they offer resolutions up to 4K. Fall back to progressive (muxed) only
        * when adaptive fails — progressive caps at 360p on YouTube currently.
        *
-       * If the SABR/403 issue is still active, the adaptive download will fail
-       * and the auto-retry logic in hostVideo will NOT silently fall back to
-       * progressive — it will throw, so the user sees the real problem instead
-       * of getting a blurry clip.
+       * If a provider rejects an adaptive level, hostVideo immediately moves
+       * to the same deterministic muxed quality ladder rather than waiting for
+       * an unavailable higher-resolution stream.
        */
       "-f",
-      [
-        `bv*[height<=${maxHeight}][vcodec^=avc1]+ba[acodec^=mp4a]`,
-        `bv*[height<=${maxHeight}]+ba`,
-        `b[height<=${maxHeight}]`,
-        `b*[height<=?${maxHeight}]`
-      ].join("/"),
-      /*
-       * Sort: highest resolution wins, then fps, then codec preference, then
-       * bitrate. This ensures we never pick a low-res rendition when a high-res
-       * one is available.
-       */
+      adaptiveFormatSelector,
+      /* Each fallback has an exact height, so only sort within that level. */
       "-S",
-      [
-        `res:${maxHeight}`,
-        "fps",
-        "codec:avc:m4a",
-        "vbr",
-        "abr"
-      ].join(","),
+      ["fps", "codec:avc:m4a", "vbr", "abr"].join(","),
       "--merge-output-format",
       "mp4",
       "--ffmpeg-location",
@@ -2745,90 +2772,190 @@ async function hostVideo(opts) {
         opts.onProgress?.(Math.max(0, Math.min(95, Math.round(scaled))));
       };
     };
+    /*
+     * For a clip render, download only a small padded interval around its chosen
+     * highlight. The previous implementation fetched the complete source at
+     * 2160p, which can run for many minutes and stall a 1 GB Fly machine.
+     */
+    const sectionArgs = range ? [
+      "--download-sections",
+      `*${offset.toFixed(3)}-${(range.end + SECTION_BUFFER).toFixed(3)}`,
+      /* Let yt-dlp manage the selected range and merge its streams. An external
+       * ffmpeg downloader can emit an incomplete merged file for adaptive audio
+       * and video streams, which then fails during the preview normalization. */
+    ] : [];
     const downloadFull = () => runStreaming(
       ytDlp,
-      [...commonArgs, "--match-filter", `duration <? ${maxMinutes * 60}`, sourceUrl],
-      { timeout: 18e5, onLine: makeProgressHandler() }
+      [...commonArgs, ...sectionArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
+      { timeout: range ? 18e4 : 18e5, onLine: makeProgressHandler() }
     );
-    const downloadProgressive = () => runStreaming(
+    /*
+     * Generic fallback for TikTok, X and providers where the specialised
+     * adaptive selector returns no format. It deliberately uses no YouTube
+     * client override and accepts the best public stream the provider exposes.
+     */
+    /* Direct compatible short-range path. This is the normal fallback for a
+     * selected highlight: it works for a 15-second clip even if the complete
+     * original is much longer than the bounded full-source rescue path. */
+    const downloadShortCompatible = (clientArgs = []) => runStreaming(
       ytDlp,
       [
-        "--no-playlist", ...YT_DLP_COOKIE_ARGS,
+        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...clientArgs,
         "--no-warnings",
-        "-f", "18/best",
+        "--socket-timeout", "20",
+        "--retries", "2",
+        "--fragment-retries", "2",
+        "--abort-on-unavailable-fragment",
+        "-f", compatibleFormatSelector,
         "--merge-output-format", "mp4",
         "--ffmpeg-location", ffmpegDir,
         "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
         "--newline", "--progress",
         "-o", `${stem}.%(ext)s`,
-        "--match-filter", `duration <? ${maxMinutes * 60}`,
+        ...sectionArgs,
+        "--match-filter", `duration < ${maxMinutes * 60}`,
         sourceUrl
       ],
-      { timeout: 18e5, onLine: makeProgressHandler() }
+      { timeout: 18e4, onLine: makeProgressHandler() }
+    );
+    const downloadCompatible = (clientArgs = []) => runStreaming(
+      ytDlp,
+      [
+        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...clientArgs,
+        "--no-warnings",
+        "--socket-timeout", "20",
+        "--retries", "2",
+        "--fragment-retries", "2",
+        "--abort-on-unavailable-fragment",
+        /* Stable fallback: prefer one public muxed MP4 stream so yt-dlp does
+         * not need to assemble brittle adaptive audio/video segments on Fly.
+         * It may be lower resolution than the primary path, but produces a
+         * compatible, renderable source instead of leaving the rank stuck. */
+        "-f", compatibleFormatSelector,
+        /* Do not pass --download-sections, --merge-output-format, or an
+         * ffmpeg location here. Even a progressive stream causes yt-dlp to
+         * invoke FFmpeg for an in-place section cut on some YouTube responses,
+         * which is exactly the failing path in the production logs. Download a
+         * single already-muxed file first; this function normalizes it below. */
+        "--no-write-sub", "--no-write-auto-sub", "--no-embed-subs",
+        "--newline", "--progress",
+        "-o", `${stem}.%(ext)s`,
+        /* Full-source fallback is deliberately bounded so a multi-hour video
+         * cannot fill the 1 GB service volume. Typical ranked sources are well
+         * below this twenty-minute / 350 MB limit. */
+        "--match-filter", `duration < ${Math.min(maxMinutes, 20) * 60}`,
+        "--max-filesize", "350M",
+        sourceUrl
+      ],
+      { timeout: range ? 9e5 : 18e5, onLine: makeProgressHandler() }
     );
     const downloadWithFallback = async () => {
       try {
         await downloadFull();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/403|Forbidden/i.test(msg)) {
-          console.warn(`[Host] Adaptive download failed (403). Falling back to progressive (lower quality)...`);
-          /* Clear any partial files from the failed attempt */
+        if (/403|Forbidden|requested format|no video formats|format is not available|no downloadable|SABR/i.test(msg)) {
+          console.warn(`[Host] Preferred adaptive format was unavailable. Downloading one stable public muxed MP4 source before local normalization to avoid the FFmpeg section-cut failure...`);
+          /* Clear partial fragments before retrying with the provider-compatible selector. */
           for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
             await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
           }
-          await downloadProgressive();
+          compatibleFullSource = false;
+          try {
+            /* Keep normal long videos on a selected short range. */
+            await downloadShortCompatible();
+          } catch (shortErr) {
+            const shortMessage = shortErr instanceof Error ? shortErr.message : String(shortErr);
+            if (/HTTP Error 403|403:\s*Forbidden|unable to download video data/i.test(shortMessage)) {
+              console.warn(`[Host] Default public short stream was rejected with 403. Retrying once with alternate public YouTube clients...`);
+              for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
+                await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
+              }
+              await downloadShortCompatible(YT_PUBLIC_FALLBACK_CLIENT_ARGS);
+            } else if (range && /ffmpeg|exited with code|merge/i.test(shortMessage)) {
+              /* Only a section-cut compatibility failure uses the complete,
+               * size-bounded source rescue. It is never the normal path. */
+              console.warn(`[Host] Compatible short-range cut failed; using the bounded full-source rescue for this source...`);
+              for (const f of await fs6.readdir(tmpDir).catch(() => [])) {
+                await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
+              }
+              compatibleFullSource = true;
+              await downloadCompatible();
+            } else {
+              throw shortErr;
+            }
+          }
         } else {
           throw err;
         }
       }
     };
     if (range) {
-      console.log(`[Host] Downloading full video at best quality for clip range ${range.start}-${range.end}s...`);
+      console.log(`[Host] Downloading selected ${(range.end - range.start).toFixed(1)}s range for clip ${range.start}-${range.end}s at best available quality...`);
       await downloadWithFallback();
-      effectiveOffset = 0;
-      fileName = fullFileName;
-      outPath = path5.join(VIDEOS_DIR, fileName);
+      /* Both paths now write the same padded local interval. The compatibility
+       * path downloads one safe muxed file, then trims it locally below. */
+      effectiveOffset = offset;
     } else {
       await downloadWithFallback();
     }
     opts.onProgress?.(96);
     const downloaded = await findWritten(tmpDir, "source");
     if (!downloaded) {
+      if (range) {
+        throw new MediaError(
+          "The selected short clip could not be downloaded from this source. Try another public video or choose a different 15-second moment."
+        );
+      }
       throw new MediaError(
-        `The video could not be downloaded. It may be longer than the ${maxMinutes}-minute limit.`
+        `The complete video could not be downloaded. It may be longer than the ${maxMinutes}-minute limit.`
       );
     }
-    const downloadedInfo = await probeMedia(downloaded);
-    if (downloadedInfo.duration > maxMinutes * 60) {
-      throw new MediaError(`Choose a source shorter than ${maxMinutes} minutes.`);
-    }
+    /* The stable compatible fallback deliberately downloaded the whole muxed
+     * file without ffmpeg. Make a short, accurately trimmed local working copy
+     * here instead of asking yt-dlp to section-cut it during download. */
+    const localTrimArgs = compatibleFullSource && range ? [
+      `-ss ${offset.toFixed(3)}`,
+      `-t ${(range.end + SECTION_BUFFER - offset).toFixed(3)}`
+    ] : [];
     const normaliseCmd = [
       q(ffmpeg),
       `-i ${q(downloaded)}`,
-      "-c copy",
+      ...localTrimArgs,
+      // A local trim is encoded for frame-accurate timestamp handling. Other
+      // already-sectioned media stays stream-copied for maximum quality/speed.
+      compatibleFullSource && range ? "-c:v libx264 -preset veryfast -crf 16 -c:a aac -b:a 192k" : "-c copy",
       // Drop any subtitle/data streams the source carried.
       "-map 0:v:0 -map 0:a:0?",
-      "-movflags +faststart",
+      compatibleFullSource && range ? "-movflags +faststart -avoid_negative_ts make_zero -pix_fmt yuv420p" : "-movflags +faststart",
       "-y -loglevel error",
       q(outPath)
     ].join(" ");
     try {
       await run(normaliseCmd, 9e5);
-    } catch {
+    } catch (copyErr) {
+      const copyMessage = copyErr instanceof Error ? copyErr.message : String(copyErr);
+      console.warn(`[Host] Source normalization failed; rebuilding the local range for compatibility: ${copyMessage.slice(0, 240)}`);
       const reencodeCmd = [
         q(ffmpeg),
+        "-fflags +genpts",
         `-i ${q(downloaded)}`,
+        ...localTrimArgs,
         "-map 0:v:0 -map 0:a:0?",
         // A working copy that clips are cut from, so keep it near-transparent;
         // every loss here is inherited by every export made from it.
         "-c:v libx264 -preset veryfast -crf 16",
         "-c:a aac -b:a 192k",
-        "-movflags +faststart -pix_fmt yuv420p",
+        "-movflags +faststart -avoid_negative_ts make_zero -pix_fmt yuv420p",
         "-y -loglevel error",
         q(outPath)
       ].join(" ");
-      await run(reencodeCmd, 18e5);
+      try {
+        await run(reencodeCmd, 18e5);
+      } catch (reencodeErr) {
+        const reencodeMessage = reencodeErr instanceof Error ? reencodeErr.message : String(reencodeErr);
+        throw new MediaError(`Selected source range could not be normalized: ${reencodeMessage.slice(0, 420)}`);
+      }
     }
     const stat = await fs6.stat(outPath).catch(() => null);
     if (!stat || stat.size === 0) throw new MediaError("Hosting produced an empty file.");
@@ -2848,7 +2975,8 @@ async function hostVideo(opts) {
         `Vertical exports will be upscaled and may appear soft. For sharp results, upload a 1080p+ source directly.`
       );
     } else {
-      console.log(`[Host] Video ${opts.videoId}: source ${meta.width}x${meta.height} ${meta.fps?.toFixed(0) ?? "?"}fps — sufficient for sharp 1080x1920 export`);
+      const selectedTier = [1080, 720, 480, 360].find((height) => meta.height >= height) ?? meta.height;
+      console.log(`[Host] Video ${opts.videoId}: using ${selectedTier}p source (${meta.width}x${meta.height} ${meta.fps?.toFixed(0) ?? "?"}fps) — sufficient for sharp 1080x1920 export`);
     }
     return { fileName, url: urlFor("video", fileName), bytes: stat.size, offset: effectiveOffset, ...meta, isLowRes };
   } catch (err) {
@@ -2936,9 +3064,20 @@ function buildCropFilter(crop, srcW = 0, srcH = 0) {
   const zoom = Math.max(0.1, Math.min(10, Number.isFinite(crop.zoom) ? crop.zoom : 1));
   const ox = Math.min(1, Math.max(-1, Number.isFinite(crop.offsetX) ? crop.offsetX : 0));
   const oy = Math.min(1, Math.max(-1, Number.isFinite(crop.offsetY) ? crop.offsetY : 0));
+  const barColor = typeof crop.barColor === "string" && /^#[0-9a-f]{6}$/i.test(crop.barColor) ? `0x${crop.barColor.slice(1)}` : "black";
   if (srcW > 0 && srcH > 0) {
     /* h264 with yuv420p needs even dimensions. */
     const even = (n) => Math.max(2, 2 * Math.round(n / 2));
+    /* 0.50× is the full-frame letterbox choice: preserve the complete 16:9
+     * source at output width and pad only above and below. Between 0.51× and
+     * 0.99× the normal geometry produces a gradual crop reduction, rather
+     * than jumping straight to the complete 16:9 frame. */
+    if (zoom <= 0.5 && srcW > srcH) {
+      const fullW = TARGET_W;
+      const fullH = even(TARGET_W * srcH / srcW);
+      const barY = Math.round((TARGET_H - fullH) / 2);
+      return `scale=${fullW}:${fullH}:flags=lanczos,pad=${TARGET_W}:${TARGET_H}:0:${barY}:${barColor},setsar=1`;
+    }
     const cover = Math.max(TARGET_W / srcW, TARGET_H / srcH);
     const scaledW = even(srcW * cover * zoom);
     const scaledH = even(srcH * cover * zoom);
@@ -2964,7 +3103,7 @@ function buildCropFilter(crop, srcW = 0, srcH = 0) {
     /* Only needed when pulled back far enough that the frame is not covered. */
     if (cropW !== TARGET_W || cropH !== TARGET_H) {
       parts.push(
-        `pad=${TARGET_W}:${TARGET_H}:${Math.round((TARGET_W - cropW) / 2)}:${Math.round((TARGET_H - cropH) / 2)}:black`
+        `pad=${TARGET_W}:${TARGET_H}:${Math.round((TARGET_W - cropW) / 2)}:${Math.round((TARGET_H - cropH) / 2)}:${barColor}`
       );
     }
     parts.push("setsar=1");
@@ -3109,6 +3248,16 @@ async function renderClipFromHosted(opts) {
   }
   await ensureDirs();
   const duration = end - start;
+  /* Top 5 clips already have no captions and receive their shared overlay in
+   * the final composition. Encode them with a bounded fast profile so one
+   * rank cannot spend fifteen minutes on an unnecessarily slow intermediate. */
+  const rankedProfile = opts.renderProfile === "top5";
+  /* The final Top 5 composition is 30 fps, so ranked intermediates must not
+   * waste CPU encoding a 60 fps source that will be reduced immediately. */
+  const outputFps = rankedProfile ? 30 : Math.round(hostedMeta?.fps || 30);
+  const encoderPreset = rankedProfile ? "medium" : "slow";
+  const outputCrf = rankedProfile ? "18" : (hostedMeta && hostedMeta.width >= 1280 ? "17" : "18");
+  const renderTimeout = rankedProfile ? 3e5 : 9e5;
   const captionKey = captions ? crypto2.createHash("sha1").update(JSON.stringify({ w: captions.words, s: captions.style })).digest("hex").slice(0, 8) : "nocap";
   const normalised = normaliseSegments(opts.segments, duration, crop);
   const segments = hostedMeta && hostedMeta.width > 0 && hostedMeta.height > 0 ? normalised.flatMap(
@@ -3126,16 +3275,24 @@ async function renderClipFromHosted(opts) {
     end,
     crop.zoom,
     crop.offsetX,
-    crop.offsetY
+    crop.offsetY,
+    crop.barColor
   );
   const outPath = path5.join(CLIPS_DIR, fileName);
   try {
     const existing = await fs6.stat(outPath);
     if (existing.size > 0) {
-      return { fileName, url: urlFor("clip", fileName), bytes: existing.size };
+      try {
+        await assertPlayableMp4(outPath, "Cached clip");
+        return { fileName, url: urlFor("clip", fileName), bytes: existing.size };
+      } catch {
+        await fs6.rm(outPath, { force: true }).catch(() => {});
+      }
     }
   } catch {
   }
+  const publishPath = `${outPath}.render.mp4`;
+  await fs6.rm(publishPath, { force: true }).catch(() => {});
   const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, `clip-${opts.clipId}-`));
   try {
     const captionFilter = [];
@@ -3207,18 +3364,18 @@ async function renderClipFromHosted(opts) {
       "-c:v",
       "libx264",
       "-preset",
-      "slow",
+      encoderPreset,
       "-crf",
-      (hostedMeta && hostedMeta.width >= 1280) ? "17" : "18",
+      outputCrf,
       "-profile:v",
       "high",
       "-level",
       "4.2",
       "-pix_fmt",
       "yuv420p",
-      "-r", String(Math.round(hostedMeta?.fps || 30)),
+      "-r", String(outputFps),
       "-fps_mode", "cfr",
-      "-g", String(Math.round((hostedMeta?.fps || 30) * 2)),
+      "-g", String(outputFps * 2),
       "-c:a",
       "aac",
       "-b:a",
@@ -3236,10 +3393,10 @@ async function renderClipFromHosted(opts) {
       "-y",
       "-loglevel",
       captions ? "verbose" : "error",
-      outPath
+      publishPath
     ];
     const ffmpegLog = await runStreaming(ffmpeg, args, {
-      timeout: 9e5,
+      timeout: renderTimeout,
       cwd: tmpDir,
       captureAll: !!captions
     });
@@ -3251,16 +3408,11 @@ async function renderClipFromHosted(opts) {
         console.warn(`[Render] Clip ${opts.clipId}: ${fontWarning}`);
       }
     }
-    const stat = await fs6.stat(outPath).catch(() => null);
-    if (!stat || stat.size === 0) throw new MediaError("Rendering produced an empty file.");
-    const outMeta = await probeMedia(outPath).catch(() => null);
-    if (!outMeta || outMeta.duration <= 0.05 || !outMeta.width || !outMeta.height) {
-      throw new MediaError(
-        "Rendering produced a file with no video frames. The clip range may fall outside the imported footage."
-      );
-    }
-    return { fileName, url: urlFor("clip", fileName), bytes: stat.size, fontWarning };
+    const checked = await assertPlayableMp4(publishPath, "Rendering");
+    await fs6.rename(publishPath, outPath);
+    return { fileName, url: urlFor("clip", fileName), bytes: checked.stat.size, fontWarning };
   } catch (err) {
+    await fs6.rm(publishPath, { force: true }).catch(() => {});
     await fs6.rm(outPath, { force: true }).catch(() => {
     });
     if (err instanceof MediaError) throw err;
@@ -3272,6 +3424,7 @@ async function renderClipFromHosted(opts) {
     }
     throw new MediaError(classifyFailure(msg) ?? `Rendering failed: ${msg.slice(0, 250)}`);
   } finally {
+    await fs6.rm(publishPath, { force: true }).catch(() => {});
     await fs6.rm(tmpDir, { recursive: true, force: true }).catch(() => {
     });
   }
@@ -3311,6 +3464,95 @@ async function signJwt(payload, secret) {
   const key = new TextEncoder().encode(secret);
   return new SignJWT2(payload).setProtectedHeader({ alg: "HS256" }).setIssuedAt().setExpirationTime("30d").sign(key);
 }
+
+async function renderTop5Countdown(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new MediaError("Add at least one ranked clip before rendering.");
+  }
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) throw new MediaError(FFMPEG_MISSING);
+  await ensureDirs();
+  const fingerprint = crypto2.createHash("sha1").update(JSON.stringify(entries)).digest("hex").slice(0, 10);
+  const fileName = clipFileName(entries[0].clipId, `top5-overlay:${fingerprint}`, 0, entries.length, 1, 0, 0);
+  const outPath = path5.join(CLIPS_DIR, fileName);
+  const existing = await fs6.stat(outPath).catch(() => null);
+  if (existing?.size > 0) {
+    try {
+      await assertPlayableMp4(outPath, "Cached ranked video");
+      return { url: urlFor("clip", fileName), bytes: existing.size };
+    } catch {
+      await fs6.rm(outPath, { force: true }).catch(() => {});
+    }
+  }
+  const publishPath = `${outPath}.render.mp4`;
+  await fs6.rm(publishPath, { force: true }).catch(() => {});
+
+  const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, "top5-overlay-"));
+  try {
+    const font = filterRelativePath(tmpDir, path5.join(FONTS_DIR, "Montserrat-Bold.ttf"));
+    const timeline = [];
+    let elapsed = 0;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const sourcePath = localPathFromUrl(entry.downloadUrl);
+      if (!sourcePath) throw new MediaError(`Rank ${entry.rank} has no rendered clip file. Render it first.`);
+      await fs6.access(sourcePath);
+      const meta = await probeMedia(sourcePath);
+      if (!meta?.duration || meta.duration <= 0.05) throw new MediaError(`Rank ${entry.rank} rendered clip has no usable duration.`);
+      timeline.push({ ...entry, sourcePath, startAt: elapsed, duration: meta.duration });
+      elapsed += meta.duration;
+    }
+
+    /* Build and normalise the video first, then burn one persistent ranking list over it. */
+    const inputArgs = timeline.flatMap((entry) => ["-i", entry.sourcePath]);
+    const normalised = timeline.flatMap((_, index) => [
+      `[${index}:v]fps=30,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih),setsar=1[v${index}]`,
+      `[${index}:a]aresample=48000,aformat=channel_layouts=stereo[a${index}]`
+    ]);
+    const concatInputs = timeline.map((_, index) => `[v${index}][a${index}]`).join("");
+    const filters = [...normalised, `${concatInputs}concat=n=${timeline.length}:v=1:a=1[basev][aout]`];
+    let previousVideo = "[basev]";
+
+    for (let index = 0; index < timeline.length; index += 1) {
+      const entry = timeline[index];
+      const rankFile = path5.join(tmpDir, `rank-number-${index}.txt`);
+      const titleFile = path5.join(tmpDir, `rank-title-${index}.txt`);
+      await fs6.writeFile(rankFile, entry.showNumber === false ? "" : String(entry.rank), "utf8");
+      await fs6.writeFile(titleFile, entry.showTitle === false ? "" : entry.title.trim().toUpperCase().slice(0, 72), "utf8");
+      const number = entry.numberPosition || { x: 0.12, y: 0.3 + index * 0.13 };
+      const title = entry.titlePosition || { x: 0.42, y: 0.3 + index * 0.13 };
+      const accent = /^#[0-9a-fA-F]{6}$/.test(entry.accentColor || "") ? entry.accentColor : "#a3e635";
+      const numberSize = Math.max(42, Math.min(220, Math.round(entry.numberSize || 96)));
+      const titleSize = Math.max(24, Math.min(112, Math.round(entry.titleSize || 56)));
+      const numberOut = `[num${index}]`;
+      const titleOut = `[title${index}]`;
+      /* Rank numbers remain visible from the first frame. Titles reveal when their matching clip begins and remain revealed. */
+      filters.push(`${previousVideo}drawtext=fontfile=${font}:textfile=${path5.basename(rankFile)}:fontcolor=${accent}:fontsize=${numberSize}:borderw=5:bordercolor=black@0.92:x=(${Math.round(number.x * 1080)})-text_w/2:y=(${Math.round(number.y * 1920)})-text_h/2${numberOut}`);
+      filters.push(`${numberOut}drawtext=fontfile=${font}:textfile=${path5.basename(titleFile)}:fontcolor=white:fontsize=${titleSize}:borderw=4:bordercolor=black@0.92:x=(${Math.round(title.x * 1080)})-text_w/2:y=(${Math.round(title.y * 1920)})-text_h/2:enable='gte(t\,${entry.startAt.toFixed(3)})'${titleOut}`);
+      previousVideo = titleOut;
+    }
+
+    filters.push(`${previousVideo}null[vout]`);
+    const graph = filters.join(";");
+    console.log(`[Top5] Composing ${timeline.length} short ranked clip${timeline.length === 1 ? "" : "s"} (${elapsed.toFixed(1)}s total) with overlay...`);
+    await runStreaming(ffmpeg, [
+      ...inputArgs, "-filter_complex", graph, "-map", "[vout]", "-map", "[aout]",
+      /* Intermediates are already 1080×1920 H.264. Medium/CRF18 preserves a
+       * clean final export while avoiding the slow-preset bottleneck on Fly's
+       * single shared CPU for a 15-second ranked video. */
+      "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-profile:v", "high", "-level", "4.2", "-pix_fmt", "yuv420p", "-r", "30", "-fps_mode", "cfr", "-g", "60",
+      "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", "-tag:v", "avc1", "-sws_flags", "lanczos+accurate_rnd+full_chroma_int", "-threads", "1", "-y", "-loglevel", "error", publishPath
+    ], { timeout: 6e5, cwd: tmpDir });
+    const checked = await assertPlayableMp4(publishPath, "Top 5 rendering");
+    await fs6.rename(publishPath, outPath);
+    console.log(`[Top5] Composition finished for ${timeline.length} ranked clip${timeline.length === 1 ? "" : "s"} and passed playback validation.`);
+    return { url: urlFor("clip", fileName), bytes: checked.stat.size };
+  } finally {
+    await fs6.rm(publishPath, { force: true }).catch(() => {});
+    await fs6.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 var appRouter = router({
   system: systemRouter,
   // ─── GEMINI AI ────────────────────────────────────────────────────────────
@@ -3504,14 +3746,16 @@ var appRouter = router({
       id: z4.number(),
       /** Download only this time range (seconds). Much faster than full video. */
       startTime: z4.number().min(0).optional(),
-      endTime: z4.number().min(0).optional()
+      endTime: z4.number().min(0).optional(),
+      /** Replace a previously hosted short range for a live custom preview. */
+      force: z4.boolean().default(false)
     })).mutation(async ({ input, ctx }) => {
       const video = await getVideoById(input.id, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
       if (video.hostedStatus === "downloading") {
         return { success: true, hostedStatus: "downloading", hostedUrl: null };
       }
-      if (video.hostedStatus === "ready" && video.hostedUrl) {
+      if (video.hostedStatus === "ready" && video.hostedUrl && !input.force) {
         return { success: true, hostedStatus: "ready", hostedUrl: video.hostedUrl };
       }
       const sourceUrl = video.sourceUrl;
@@ -3546,7 +3790,9 @@ var appRouter = router({
             hostedOffset: result.offset,
             width: result.width || null,
             height: result.height || null,
-            ...result.duration && result.offset === 0 ? { duration: result.duration } : {}
+            /* A selected preview range can begin at 0, but it must never
+             * overwrite the original full-source duration with 15 seconds. */
+            ...!range && result.duration ? { duration: result.duration } : {}
           });
           console.log(
             `[Host] Video ${video.id} hosted (${Math.round(result.bytes / 1024 / 1024)} MB, ${result.width}x${result.height}, quality=${qualityState}) \u2192 ${result.url}`
@@ -3694,8 +3940,12 @@ var appRouter = router({
       zoom: z4.number().min(0.1).max(10).optional(),
       offsetX: z4.number().min(-1).max(1).optional(),
       offsetY: z4.number().min(-1).max(1).optional(),
+      /** Top-and-bottom letterbox color used by horizontal zoom-out. */
+      barColor: z4.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
       /** Overrides the clip's saved setting for this render. */
-      captionsEnabled: z4.boolean().optional()
+      captionsEnabled: z4.boolean().optional(),
+      /** Optimized intermediate profile used only by the ranked-video builder. */
+      renderProfile: z4.enum(["top5"]).optional()
     })).mutation(async ({ input, ctx }) => {
       const owned = await getClipsByUser(ctx.user.id);
       const clip = owned.find((c) => c.id === input.id);
@@ -3704,6 +3954,7 @@ var appRouter = router({
         throw new TRPCError5({ code: "BAD_REQUEST", message: "Set a valid start and end time before rendering." });
       }
       const captionsEnabled = input.captionsEnabled ?? clip.captionsEnabled ?? true;
+      const renderProfile = input.renderProfile === "top5" ? "top5" : "standard";
       const video = await getVideoById(clip.videoId, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "This clip's video no longer exists." });
       const hostedPath = localPathFromUrl(video.hostedUrl);
@@ -3757,12 +4008,15 @@ var appRouter = router({
       const crop = {
         zoom: input.zoom ?? clip.zoom ?? DEFAULT_CROP.zoom,
         offsetX: input.offsetX ?? clip.offsetX ?? DEFAULT_CROP.offsetX,
-        offsetY: input.offsetY ?? clip.offsetY ?? DEFAULT_CROP.offsetY
+        offsetY: input.offsetY ?? clip.offsetY ?? DEFAULT_CROP.offsetY,
+        barColor: input.barColor ?? clip.barColor ?? "#000000"
       };
       await updateClip(clip.id, {
         status: "rendering",
         errorMessage: null,
-        ...crop,
+        zoom: crop.zoom,
+        offsetX: crop.offsetX,
+        offsetY: crop.offsetY,
         captionsEnabled
       });
       /*
@@ -3914,9 +4168,10 @@ var appRouter = router({
             // Time-varying framing, when the clip has a timeline.
             segments: clip.framingSegments,
             scale: clip.scale,
-            barColor: clip.barColor,
+            barColor: crop.barColor,
             textOverlays: clip.textOverlays,
-            captions: finalCaptions
+            captions: finalCaptions,
+            renderProfile
           });
           await updateClip(clip.id, {
             status: "done",
@@ -3968,9 +4223,10 @@ var appRouter = router({
                   crop,
                   segments: clip.framingSegments,
                   scale: clip.scale,
-                  barColor: clip.barColor,
+                  barColor: crop.barColor,
                   textOverlays: clip.textOverlays,
-                  captions: finalCaptions
+                  captions: finalCaptions,
+                  renderProfile
                 });
                 await updateClip(clip.id, {
                   status: "done",
@@ -4193,6 +4449,39 @@ var appRouter = router({
     })).mutation(async ({ input, ctx }) => {
       await updateClip(input.id, { status: input.status, downloadUrl: input.downloadUrl, thumbnailUrl: input.thumbnailUrl });
       return { success: true };
+    })
+  }),
+  // ─── TOP 5 RANKED VIDEO ─────────────────────────────────────────────────
+  top5: router({
+    compose: protectedProcedure.input(z4.object({
+      entries: z4.array(z4.object({
+        clipId: z4.number().int().positive(),
+        rank: z4.number().int().min(1).max(99),
+        title: z4.string().max(72).default(""),
+        showNumber: z4.boolean().default(true),
+        showTitle: z4.boolean().default(true),
+        numberPosition: z4.object({ x: z4.number().min(0).max(1), y: z4.number().min(0).max(1) }).optional(),
+        titlePosition: z4.object({ x: z4.number().min(0).max(1), y: z4.number().min(0).max(1) }).optional(),
+        accentColor: z4.string().max(16).default("#a3e635"),
+        numberSize: z4.number().min(42).max(220).default(96),
+        titleSize: z4.number().min(24).max(112).default(56)
+      })).min(1).max(5)
+    })).mutation(async ({ input, ctx }) => {
+      const owned = await getClipsByUser(ctx.user.id);
+      const entries = input.entries.map((entry) => {
+        const clip = owned.find((item) => item.id === entry.clipId);
+        if (!clip || clip.status !== "done" || !clip.downloadUrl) {
+          throw new TRPCError5({ code: "PRECONDITION_FAILED", message: `Rank ${entry.rank} is not rendered yet. Render each selected clip before creating the Top 5 video.` });
+        }
+        const clipDuration = (clip.endTime ?? 0) - (clip.startTime ?? 0);
+        if (!Number.isFinite(clipDuration) || clipDuration <= 0 || clipDuration > 15.1) {
+          throw new TRPCError5({ code: "BAD_REQUEST", message: `Rank ${entry.rank} must use a clip of 15 seconds or less.` });
+        }
+        return { ...entry, downloadUrl: clip.downloadUrl };
+      }).sort((a, b) => b.rank - a.rank);
+      const result = await renderTop5Countdown(entries);
+      console.log(`[Top5] Rendered ${entries.length} ranked clips (${Math.round(result.bytes / 1024 / 1024)} MB) → ${result.url}`);
+      return { success: true, ...result };
     })
   }),
   // ─── SUBTITLES ───────────────────────────────────────────────────────────
@@ -4495,6 +4784,7 @@ async function startServer() {
   }
   const app = express2();
   const server = createServer(app);
+  app.get("/healthz", (_req, res) => res.json({ status: "ok" }));
   app.use("/api/native/youtube", express2.json({ limit: "2kb" }));
   registerNativeYouTube(app, { findYtDlp, findFfmpeg });
   app.use(express2.json({ limit: "50mb" }));
