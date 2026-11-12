@@ -90,13 +90,19 @@ async function processJob({ id, videoId, kind, range, language }) {
 }
 
 console.log(`Waiting for Clip Maker download jobs from ${origin.origin}.`);
+let waitingForServer = false;
 for (;;) {
   try {
     const response = await request("claim");
     if (response.status === 401 || response.status === 404) {
-      console.error("The service has not enabled this worker token. Check the Rundploy secret and redeploy.");
-      process.exitCode = 1;
-      break;
+      if (!waitingForServer) console.warn("Waiting for the server to accept the worker token. Check the Rundploy runtime secret if this persists.");
+      waitingForServer = true;
+      await delay(15_000);
+      continue;
+    }
+    if (response.ok && waitingForServer) {
+      console.log("Reconnected to Clip Maker.");
+      waitingForServer = false;
     }
     if (response.status !== 204) {
       if (!response.ok) throw new Error(`Worker polling returned HTTP ${response.status}.`);

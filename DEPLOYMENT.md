@@ -26,6 +26,6 @@ If the logs show “Sign in to confirm you’re not a bot,” set `YTDLP_YOUTUBE
 
 If you have no proxy, run Clip Maker’s download worker on a Mac or another computer that can download from YouTube. It connects out to the website over HTTPS and sends back audio or a selected video range when YouTube blocks the hosting server. The worker supports transfers up to 28 MiB and uses the single-instance deployment described above. Allocate 2 GiB of memory for Whisper when processing longer videos.
 
-1. Generate a random token with `openssl rand -hex 32` and add it to Rundploy as the runtime secret `CLIP_MAKER_YOUTUBE_WORKER_TOKEN`. Redeploy.
+1. Generate a random token with `openssl rand -hex 32` and save it in the app’s Rundploy environment settings as the runtime secret `CLIP_MAKER_YOUTUBE_WORKER_TOKEN`. Redeploy. Rundploy recreates the service configuration from its own settings, so save the token there for future deployments.
 2. On the worker computer, set the same `CLIP_MAKER_YOUTUBE_WORKER_TOKEN` and `CLIP_MAKER_SERVICE_URL` to the website’s HTTPS origin in the local, ignored `.env` file. Install Node 22, FFmpeg, a current yt-dlp with its JavaScript components, and the Python dependencies in `scripts/requirements-whisper.txt`. The worker runs Whisper locally for videos at least 10 minutes long. Set `WHISPER_PYTHON`, `CLIP_MAKER_YTDLP`, and `CLIP_MAKER_FFMPEG` to the executable paths if they’re outside your PATH.
 3. Run `npm run youtube:worker` from the project directory and leave it running while using the website.
