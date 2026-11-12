@@ -7,6 +7,7 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
+import { downloadWithYouTubeWorker, registerYouTubeWorker } from "../server/youtube-worker.mjs";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -1109,6 +1110,22 @@ function youtubeSourceId(url) {
       : null;
   return /^[a-zA-Z0-9_-]{11}$/.test(id ?? "") ? id : null;
 }
+var youtubeProxy = process.env.YTDLP_YOUTUBE_PROXY?.trim();
+function youtubeNetworkArgs(url) {
+  if (!youtubeProxy || !youtubeSourceId(url)) return [];
+  try {
+    const proxy = new URL(youtubeProxy);
+    if (proxy.protocol === "http:" && proxy.hostname && proxy.pathname === "/" && !proxy.search && !proxy.hash) {
+      return ["--proxy", youtubeProxy];
+    }
+  } catch {
+  }
+  throw new Error("YTDLP_YOUTUBE_PROXY must be an HTTP CONNECT proxy URL.");
+}
+function redactDownloadError(details) {
+  return (youtubeProxy ? details.replaceAll(youtubeProxy, "[YouTube proxy]") : details)
+    .replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[redacted]@");
+}
 async function tryYouTubeTranscript(url, language) {
   try {
     const videoId = youtubeSourceId(url);
@@ -1168,11 +1185,18 @@ async function inworldTranscribe(audioPath, apiKey, language = "en") {
   return data.transcription?.transcript ?? "";
 }
 async function getVideoInfo(url) {
+  const source = assertSafeUrl(url);
   const ytDlp = await getYtDlp();
-  const { stdout } = await promisify(execFile)(ytDlp,
-    ["--ignore-config", "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, "--print-json", "--skip-download", "--no-warnings", "--", assertSafeUrl(url)],
-    { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
-  );
+  let stdout;
+  try {
+    ({ stdout } = await promisify(execFile)(ytDlp,
+      ["--ignore-config", "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...youtubeNetworkArgs(source),
+        "--print-json", "--skip-download", "--no-warnings", "--", source],
+      { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
+    ));
+  } catch (error) {
+    throw new Error(redactDownloadError(String(error.stderr || error.message)));
+  }
   const info = JSON.parse(stdout.trim());
   return {
     title: info.title ?? "Untitled",
@@ -1183,15 +1207,16 @@ async function getVideoInfo(url) {
     language: /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(info.language ?? "") ? info.language.toLowerCase() : "auto"
   };
 }
-async function downloadSourceAudio(url, tmpDir) {
+async function downloadSourceAudio(url, tmpDir, language, onTranscribing) {
   const ytDlp = await getYtDlp();
   const ffmpeg = await getFfmpeg();
   if (!ffmpeg) throw new Error(FFMPEG_MISSING);
+  const networkArgs = youtubeNetworkArgs(url);
   const download = async (stem, format, clientArgs = []) => {
     await runStreaming(ytDlp, [
       "--ignore-config", "--no-playlist", "--no-warnings", "--no-progress",
       "--socket-timeout", "15", "--retries", "1", "--fragment-retries", "1", "--abort-on-unavailable-fragment",
-      ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...clientArgs,
+      ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...networkArgs, ...clientArgs,
       "--format", format, "--ffmpeg-location", path3.dirname(ffmpeg),
       "--output", path3.join(tmpDir, `${stem}.%(ext)s`), "--", url
     ], { timeout: 15e4 });
@@ -1205,7 +1230,15 @@ async function downloadSourceAudio(url, tmpDir) {
   } catch (error) {
     if (!youtubeSourceId(url) || !/403|429|forbidden|format|SABR|sign in|download video data|fragment/i.test(error.message)) throw error;
     console.warn("[Extract] Preferred YouTube audio failed. Trying a public stream with audio and video:", error.message.slice(0, 350));
-    mediaPath = await download("source-muxed", "b[height<=480]/b", YT_PUBLIC_FALLBACK_CLIENT_ARGS);
+    const fallbackArgs = networkArgs.length ? YT_PUBLIC_FALLBACK_CLIENT_ARGS : ["--force-ipv4", ...YT_PUBLIC_FALLBACK_CLIENT_ARGS];
+    try {
+      mediaPath = await download("source-muxed", "b[height<=480]/b", fallbackArgs);
+    } catch (fallbackError) {
+      const workerAudio = path3.join(tmpDir, "worker-audio.mp3");
+      const metadata = await downloadWithYouTubeWorker(youtubeSourceId(url), workerAudio, { language, onTranscribing });
+      if (metadata) return { audioPath: workerAudio, metadata };
+      throw new Error(`${error.message}\n${fallbackError.message}`);
+    }
   }
 
   const audioPath = path3.join(tmpDir, "source.wav");
@@ -1213,7 +1246,7 @@ async function downloadSourceAudio(url, tmpDir) {
     "-nostdin", "-hide_banner", "-loglevel", "error", "-i", mediaPath,
     "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", audioPath
   ], { timeout: 12e4 });
-  return audioPath;
+  return { audioPath };
 }
 var sourceTranscriptionInput = z.object({
   url: z.string().url("Invalid URL"),
@@ -1250,13 +1283,25 @@ async function transcribeSource(input, reportStage = () => {}) {
     reportStage("downloading");
     let audioPath;
     try {
-      audioPath = await downloadSourceAudio(url, tmpDir);
+      const download = await downloadSourceAudio(url, tmpDir, language, () => reportStage("transcribing"));
+      audioPath = download.audioPath;
+      if (download.metadata) {
+        const { title, duration, uploader, language: sourceLanguage } = download.metadata;
+        if (typeof title === "string" && title) meta.title = title.slice(0, 512);
+        if (Number.isFinite(duration) && duration > 0) meta.duration = duration;
+        if (typeof uploader === "string") meta.uploader = uploader.slice(0, 512);
+        if (language === "auto" && /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(sourceLanguage ?? "")) language = sourceLanguage;
+        if (download.metadata.transcript) {
+          const { text, words } = download.metadata.transcript;
+          return text && words.length ? result("whisper", text, words) : result("none", "", [], "Whisper didn’t detect speech in this video.");
+        }
+      }
     } catch (error) {
-      const details = String(error.stderr || error.message).slice(0, 600);
-      console.warn("[Extract] Source audio unavailable:", details);
+      const details = redactDownloadError(String(error.stderr || error.message));
+      console.warn("[Extract] Source audio unavailable:", details.slice(0, 600));
       const youtubeDenied = youtubeSourceId(url) && /403|429|forbidden|sign in|not a bot/i.test(details);
       const note = youtubeDenied
-        ? "YouTube refused the media request from this server. Upload the original video to transcribe it with Whisper."
+        ? "YouTube blocked this server’s download. You can upload a copy of the video you own to transcribe it with Whisper."
         : "Clip Maker couldn’t prepare audio for Whisper. Try again or upload the original video.";
       return result("none", "", [], note);
     }
@@ -1298,7 +1343,7 @@ var extractRouter = router({
     const job = { userId: ctx.user.id, stage: "fetching-info", result: null, error: null };
     sourceTranscriptionJobs.set(id, job);
     runningSourceTranscriptions++;
-    void transcribeSource(input, (stage) => { job.stage = stage; }).then((result) => {
+    job.finished = transcribeSource(input, (stage) => { job.stage = stage; }).then((result) => {
       job.result = result;
     }, (error) => {
       job.error = error instanceof TRPCError2 ? error.message : "Couldn’t analyse this video. Try again.";
@@ -1309,12 +1354,22 @@ var extractRouter = router({
     });
     return { id };
   }),
-  transcriptionStatus: protectedProcedure.input(z.object({ id: z.string().uuid() })).query(({ input, ctx }) => {
+  transcriptionStatus: protectedProcedure.input(z.object({
+    id: z.string().uuid(), wait: z.boolean().default(false)
+  })).query(async ({ input, ctx }) => {
     const job = sourceTranscriptionJobs.get(input.id);
     if (!job || job.userId !== ctx.user.id) {
       throw new TRPCError2({ code: "NOT_FOUND", message: "This analysis expired. Start it again." });
     }
     ctx.res.setHeader("Cache-Control", "no-store");
+    if (input.wait && !job.result && !job.error) {
+      // Keep a request active during inference on hosts that throttle idle CPU.
+      let timer;
+      await Promise.race([
+        job.finished,
+        new Promise(resolve => { timer = setTimeout(resolve, 12_000); }),
+      ]).finally(() => clearTimeout(timer));
+    }
     return { stage: job.stage, result: job.result, error: job.error };
   }),
   /**
@@ -2447,7 +2502,7 @@ function runStreaming(bin, args, opts) {
       const errorLines = tail.filter((l) => /^ERROR:|^\s*error/i.test(l));
       const chosen = (errorLines.length ? errorLines : tail).slice(-3);
       const unique = chosen.filter((l, i) => chosen.indexOf(l) === i).join(" | ");
-      reject(new Error(unique || `exited with code ${code}`));
+      reject(new Error(redactDownloadError(unique || `exited with code ${code}`)));
     });
   });
 }
@@ -2528,6 +2583,7 @@ async function probeMedia(filePath) {
 }
 async function hostVideo(opts) {
   const sourceUrl = assertSafeUrl(opts.sourceUrl);
+  const networkArgs = youtubeNetworkArgs(sourceUrl);
   const maxMinutes = opts.maxMinutes ?? 180;
   const maxHeight = opts.maxHeight ?? 2160;
   const range = opts.range ?? null;
@@ -2585,7 +2641,7 @@ async function hostVideo(opts) {
   ].join("/");
   try {
     const commonArgs = [
-      "--no-playlist", ...YTDLP_COOKIE_ARGS,
+      "--no-playlist", ...YTDLP_COOKIE_ARGS, ...networkArgs,
       ...YT_CLIENT_ARGS,
       "--no-warnings",
       // Fail quickly when a provider leaves a media connection hanging.
@@ -2667,7 +2723,7 @@ async function hostVideo(opts) {
     const downloadShortCompatible = (clientArgs = []) => runStreaming(
       ytDlp,
       [
-        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...clientArgs,
+        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...networkArgs, ...clientArgs,
         "--no-warnings",
         "--socket-timeout", "20",
         "--retries", "2",
@@ -2688,7 +2744,7 @@ async function hostVideo(opts) {
     const downloadCompatible = (clientArgs = []) => runStreaming(
       ytDlp,
       [
-        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...clientArgs,
+        "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...networkArgs, ...clientArgs,
         "--no-warnings",
         "--socket-timeout", "20",
         "--retries", "2",
@@ -2757,17 +2813,22 @@ async function hostVideo(opts) {
         }
       }
     };
-    if (range) {
-      console.log(`[Host] Downloading selected ${(range.end - range.start).toFixed(1)}s range for clip ${range.start}-${range.end}s at best available quality...`);
+    let downloaded;
+    try {
       await downloadWithFallback();
-      /* Both paths now write the same padded local interval. The compatibility
-       * path downloads one safe muxed file, then trims it locally below. */
-      effectiveOffset = offset;
-    } else {
-      await downloadWithFallback();
+      downloaded = await findWritten(tmpDir, "source");
+    } catch (error) {
+      if (!/403|429|forbidden|sign in|not a bot/i.test(error.message)) throw error;
+      const workerVideo = path5.join(tmpDir, "worker.mp4");
+      const metadata = await downloadWithYouTubeWorker(youtubeSourceId(sourceUrl), workerVideo, {
+        kind: "video",
+        range: range ? { start: offset, duration: range.end + SECTION_BUFFER - offset } : undefined,
+      });
+      if (!metadata) throw error;
+      compatibleFullSource = false;
+      downloaded = workerVideo;
     }
     opts.onProgress?.(96);
-    const downloaded = await findWritten(tmpDir, "source");
     if (!downloaded) {
       if (range) {
         throw new MediaError(
@@ -4445,6 +4506,7 @@ async function startServer() {
   const app = express2();
   const server = createServer(app);
   app.get("/healthz", (_req, res) => res.json({ status: "ok" }));
+  registerYouTubeWorker(app);
   app.use("/api/native/youtube", express2.json({ limit: "2kb" }));
   registerNativeYouTube(app, { findYtDlp, findFfmpeg });
   app.use(express2.json({ limit: "50mb" }));

@@ -28,11 +28,11 @@ export function useSourceTranscription() {
     const { id } = await start.mutateAsync(input);
     const deadline = Date.now() + 30 * 60_000;
     while (Date.now() < deadline) {
-      const status = await client.extract.transcriptionStatus.query({ id });
+      const status = await client.extract.transcriptionStatus.query({ id, wait: true });
       if (status.error) throw new Error(status.error);
       if (status.result) return status.result;
       onStage?.(status.stage);
-      await new Promise(resolve => window.setTimeout(resolve, 2000));
+      await new Promise(resolve => window.setTimeout(resolve, 250));
     }
     throw new Error("Video analysis timed out. Try a shorter video.");
   };
