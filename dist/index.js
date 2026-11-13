@@ -739,6 +739,16 @@ function localPathFromUrl(url) {
 
 // server/_core/mediaRoutes.ts
 var KINDS = /* @__PURE__ */ new Set(["video", "clip"]);
+const previewDurations = new Map();
+async function previewDuration(filePath, stat) {
+  const version = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+  const cached = previewDurations.get(filePath);
+  if (cached?.version === version) return cached.duration;
+  const duration = probeMedia(filePath).then(info => info.duration).catch(() => null);
+  if (previewDurations.size >= 128) previewDurations.delete(previewDurations.keys().next().value);
+  previewDurations.set(filePath, { version, duration });
+  return duration;
+}
 function registerMediaRoutes(app) {
   app.get("/api/media/:kind/:name", async (req, res) => {
     const kind = req.params.kind;
@@ -1625,6 +1635,26 @@ var HighlightSchema = z2.object({
   engagementScore: z2.number(),
   reason: z2.string()
 });
+const titleLanguages = {
+  "ar-ma": "Moroccan Darija in Arabic script",
+  ar: "Arabic",
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  de: "German",
+  pt: "Portuguese",
+  ja: "Japanese",
+  zh: "Chinese",
+  hi: "Hindi",
+  ko: "Korean"
+};
+const titleLanguageInput = z2.enum(["auto", ...Object.keys(titleLanguages)]).default("auto");
+function titleLanguageInstruction(language) {
+  const choice = titleLanguages[language];
+  return choice
+    ? `Write all generated text in ${choice}. Keep the JSON keys in English.`
+    : "Write all generated text in the language and dialect of the source text. For Moroccan Darija, use natural Moroccan expressions and Arabic script. Keep the JSON keys in English.";
+}
 var geminiRouter = router({
   /**
    * GET /api/trpc/gemini.models
@@ -1655,6 +1685,7 @@ var geminiRouter = router({
     transcript: z2.string().min(10, "Transcript is too short"),
     transcriptWords: z2.array(z2.object({ word: z2.string(), start: z2.number().nonnegative() })).optional(),
     videoDuration: z2.number().optional(),
+    titleLanguage: titleLanguageInput,
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
     apiKey: z2.string().min(1, "Inworld API key is required"),
     /** Pick candidates for one ranked source instead of five moments from one video. */
@@ -1743,7 +1774,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         model: input.model,
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
-          { role: "system", content: systemPrompt },
+          { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage)}` },
           { role: "user", content: userPrompt }
         ],
         temperature: 0.7,
@@ -1768,7 +1799,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       const ordered = highlights.sort((a, b) => b.engagementScore - a.engagementScore).map((h, i) => ({ ...h, id: i + 1 }));
       return {
         highlights: ordered,
-        reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : "TOP MOMENTS"),
+        reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : ordered[0].title),
         modelUsed,
         modelSubstituted: substituted,
         metadata: response.metadata
@@ -1786,6 +1817,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
    */
   generateTitle: protectedProcedure.input(z2.object({
     clipContent: z2.string().min(5),
+    titleLanguage: titleLanguageInput,
     style: z2.enum(["tiktok", "youtube", "instagram"]).default("tiktok"),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
     apiKey: z2.string().min(1, "Inworld API key is required")
@@ -1797,7 +1829,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         messages: [
           {
             role: "system",
-            content: `You are a viral content strategist writing irresistible hooks for ${input.style} short-form videos. Titles are bold, capitalized, and maximize CTR and shares. Return ONLY JSON, no markdown.`
+            content: `You are a viral content strategist writing irresistible hooks for ${input.style} short-form videos. Titles are bold, capitalized, and maximize CTR and shares. Return ONLY JSON, no markdown. ${titleLanguageInstruction(input.titleLanguage)}`
           },
           {
             role: "user",
@@ -3615,7 +3647,17 @@ var appRouter = router({
     get: protectedProcedure.input(z4.object({ id: z4.number() })).query(async ({ input, ctx }) => {
       const video = await getVideoById(input.id, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND" });
-      return video;
+      const mediaPath = video.hostedStatus === "ready" && localPathFromUrl(video.hostedUrl);
+      const media = mediaPath ? await fs2.stat(mediaPath).catch(() => null) : null;
+      if (media?.size) {
+        // A preview can cover just one clip. Report its real length for seeking.
+        return { ...video, hostedDuration: await previewDuration(mediaPath, media) };
+      }
+      if (video.hostedStatus !== "ready") return video;
+      if (video.sourceType === "url") {
+        return { ...video, hostedStatus: "none", hostedUrl: null, hostProgress: 0 };
+      }
+      return { ...video, hostedStatus: "error", hostedUrl: null, hostError: "This uploaded file is no longer available. Upload the original video again." };
     }),
     /**
      * POST /api/trpc/videos.create
@@ -3689,7 +3731,9 @@ var appRouter = router({
       if (video.hostedStatus === "downloading") {
         return { success: true, hostedStatus: "downloading", hostedUrl: null };
       }
-      if (video.hostedStatus === "ready" && video.hostedUrl && !input.force) {
+      const currentPath = localPathFromUrl(video.hostedUrl);
+      const existingFile = video.hostedStatus === "ready" && currentPath && await fs2.stat(currentPath).catch(() => null);
+      if (existingFile?.size && !input.force) {
         return { success: true, hostedStatus: "ready", hostedUrl: video.hostedUrl };
       }
       const sourceUrl = video.sourceUrl;
@@ -3892,7 +3936,12 @@ var appRouter = router({
       const video = await getVideoById(clip.videoId, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "This clip's video no longer exists." });
       const hostedPath = localPathFromUrl(video.hostedUrl);
-      if (video.hostedStatus !== "ready" || !hostedPath) {
+      const hostedFile = video.hostedStatus === "ready" && hostedPath && await fs2.stat(hostedPath).catch(() => null);
+      const hostedDuration = hostedFile?.size ? await previewDuration(hostedPath, hostedFile) : null;
+      const hostedStart = video.hostedOffset ?? 0;
+      const coversClip = hostedDuration && hostedStart <= clip.startTime + 0.15
+        && hostedStart + hostedDuration >= clip.endTime - 0.15;
+      if (!hostedFile?.size || (video.sourceType === "url" && !coversClip)) {
         /*
          * Auto-import just this clip's range at full quality.
          * Much faster than downloading the entire video.
@@ -3926,10 +3975,8 @@ var appRouter = router({
             height: result.height || null,
           });
           console.log(`[Render] Auto-import done: ${Math.round(result.bytes / 1024 / 1024)}MB ${result.width}x${result.height}`);
-          /* Re-read the video to get the updated path */
-          const updatedVideo = await getVideoById(video.id, ctx.user.id);
-          var actualHostedPath = localPathFromUrl(updatedVideo.hostedUrl);
-          var actualHostedOffset = updatedVideo.hostedOffset ?? 0;
+          var actualHostedPath = localPathFromUrl(result.url);
+          var actualHostedOffset = result.offset;
         } catch (importErr) {
           const msg = importErr instanceof Error ? importErr.message : String(importErr);
           await updateVideo(video.id, { hostedStatus: "error", hostError: msg.slice(0, 500) }).catch(() => {});

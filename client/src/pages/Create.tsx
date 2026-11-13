@@ -650,7 +650,7 @@ function ManualClipPicker({ videoTitle, videoDuration, onNext }: {
 // ─── Step 2: Highlights ───────────────────────────────────────────────────────
 function StepHighlights({
   videoTitle, transcript, apiKey, model, videoDuration,
-  transcriptWords, heatmap, chapters,
+  transcriptWords, heatmap, chapters, titleLanguage, onTitleLanguageChange,
   onNext
 }: {
   videoTitle: string; transcript: string; apiKey: string; model: string;
@@ -660,14 +660,18 @@ function StepHighlights({
   /** YouTube's most-replayed curve, when available — real engagement data. */
   heatmap: { start: number; end: number; value: number }[];
   chapters: { start: number; end: number; title: string }[];
+  titleLanguage: string;
+  onTitleLanguageChange: (language: string) => void;
   onNext: (clips: Highlight[], reelTitle: string) => void
 }) {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [reelTitle, setReelTitle] = useState("");
   const [manual, setManual] = useState(false);
+  const [generatedLanguage, setGeneratedLanguage] = useState("");
 
   const detect = trpc.gemini.detectHighlights.useMutation({
     onSuccess: (data) => {
+      setGeneratedLanguage(titleLanguage);
       setReelTitle(data.reelTitle);
       setSelected(new Set(data.highlights.map(h => h.id)));
       toast.success(
@@ -689,7 +693,7 @@ function StepHighlights({
 
   /** Everything the detector needs, including whichever signals this source had. */
   const detectInput = {
-    transcript, model, apiKey, videoDuration,
+    transcript, model, apiKey, videoDuration, titleLanguage,
     transcriptWords: transcriptWords.length > 0 ? transcriptWords : undefined,
     heatmap: heatmap.length > 0 ? heatmap : undefined,
     chapters: chapters.length > 0 ? chapters : undefined,
@@ -724,6 +728,16 @@ function StepHighlights({
         <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Gemini AI Highlights</h2>
         <p className="text-sm text-muted-foreground">Analyzing: <span className="text-foreground font-medium">{videoTitle}</span></p>
       </div>
+      <label className="mb-4 block text-sm font-semibold text-foreground">
+        Highlight title language
+        <select value={titleLanguage} disabled={detect.isPending}
+          onChange={event => onTitleLanguageChange(event.target.value)}
+          className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
+          {LANGUAGES.map(({ code, label }) => (
+            <option key={code} value={code}>{code === "auto" ? "Same as video" : label}</option>
+          ))}
+        </select>
+      </label>
       {!apiKey && <NoKeyWarning />}
       {!detect.isPending && (
         <button type="button" onClick={() => setManual(true)}
@@ -772,7 +786,7 @@ function StepHighlights({
               <Wand2 className="w-4 h-4 shrink-0" style={{ color: "var(--mint)" }} />
               <div className="flex-1 min-w-0">
                 <p className="text-xs text-muted-foreground">Gemini suggested reel title:</p>
-                <p className="text-sm font-bold text-foreground truncate">{reelTitle}</p>
+                <p dir="auto" className="text-sm font-bold text-foreground truncate">{reelTitle}</p>
               </div>
             </div>
           )}
@@ -791,14 +805,14 @@ function StepHighlights({
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between gap-2 mb-1">
-                        <span className="text-sm font-bold text-foreground" style={{ fontFamily: "Montserrat, sans-serif" }}>{h.title}</span>
+                        <span dir="auto" className="text-sm font-bold text-foreground" style={{ fontFamily: "Montserrat, sans-serif" }}>{h.title}</span>
                         <span className="text-xs font-black px-2 py-0.5 rounded-full shrink-0" style={{ color, background: `${color}22` }}>{h.engagementScore}</span>
                       </div>
                       <div className="flex items-center gap-3 text-xs text-muted-foreground mb-2">
                         <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{fmt(h.startTime)}–{fmt(h.endTime)}</span>
                         <span>{h.endTime - h.startTime}s</span>
                       </div>
-                      <p className="text-xs text-muted-foreground italic">{h.reason}</p>
+                      <p dir="auto" className="text-xs text-muted-foreground italic">{h.reason}</p>
                       <div className="mt-2 h-1 rounded-full bg-secondary overflow-hidden">
                         <div className="h-full rounded-full" style={{ width:`${h.engagementScore}%`, background: color }} />
                       </div>
@@ -811,9 +825,9 @@ function StepHighlights({
           <div className="flex gap-3">
             <button onClick={() => detect.mutate(detectInput)}
               className="flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold text-muted-foreground bg-secondary/60 hover:text-foreground transition-colors">
-              <RefreshCw className="w-4 h-4" /> Re-analyze
+              <RefreshCw className="w-4 h-4" /> {generatedLanguage === titleLanguage ? "Re-analyze" : "Regenerate in selected language"}
             </button>
-            <button onClick={proceed} disabled={selected.size === 0}
+            <button onClick={proceed} disabled={selected.size === 0 || generatedLanguage !== titleLanguage}
               className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 glow-blue"
               style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
               Use {selected.size} Clip{selected.size !== 1 ? "s" : ""} — Style Subtitles <ArrowRight className="w-4 h-4" />
@@ -823,6 +837,44 @@ function StepHighlights({
       )}
     </div>
   );
+}
+
+function useClipPreviewImport(
+  videoId: number | null,
+  clip: Highlight | undefined,
+  video: { sourceUrl?: string | null; hostedStatus: string; hostedUrl?: string | null; hostedOffset?: number | null; hostedDuration?: number | null } | undefined,
+  request: (input: { id: number; startTime: number; endTime: number; force: boolean }) => void,
+) {
+  const attempted = useRef("");
+  const offset = video?.hostedOffset ?? 0;
+  const coversClip = !clip || video?.hostedDuration == null || (
+    clip.startTime >= offset - 0.15 && clip.endTime <= offset + video.hostedDuration + 0.15
+  );
+  const ready = video?.hostedStatus === "ready" && !!video.hostedUrl && coversClip;
+  const canImport = videoId != null && !!clip && !!video?.sourceUrl;
+  const importClip = canImport && clip && videoId != null ? () => request({
+    id: videoId, startTime: clip.startTime, endTime: clip.endTime,
+    force: video?.hostedStatus === "ready",
+  }) : undefined;
+
+  useEffect(() => {
+    if (ready) {
+      attempted.current = "";
+      return;
+    }
+    if (!importClip || video?.hostedStatus === "downloading" || video?.hostedStatus === "error") return;
+    const target = `${videoId}:${clip?.startTime}:${clip?.endTime}:${video?.hostedUrl ?? ""}`;
+    if (attempted.current === target) return;
+    attempted.current = target;
+    importClip();
+  }, [videoId, clip, video, ready, importClip]);
+
+  return {
+    hostedUrl: ready ? video?.hostedUrl : null,
+    hostedStatus: (ready ? "ready" : video?.hostedStatus === "ready" ? "none" : video?.hostedStatus ?? "none") as
+      "none" | "downloading" | "ready" | "error",
+    importClip,
+  };
 }
 
 // ─── Step 3: Subtitles ────────────────────────────────────────────────────────
@@ -874,8 +926,6 @@ function StepSubtitles({
     { id: videoId ?? 0 },
     { enabled: videoId != null, refetchInterval: 3000, retry: false }
   );
-  const hostedUrl = video?.hostedUrl ?? null;
-  const hostedStatus = (video?.hostedStatus ?? "none") as "none" | "downloading" | "ready" | "error";
   /**
    * A partial import starts partway into the source, so the hosted file's t=0
    * is `hostedOffset` seconds into the original. Clip times are absolute and
@@ -891,37 +941,7 @@ function StepSubtitles({
     onError: err => toast.error(`Import failed: ${err.message}`),
   });
 
-  /** Span covering every selected clip — the only part worth downloading. */
-  const clipSpan = useMemo(() => {
-    if (clips.length === 0) return null;
-    const validClips = clips.filter(c => c.startTime != null && c.endTime != null);
-    if (validClips.length === 0) return null;
-    return {
-      startTime: Math.min(...validClips.map(c => c.startTime)),
-      endTime: Math.max(...validClips.map(c => c.endTime)),
-    };
-  }, [clips]);
-
-  // Start the import as soon as this step opens, so the preview fills in on its
-  // own. Guarded so it fires once per video rather than on every poll.
-  const importStarted = useRef<number | null>(null);
-  useEffect(() => {
-    if (videoId == null || !clipSpan) return;
-    if (importStarted.current === videoId) return;
-    // Wait for the row to load before deciding whether an import is needed.
-    if (!video) return;
-
-    // Already done or in flight: nothing to start.
-    if (hostedStatus === "ready" || hostedStatus === "downloading") {
-      importStarted.current = videoId;
-      return;
-    }
-
-    importStarted.current = videoId;
-    host.mutate({ id: videoId, ...clipSpan });
-    // `host` is stable for the component's lifetime; excluded deliberately.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoId, clipSpan, video, hostedStatus]);
+  const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
 
   const previewWords = useMemo(
     () => previewWordsFor(transcript, clip?.startTime, SAMPLE_WORDS.map(w => w.word)),
@@ -1061,9 +1081,7 @@ function StepSubtitles({
                   url={video?.sourceUrl ?? null}
                   hostingStatus={hostedStatus}
                   hostingProgress={video?.hostProgress ?? 0}
-                  onHost={videoId != null && clipSpan
-                    ? () => host.mutate({ id: videoId, ...clipSpan })
-                    : undefined}
+                  onHost={importClip}
                   className="rounded-2xl w-full"
                   style={{ aspectRatio: "9/16" }}
                 />
@@ -1160,8 +1178,6 @@ function StepEdit({
     { id: videoId ?? 0 },
     { enabled: videoId != null, refetchInterval: 3000, retry: false }
   );
-  const hostedUrl = video?.hostedUrl ?? null;
-  const hostedStatus = (video?.hostedStatus ?? "none") as "none" | "downloading" | "ready" | "error";
   const hostedOffset = video?.hostedOffset ?? 0;
 
   /*
@@ -1184,15 +1200,7 @@ function StepEdit({
     onError: err => toast.error(`Import failed: ${err.message}`),
   });
 
-  const clipSpan = useMemo(() => {
-    if (clips.length === 0) return null;
-    const validClips = clips.filter(c => c.startTime != null && c.endTime != null);
-    if (validClips.length === 0) return null;
-    return {
-      startTime: Math.min(...validClips.map(c => c.startTime)),
-      endTime: Math.max(...validClips.map(c => c.endTime)),
-    };
-  }, [clips]);
+  const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
 
   /**
    * Words for a clip, in clip-relative seconds.
@@ -1305,7 +1313,7 @@ function StepEdit({
     if (hostedStatus !== "ready" || !captionsOn || video?.sourceType === "upload") return;
     for (const h of clips) {
       const e = edits[h.id];
-      if (!e || e.words.length > 0 || transcribing.current.has(e.clipId)) continue;
+      if (h.id !== clip?.id || !e || e.words.length > 0 || transcribing.current.has(e.clipId)) continue;
       transcribing.current.add(e.clipId);
       transcribeClip.mutateAsync({ id: e.clipId, force: true })
         .then((result: any) => {
@@ -1327,18 +1335,7 @@ function StepEdit({
         .catch(() => { /* fallback to YouTube captions already seeded */ });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostedStatus, clips, edits, captionsOn, video?.sourceType]);
-
-  // Start the import if it has not begun, so the preview can fill in.
-  const importStarted = useRef<number | null>(null);
-  useEffect(() => {
-    if (videoId == null || !clipSpan || !video) return;
-    if (importStarted.current === videoId) return;
-    importStarted.current = videoId;
-    if (hostedStatus === "ready" || hostedStatus === "downloading") return;
-    host.mutate({ id: videoId, ...clipSpan });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoId, clipSpan, video, hostedStatus]);
+  }, [hostedStatus, clip?.id, clips, edits, captionsOn, video?.sourceType]);
 
   const current = clip ? edits[clip.id] : undefined;
   const duration = clip ? Math.max(1, (clip.endTime ?? 0) - (clip.startTime ?? 0)) : 1;
@@ -1614,9 +1611,7 @@ function StepEdit({
               url={video?.sourceUrl ?? null}
               hostingStatus={hostedStatus}
               hostingProgress={video?.hostProgress ?? 0}
-              onHost={videoId != null && clipSpan
-                ? () => host.mutate({ id: videoId, ...clipSpan })
-                : undefined}
+              onHost={importClip}
               className="rounded-2xl w-full"
               style={{ aspectRatio: "9/16" }}
             />
@@ -1696,14 +1691,14 @@ function StepEdit({
 }
 
 // ─── Step 5: Export ───────────────────────────────────────────────────────────
-function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, captionsOn, apiKey, model }: {
+function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, captionsOn, apiKey, model, titleLanguage }: {
   clips: Highlight[]; style: SubStyle; videoTitle: string; reelTitle: string;
   videoUrl: string;
   /** Row ids created by the Edit step, keyed by highlight id. */
   clipIds: Record<number, number>;
   /** Burn captions into the exports. */
   captionsOn: boolean;
-  apiKey: string; model: string;
+  apiKey: string; model: string; titleLanguage: string;
 }) {
   const [rendering, setRendering] = useState<Set<number>>(new Set());
   const utils = trpc.useUtils();
@@ -1738,7 +1733,7 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
 
   const genHook = async (h: Highlight) => {
     try {
-      const result = await generateTitle.mutateAsync({ clipContent: `${h.title}: ${h.reason}`, style: "tiktok", apiKey, model });
+      const result = await generateTitle.mutateAsync({ clipContent: `${h.title}: ${h.reason}`, style: "tiktok", apiKey, model, titleLanguage });
       setHookTitles(prev => ({ ...prev, [h.id]: result }));
       toast.success("AI generated a viral hook!");
     } catch { toast.error("Failed to generate hook"); }
@@ -1849,6 +1844,7 @@ export default function CreatePage() {
   const [videoUrl, setVideoUrl] = useState("");
   const [selectedClips, setSelectedClips] = useState<Highlight[]>([]);
   const [reelTitle, setReelTitle] = useState("");
+  const [titleLanguage, setTitleLanguage] = useState("auto");
   const [subStyle, setSubStyle] = useState<SubStyle|null>(null);
   /**
    * Clip rows created by the Edit step, keyed by highlight id. Export renders
@@ -1877,6 +1873,7 @@ export default function CreatePage() {
           <StepHighlights videoTitle={videoTitle} transcript={transcript} apiKey={apiKey} model={model} videoDuration={videoDuration}
             transcriptWords={transcriptWords}
             heatmap={heatmap} chapters={chapters}
+            titleLanguage={titleLanguage} onTitleLanguageChange={setTitleLanguage}
             onNext={(clips, rt) => {
               setSelectedClips(clips);
               setReelTitle(rt);
@@ -1899,7 +1896,7 @@ export default function CreatePage() {
         {step === 5 && subStyle && (
           <StepExport clips={selectedClips} style={subStyle} videoTitle={videoTitle} reelTitle={reelTitle}
             videoUrl={videoUrl} clipIds={clipIds} captionsOn={captionsOn}
-            apiKey={apiKey} model={model} />
+            apiKey={apiKey} model={model} titleLanguage={titleLanguage} />
         )}
       </div>
     </AppLayout>
