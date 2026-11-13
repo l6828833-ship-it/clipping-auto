@@ -46,9 +46,9 @@ async function processJob({ id, videoId, kind, range, language }) {
       "-o", path.join(directory, "download.%(ext)s"), "--", url,
     ], { timeout: 180_000, maxBuffer: 1024 * 1024 });
     const { filepath, ...info } = JSON.parse(stdout);
-    if (audio && info.duration >= 600) {
+    const selectedLanguage = language && language !== "auto" ? language : info.language || "auto";
+    if (audio && (selectedLanguage === "ar-ma" || info.duration >= 600)) {
       await request(`${id}/transcribing`);
-      const selectedLanguage = language && language !== "auto" ? language : info.language || "auto";
       const { stdout: words } = await run(process.env.WHISPER_PYTHON || "python3", [
         fileURLToPath(new URL("./whisper_words.py", import.meta.url)),
         filepath, selectedLanguage, "base",

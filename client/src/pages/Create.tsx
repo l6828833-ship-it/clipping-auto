@@ -4,7 +4,7 @@ import AppLayout from "@/components/AppLayout";
 import ClipPreview from "@/components/ClipPreview";
 import VideoFramer, { CropView, DEFAULT_FRAMING, type Framing } from "@/components/VideoFramer";
 import SubtitleOverlay, {
-  previewWordsFor, DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE, PRESET_Y,
+  DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE, PRESET_Y,
 } from "@/components/SubtitleOverlay";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { trpc } from "@/lib/trpc";
@@ -52,11 +52,6 @@ type SubStyle = {
 const FONTS = ["Montserrat", "Oswald", "Inter", "Impact", "Arial Black"];
 const TEXT_COLORS = ["#FFFFFF","#FFE600","#39FF14","#00B4FF","#FF2D78"];
 const HL_COLORS   = ["#FFE600","#39FF14","#00B4FF","#FF2D78"];
-const SAMPLE_WORDS = [
-  { word:"This",  start:0.0, end:0.3 }, { word:"is",    start:0.3, end:0.5 },
-  { word:"how",   start:0.5, end:0.8 }, { word:"you",   start:0.8, end:1.0 },
-  { word:"go",    start:1.0, end:1.2 }, { word:"VIRAL", start:1.2, end:1.8 },
-];
 const LANGUAGES = [
   { code: "auto", label: "Auto-detect" }, { code: "ar-ma", label: "Moroccan Darija" },
   { code: "en", label: "English" }, { code: "es", label: "Spanish" },
@@ -153,6 +148,7 @@ function StepInput({ apiKey, onNext }: {
   const [title, setTitle] = useState("");
   const [transcript, setTranscript] = useState("");
   const [language, setLanguage] = useState("auto");
+  const [detectedLanguage, setDetectedLanguage] = useState("auto");
   const [showLangPicker, setShowLangPicker] = useState(false);
   const [file, setFile] = useState<File|null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -179,6 +175,7 @@ function StepInput({ apiKey, onNext }: {
     setVideoMeta(null);
     setTranscript("");
     setTimedWords([]);
+    setDetectedLanguage("auto");
 
     try {
       const result = await transcribeSource({
@@ -190,6 +187,7 @@ function StepInput({ apiKey, onNext }: {
       setStage("done");
       setTranscript(result.transcript);
       setTimedWords(result.words ?? []);
+      setDetectedLanguage(result.language ?? "auto");
       // Real viewer rewatch data, when YouTube published it for this video.
       setHeatmap(result.heatmap ?? []);
       setChapters(result.chapters ?? []);
@@ -264,6 +262,7 @@ function StepInput({ apiKey, onNext }: {
       transcript: transcript.trim() || undefined,
       duration: videoMeta?.duration || undefined,
       transcriptWords: timedWords.length > 0 ? timedWords : undefined,
+      captionLanguage: language === "auto" && stage === "done" ? detectedLanguage : language,
       transcriptionEnabled: subtitlesOn,
     }).catch(() => null);
     if (!videoResult) return;
@@ -348,7 +347,7 @@ function StepInput({ apiKey, onNext }: {
               </div>
               {/* Language picker */}
               <div className="relative">
-                <button onClick={() => setShowLangPicker(v => !v)}
+                <button onClick={() => setShowLangPicker(v => !v)} disabled={isExtracting}
                   className="flex items-center gap-1.5 px-3 py-3 rounded-xl bg-secondary/60 hover:bg-secondary text-sm font-semibold text-foreground transition-colors whitespace-nowrap">
                   <Globe2 className="w-4 h-4" />
                   {LANGUAGES.find(l => l.code === language)?.label ?? language}
@@ -357,7 +356,14 @@ function StepInput({ apiKey, onNext }: {
                 {showLangPicker && (
                   <div className="absolute right-0 top-full mt-1 z-20 glass rounded-xl shadow-xl border border-border p-1 w-40 max-h-48 overflow-y-auto">
                     {LANGUAGES.map(l => (
-                      <button key={l.code} onClick={() => { setLanguage(l.code); setShowLangPicker(false); }}
+                      <button key={l.code} onClick={() => {
+                        setShowLangPicker(false);
+                        if (l.code === language) return;
+                        setLanguage(l.code);
+                        setStage("idle");
+                        setTranscript("");
+                        setTimedWords([]);
+                      }}
                         className={`w-full text-left px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${language === l.code ? "text-white" : "text-muted-foreground hover:text-foreground hover:bg-secondary/60"}`}
                         style={language === l.code ? { background: "var(--cobalt)" } : {}}>
                         {l.label}
@@ -879,11 +885,10 @@ function useClipPreviewImport(
 
 // ─── Step 3: Subtitles ────────────────────────────────────────────────────────
 function StepSubtitles({
-  clips, videoId, transcript, captionsOn, onCaptionsChange, onNext,
+  clips, videoId, captionsOn, onCaptionsChange, onNext,
 }: {
   clips: Highlight[];
   videoId: number | null;
-  transcript: string;
   /** Whether captions get burned into the exports. */
   captionsOn: boolean;
   onCaptionsChange: (on: boolean) => void;
@@ -904,9 +909,7 @@ function StepSubtitles({
    * Caption position as a percentage of the frame. Null means the preset above
    * is in use; dragging the caption on screen switches to a free position.
    *
-   * This is the style shared by every clip. The Edit step can override it per
-   * clip, which is why reframing stays there — but placing the caption is part
-   * of the look, so it belongs here too.
+   * The caption style is shared by every clip.
    */
   const [freePos, setFreePos] = useState<{ posX: number; posY: number } | null>(null);
   const style: SubStyle = {
@@ -944,8 +947,8 @@ function StepSubtitles({
   const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
 
   const previewWords = useMemo(
-    () => previewWordsFor(transcript, clip?.startTime, SAMPLE_WORDS.map(w => w.word)),
-    [transcript, clip?.startTime]
+    () => clip ? wordsInClip(video?.transcriptWords, clip).slice(0, 4).map(word => word.word) : [],
+    [video?.transcriptWords, clip]
   );
 
   // Keep the highlighted word inside the current slice.
@@ -1065,7 +1068,7 @@ function StepSubtitles({
                 className="w-full shadow-2xl"
                 style={{ maxWidth: "300px" }}
               >
-                {captionsOn && (
+                {captionsOn && previewWords.length > 0 && (
                   <SubtitleOverlay
                     words={previewWords}
                     activeIndex={activeWord}
@@ -1096,9 +1099,9 @@ function StepSubtitles({
 
             <p className="text-xs text-muted-foreground text-center">
               {clip ? <>Clip #{previewIdx + 1} · {fmt(clip.startTime)}–{fmt(clip.endTime)}<br /></> : null}
-              {previewWords.length > 0
+              {captionsOn && (previewWords.length > 0
                 ? "Click words to preview the highlight"
-                : "Extract a transcript in step 1 to preview captions"}
+                : "No timed captions for this preview")}
             </p>
 
             {/* Make the import state explicit rather than leaving a bare
@@ -1128,14 +1131,22 @@ function StepSubtitles({
 
 /** Everything the editor tracks for one clip. */
 type ClipEdit = {
-  /** Row id, needed before framing or subtitles can be saved. */
   clipId: number;
   framing: Framing;
   segments: FramingSegment[];
-  words: TimelineWord[];
-  /** Caption position as a percentage of the frame, or null for the preset. */
-  capPos: { posX: number; posY: number } | null;
 };
+
+function wordsInClip(words: TimelineWord[] | null | undefined, clip: Highlight): TimelineWord[] {
+  if (!Array.isArray(words)) return [];
+  return words
+    .filter(word => word.end > clip.startTime && word.start < clip.endTime)
+    .map(word => ({
+      word: word.word,
+      start: Math.max(0, word.start - clip.startTime),
+      end: Math.min(clip.endTime - clip.startTime, word.end - clip.startTime),
+    }))
+    .filter(word => word.end > word.start);
+}
 
 /**
  * Timeline editing for every selected clip, on one page.
@@ -1145,12 +1156,13 @@ type ClipEdit = {
  * them to. Export then just renders what this step has already saved.
  */
 function StepEdit({
-  clips, videoId, style, captionsOn, onNext,
+  clips, videoId, style, captionsOn, onCaptionsChange, onNext,
 }: {
   clips: Highlight[];
   videoId: number | null;
   style: SubStyle;
   captionsOn: boolean;
+  onCaptionsChange: (on: boolean) => void;
   onNext: (clipIds: Record<number, number>) => void;
 }) {
   const utils = trpc.useUtils();
@@ -1202,26 +1214,6 @@ function StepEdit({
 
   const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
 
-  /**
-   * Words for a clip, in clip-relative seconds.
-   *
-   * Real timings from the source caption track when the video has them,
-   * otherwise the track starts empty — inventing timings would put captions out
-   * of sync with the speech, which is worse than showing none.
-   */
-  const seedWords = (h: Highlight): TimelineWord[] => {
-    const timed = video?.transcriptWords as Array<{ word: string; start: number; end: number }> | null | undefined;
-    if (!Array.isArray(timed)) return [];
-    return timed
-      .filter(w => w.end > h.startTime && w.start < h.endTime)
-      .map(w => ({
-        word: w.word,
-        start: Math.max(0, w.start - h.startTime),
-        end: Math.min(h.endTime - h.startTime, w.end - h.startTime),
-      }))
-      .filter(w => w.end > w.start);
-  };
-
   /*
    * Create a row per selected clip, once. The ref guard matters: this effect can
    * run twice in development and duplicate rows would be created otherwise.
@@ -1254,8 +1246,6 @@ function StepEdit({
               offsetY: found.offsetY ?? DEFAULT_FRAMING.offsetY,
             },
             segments: (found.framingSegments as FramingSegment[] | null) ?? [],
-            words: seedWords(h),
-            capPos: null,
           };
           continue;
         }
@@ -1272,8 +1262,6 @@ function StepEdit({
             clipId: id,
             framing: DEFAULT_FRAMING,
             segments: [],
-            words: seedWords(h),
-            capPos: null,
           };
         } catch (err) {
           toast.error(err instanceof Error ? err.message : `Could not prepare "${h.title}"`);
@@ -1288,56 +1276,26 @@ function StepEdit({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoId, clips, existingClips]);
 
-  // Seed subtitle tracks once the video's timings arrive after the rows exist.
-  useEffect(() => {
-    if (!video?.transcriptWords) return;
-    setEdits(prev => {
-      let changed = false;
-      const next = { ...prev };
-      for (const h of clips) {
-        const e = next[h.id];
-        if (!e || e.words.length > 0) continue;
-        const seeded = seedWords(h);
-        if (seeded.length > 0) { next[h.id] = { ...e, words: seeded }; changed = true; }
-      }
-      return changed ? next : prev;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [video?.transcriptWords, clips]);
-
-  /*
-   * Fill missing captions with local Whisper once the video is hosted.
-   */
-  const transcribing = useRef<Set<number>>(new Set());
-  useEffect(() => {
-    if (hostedStatus !== "ready" || !captionsOn || video?.sourceType === "upload") return;
-    for (const h of clips) {
-      const e = edits[h.id];
-      if (h.id !== clip?.id || !e || e.words.length > 0 || transcribing.current.has(e.clipId)) continue;
-      transcribing.current.add(e.clipId);
-      transcribeClip.mutateAsync({ id: e.clipId, force: true })
-        .then((result: any) => {
-          if (result?.words?.length > 0) {
-            const clipWords = result.words.map((w: any) => ({
-              word: w.word,
-              start: Math.max(0, w.start - h.startTime),
-              end: Math.max(0, w.end - h.startTime),
-            })).filter((w: any) => w.end > w.start);
-            if (clipWords.length > 0) {
-              setEdits(prev => {
-                const existing = prev[h.id];
-                if (!existing) return prev;
-                return { ...prev, [h.id]: { ...existing, words: clipWords } };
-              });
-            }
-          }
-        })
-        .catch(() => { /* fallback to YouTube captions already seeded */ });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostedStatus, clip?.id, clips, edits, captionsOn, video?.sourceType]);
-
   const current = clip ? edits[clip.id] : undefined;
+  const clipId = current?.clipId;
+  const { data: savedCaptions } = trpc.subtitles.get.useQuery(
+    { clipId: clipId ?? 0 },
+    { enabled: captionsOn && clipId != null },
+  );
+  const previewWords = useMemo(() => {
+    if (!clip) return [];
+    const saved = wordsInClip(savedCaptions?.words, clip);
+    return saved.length ? saved : wordsInClip(video?.transcriptWords, clip);
+  }, [clip, savedCaptions?.words, video?.transcriptWords]);
+  const transcribing = useRef(new Map<number, Promise<unknown>>());
+  useEffect(() => {
+    if (!captionsOn || hostedStatus !== "ready" || clipId == null || savedCaptions === undefined
+        || previewWords.length || transcribing.current.has(clipId)) return;
+    const request = transcribeClip.mutateAsync({ id: clipId, force: true }).then(() =>
+      utils.subtitles.get.invalidate({ clipId }),
+    ).catch(() => {});
+    transcribing.current.set(clipId, request);
+  }, [captionsOn, hostedStatus, clipId, savedCaptions, previewWords.length, transcribeClip.mutateAsync, utils]);
   const duration = clip ? Math.max(1, (clip.endTime ?? 0) - (clip.startTime ?? 0)) : 1;
 
   const patch = (next: Partial<ClipEdit>) => {
@@ -1346,7 +1304,7 @@ function StepEdit({
   };
 
   /** Writes one clip's edits to the server. */
-  const persist = async (h: Highlight, e: ClipEdit) => {
+  const persist = async (e: ClipEdit) => {
     await updateClip.mutateAsync({
       id: e.clipId,
       ...e.framing,
@@ -1354,17 +1312,10 @@ function StepEdit({
       captionsEnabled: captionsOn,
     });
     if (captionsOn) {
+      await transcribing.current.get(e.clipId);
       await saveSubtitles.mutateAsync({
         clipId: e.clipId,
-        style: { ...style, ...(e.capPos ?? {}) },
-        // Absolute source times, which is what the renderer expects.
-        words: e.words.length > 0
-          ? e.words.map(w => ({
-            word: w.word,
-            start: w.start + h.startTime,
-            end: w.end + h.startTime,
-          }))
-          : undefined,
+        style,
       });
     }
   };
@@ -1374,7 +1325,7 @@ function StepEdit({
     try {
       for (const h of clips) {
         const e = edits[h.id];
-        if (e) await persist(h, e);
+        if (e) await persist(e);
       }
       toast.success("Edits saved.");
       return true;
@@ -1392,7 +1343,7 @@ function StepEdit({
     if (!e) return;
     setRendering(prev => new Set(Array.from(prev).concat(h.id)));
     try {
-      await persist(h, e);
+      await persist(e);
       await startRender.mutateAsync({ id: e.clipId, ...e.framing, captionsEnabled: captionsOn });
       setRendered(prev => new Set(Array.from(prev).concat(h.id)));
       toast.success(`"${h.title}" is rendering.`);
@@ -1454,21 +1405,7 @@ function StepEdit({
     return { start: clip.startTime ?? 0, end: clip.endTime ?? 1 };
   }, [clip, current, selectedSegment, duration]);
 
-  const previewStyle: SubStyle = { ...style, ...(current?.capPos ?? {}) };
-
-  /**
-   * Only the caption that belongs at the playhead.
-   *
-   * The overlay draws every word it is given, so handing it the whole clip
-   * stacked the entire transcript on the frame. The renderer shows one word at a
-   * time, so the preview does the same.
-   */
-  const visibleCaption = useMemo(() => {
-    if (!current || current.words.length === 0) return null;
-    const at = current.words.findIndex(w => playhead >= w.start && playhead < w.end);
-    if (at === -1) return null;
-    return { words: [current.words[at].word], activeIndex: 0 };
-  }, [current, playhead]);
+  const visibleCaption = captionsOn && previewWords.find(word => playhead >= word.start && playhead < word.end);
 
   /** Moves the playhead and takes both players with it. */
   const scrubTo = (t: number) => {
@@ -1496,10 +1433,21 @@ function StepEdit({
             Edit
           </h2>
           <p className="text-sm text-muted-foreground">
-            Move the frame, add zooms and fix subtitle timings for each clip.
+            Move the frame and add zooms for each clip.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={captionsOn}
+            aria-label="Captions"
+            onClick={() => { onCaptionsChange(!captionsOn); setRendered(new Set()); }}
+            disabled={saving || rendering.size > 0}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl border border-border text-sm font-semibold disabled:opacity-50"
+          >
+            <Captions className="w-4 h-4" /> Captions {captionsOn ? "on" : "off"}
+          </button>
           <button
             onClick={saveAll}
             disabled={saving}
@@ -1572,12 +1520,11 @@ function StepEdit({
                 seekTo={seek}
                 onPlayingChange={setPlaying}
               >
-                {captionsOn && visibleCaption && (
+                {visibleCaption && (
                   <SubtitleOverlay
-                    words={visibleCaption.words}
-                    activeIndex={visibleCaption.activeIndex}
-                    style={previewStyle}
-                    onPositionChange={p => patch({ capPos: p })}
+                    words={[visibleCaption.word]}
+                    activeIndex={0}
+                    style={style}
                   />
                 )}
               </CropView>
@@ -1602,8 +1549,7 @@ function StepEdit({
               </div>
 
               <p className="text-[10px] text-muted-foreground/70 leading-relaxed">
-                Drag inside either player to move the frame. Drag the caption to place it
-                anywhere. Both apply to this clip only.
+                Drag inside either player to move the frame.
               </p>
             </>
           ) : (
@@ -1634,22 +1580,12 @@ function StepEdit({
                 onSegmentsChange={next => patch({ segments: next })}
                 selectedSegment={selectedSegment}
                 onSelectSegment={setSelectedSegment}
-                words={current.words}
-                onWordsChange={next => patch({ words: next })}
                 playheadSeconds={playhead}
                 onScrub={scrubTo}
                 baseFraming={current.framing}
                 editingKeyframe={editingKeyframe}
                 onEditingKeyframeChange={setEditingKeyframe}
               />
-
-              {captionsOn && current.words.length === 0 && (
-                <p className="text-[11px] leading-relaxed p-3 rounded-xl" style={{ background: "oklch(0.78 0.18 55 / 0.1)", color: "oklch(0.82 0.17 60)" }}>
-                  No word timings for this clip. The export will spread the transcript evenly,
-                  which drifts from the speech. Transcribe the clip on the Clips page for
-                  captions that follow the audio, or add words with the + on the subtitle track.
-                </p>
-              )}
 
               <div className="flex items-center justify-end gap-2">
                 <button
@@ -1712,8 +1648,7 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
 
   /**
    * Renders the row the Edit step already created and saved. Nothing is created
-   * here, so the framing sections and subtitle timings made in Edit are exactly
-   * what gets burned in.
+   * here, so the saved framing and caption settings apply to the render.
    */
   const renderClip = async (h: Highlight) => {
     const clipId = clipIds[h.id];
@@ -1884,13 +1819,13 @@ export default function CreatePage() {
             }} />
         )}
         {step === 3 && (
-          <StepSubtitles clips={selectedClips} videoId={videoId} transcript={transcript}
+          <StepSubtitles clips={selectedClips} videoId={videoId}
             captionsOn={captionsOn} onCaptionsChange={setCaptionsOn}
             onNext={style => { setSubStyle(style); setStep(4); }} />
         )}
         {step === 4 && subStyle && (
           <StepEdit clips={selectedClips} videoId={videoId} style={subStyle}
-            captionsOn={captionsOn}
+            captionsOn={captionsOn} onCaptionsChange={setCaptionsOn}
             onNext={ids => { setClipIds(ids); setStep(5); }} />
         )}
         {step === 5 && subStyle && (

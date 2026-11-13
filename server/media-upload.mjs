@@ -137,6 +137,7 @@ export function registerMediaUpload(app, {
       const id = await storeVideo({
         userId: user.id, title: title.trim(), sourceType: "upload", status: "done",
         duration, width, height, transcript, transcriptWords: words.length ? words : null,
+        captionLanguage: language.toLowerCase(),
         transcriptionEnabled: captions === "on", hostedStatus: "ready", hostProgress: 100,
         hostedUrl: `/api/media/video/${name}`,
       });

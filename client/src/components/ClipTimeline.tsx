@@ -224,7 +224,7 @@ export function ClipTimeline({
   onSegmentsChange,
   selectedSegment,
   onSelectSegment,
-  words,
+  words = [],
   onWordsChange,
   playheadSeconds,
   onScrub,
@@ -243,8 +243,8 @@ export function ClipTimeline({
   /** Index of the segment being reframed, or null for the whole clip. */
   selectedSegment: number | null;
   onSelectSegment: (index: number | null) => void;
-  words: TimelineWord[];
-  onWordsChange: (next: TimelineWord[]) => void;
+  words?: TimelineWord[];
+  onWordsChange?: (next: TimelineWord[]) => void;
   playheadSeconds?: number;
   onScrub?: (seconds: number) => void;
   /** Framing used for the clip when no segments exist yet. */
@@ -491,11 +491,11 @@ export function ClipTimeline({
   // ─── Word operations ───────────────────────────────────────────────────────
 
   const updateWord = (index: number, patch: Partial<TimelineWord>) => {
-    onWordsChange(words.map((w, i) => (i === index ? { ...w, ...patch } : w)));
+    onWordsChange?.(words.map((w, i) => (i === index ? { ...w, ...patch } : w)));
   };
 
   const removeWord = (index: number) => {
-    onWordsChange(words.filter((_, i) => i !== index));
+    onWordsChange?.(words.filter((_, i) => i !== index));
     setEditingWord(null);
   };
 
@@ -503,7 +503,7 @@ export function ClipTimeline({
     const start = Math.max(0, Math.min(safeDuration - MIN_WORD, t));
     const next = [...words, { word: "NEW", start, end: Math.min(safeDuration, start + 0.4) }]
       .sort((a, b) => a.start - b.start);
-    onWordsChange(next);
+    onWordsChange?.(next);
     setEditingWord(next.findIndex(w => w.start === start));
   };
 
@@ -541,16 +541,16 @@ export function ClipTimeline({
   const splitWordAt = (t: number) => {
     const result = splitWordAtTime(words, t);
     if (result.selectIndex == null) return;
-    onWordsChange(result.words);
+    onWordsChange?.(result.words);
     setEditingWord(result.selectIndex);
   };
 
   const trimWord = (index: number, edge: "start" | "end", time: number) => {
-    onWordsChange(trimWordEdge(words, index, edge, snapWord(time, index), safeDuration));
+    onWordsChange?.(trimWordEdge(words, index, edge, snapWord(time, index), safeDuration));
   };
 
   const shiftWord = (index: number, newStart: number) => {
-    onWordsChange(shiftWordTo(words, index, snapWord(newStart, index), safeDuration));
+    onWordsChange?.(shiftWordTo(words, index, snapWord(newStart, index), safeDuration));
   };
 
   // ─── Tool dispatch ─────────────────────────────────────────────────────────
@@ -630,7 +630,7 @@ export function ClipTimeline({
           >
             Tracks
           </div>
-          {TRACKS.map(track => (
+          {TRACKS.filter(track => track.id !== "subtitle" || onWordsChange).map(track => (
             <div
               key={track.id}
               className="flex items-center gap-1.5 px-2 border-b border-border/60"
@@ -826,7 +826,7 @@ export function ClipTimeline({
             </div>
 
             {/* Subtitle lane */}
-            <div
+            {onWordsChange && <div
               className={`relative ${toolCursor}`}
               style={{ height: TRACKS[1].height, background: "#f7f6f3" }}
               onPointerDown={e => onScrub?.(timeAt(e.clientX))}
@@ -896,7 +896,7 @@ export function ClipTimeline({
                   Track hidden
                 </span>
               )}
-            </div>
+            </div>}
 
             {/* Text overlay lane */}
             <div
@@ -1075,7 +1075,7 @@ export function ClipTimeline({
 
         <div className="w-px self-stretch mx-1 bg-border shrink-0" />
 
-        <button
+        {onWordsChange && <button
           onClick={() => splitWordAt(playheadSeconds ?? 0)}
           disabled={!canSplitWord || locked.subtitle}
           title="Cut the subtitle under the playhead"
@@ -1083,7 +1083,7 @@ export function ClipTimeline({
         >
           <Type className="w-4 h-4" />
           <span className="text-[9px] font-bold">Cut word</span>
-        </button>
+        </button>}
         <button
           onClick={() => addZoom(playheadSeconds ?? 0)}
           disabled={locked.framing}
@@ -1240,7 +1240,7 @@ export function ClipTimeline({
       })()}
 
       {/* ── Inspector: the selected subtitle ─────────────────────────────── */}
-      {editingWord != null && words[editingWord] && (
+      {onWordsChange && editingWord != null && words[editingWord] && (
         <div className="border-t border-border p-3 space-y-2" style={{ background: "#f7f6f3" }}>
           <div className="flex items-center gap-2">
             <input

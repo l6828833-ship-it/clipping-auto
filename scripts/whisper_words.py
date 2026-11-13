@@ -26,11 +26,16 @@ def main() -> None:
     from whisper.tokenizer import LANGUAGES
 
     torch.set_num_threads(2)
+    if locale == "ar-ma":
+        from darija_whisper import model_path
+
+        model_name = str(model_path())
     model = whisper.load_model(model_name, device="cpu")
     result = model.transcribe(
         audio_path,
         language=language if language in LANGUAGES else None,
-        initial_prompt="هاد الهضرة بالدارجة المغربية." if locale == "ar-ma" else None,
+        task="transcribe",
+        condition_on_previous_text=locale != "ar-ma",
         word_timestamps=True,
         fp16=False,
         verbose=None,

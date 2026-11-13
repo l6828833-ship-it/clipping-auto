@@ -67,6 +67,7 @@ var videos = pgTable("videos", {
   duration: real("duration"),
   transcript: text("transcript"),
   transcriptWords: jsonb("transcriptWords"),
+  captionLanguage: varchar("captionLanguage", { length: 8 }).default("auto").notNull(),
   transcriptionEnabled: boolean("transcriptionEnabled").default(true).notNull(),
   sttCalls: integer("sttCalls").default(0).notNull(),
   sttSeconds: real("sttSeconds").default(0).notNull(),
@@ -1258,9 +1259,10 @@ async function downloadSourceAudio(url, tmpDir, language, onTranscribing) {
   ], { timeout: 12e4 });
   return { audioPath };
 }
+var captionLanguageInput = z.string().regex(/^(?:auto|[a-z]{2,3}(?:-[a-z]{2})?)$/i).transform(value => value.toLowerCase()).default("auto");
 var sourceTranscriptionInput = z.object({
   url: z.string().url("Invalid URL"),
-  language: z.string().regex(/^(?:auto|[a-z]{2,3}(?:-[a-z]{2})?)$/i).transform(value => value.toLowerCase()).default("auto"),
+  language: captionLanguageInput,
   allowSpeechToText: z.boolean().default(true)
 });
 async function transcribeSource(input, reportStage = () => {}) {
@@ -1279,10 +1281,10 @@ async function transcribeSource(input, reportStage = () => {}) {
   }
 
   const result = (source, transcript = "", words = [], note = "") => ({
-    success: true, ...meta, source, transcript, words, wordCount: words.length, note
+    success: true, ...meta, source, transcript, words, wordCount: words.length, note, language
   });
   reportStage("checking-captions");
-  const captions = await tryYouTubeTranscript(url, language);
+  const captions = language === "ar-ma" ? null : await tryYouTubeTranscript(url, language);
   if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
     return result("none", "", [], "Subtitles are off for this import.");
@@ -3416,7 +3418,7 @@ async function captionsForClip(clip, video) {
     savedWords: saved?.words,
     savedStyle: saved?.style,
     transcriptWords: video.transcriptWords,
-    transcript: video.transcript,
+    transcript: video.captionLanguage === "ar-ma" ? undefined : video.transcript,
     videoDuration: video.duration
   });
 }
@@ -3683,6 +3685,7 @@ var appRouter = router({
         start: z4.number(),
         end: z4.number()
       })).optional(),
+      captionLanguage: captionLanguageInput,
       /**
        * Whether this video should have subtitles at all. Off skips every
        * speech-to-text call, so no Inworld credits are spent, and can be
@@ -3886,6 +3889,10 @@ var appRouter = router({
       if (endTime <= startTime) {
         throw new TRPCError5({ code: "BAD_REQUEST", message: "End time must be after start time" });
       }
+      const captionsChanged = input.captionsEnabled != null && input.captionsEnabled !== clip.captionsEnabled;
+      if (captionsChanged && clip.status === "rendering") {
+        throw new TRPCError5({ code: "PRECONDITION_FAILED", message: "Wait for this clip to finish rendering before changing captions." });
+      }
       await updateClip(input.id, {
         ...input.title !== void 0 ? { title: input.title } : {},
         ...input.startTime !== void 0 ? { startTime } : {},
@@ -3897,6 +3904,7 @@ var appRouter = router({
         ...input.barColor !== void 0 ? { barColor: input.barColor } : {},
         ...input.textOverlays !== void 0 ? { textOverlays: input.textOverlays } : {},
         ...input.captionsEnabled !== void 0 ? { captionsEnabled: input.captionsEnabled } : {},
+        ...captionsChanged && clip.status === "done" ? { status: "pending", downloadUrl: null, errorMessage: null } : {},
         // An empty array means "no timeline", stored as null.
         ...input.framingSegments !== void 0 ? { framingSegments: input.framingSegments.length > 0 ? input.framingSegments : null } : {}
       });
@@ -4010,7 +4018,7 @@ var appRouter = router({
               const seekStart = Math.max(0, clip.startTime - actualHostedOffset);
               const duration = clip.endTime - clip.startTime;
               audioPath = await extractAudioRange(actualHostedPath, seekStart, duration);
-              const { words } = await localWhisperWords(audioPath);
+              const { words } = await localWhisperWords(audioPath, video.captionLanguage);
               if (words.length) {
                 const saved = await getSubtitleByClip(clip.id);
                 finalCaptions = { words, style: saved?.style ?? DEFAULT_CAPTION_STYLE };
@@ -4136,7 +4144,7 @@ var appRouter = router({
      */
     transcribe: protectedProcedure.input(z4.object({
       id: z4.number(),
-      language: z4.string().default("auto"),
+      language: captionLanguageInput.optional(),
       /**
        * Transcribe even though the video has subtitles switched off, and turn
        * them on. Used by the explicit "generate transcript now" action.
@@ -4168,7 +4176,7 @@ var appRouter = router({
       let audioPath = null;
       try {
         audioPath = await extractAudioRange(hostedPath, localStart, duration);
-        const local = await localWhisperWords(audioPath, input.language);
+        const local = await localWhisperWords(audioPath, input.language ?? video.captionLanguage);
         if (!local.words.length) {
           throw new TRPCError5({ code: "BAD_REQUEST", message: "Whisper didn’t detect speech in this clip." });
         }
@@ -4262,7 +4270,7 @@ var appRouter = router({
       if (!await getClipById(input.clipId, ctx.user.id)) {
         throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
       }
-      return getSubtitleByClip(input.clipId);
+      return await getSubtitleByClip(input.clipId) ?? null;
     }),
     /**
      * POST /api/trpc/subtitles.save

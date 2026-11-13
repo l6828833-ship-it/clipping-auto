@@ -11,6 +11,7 @@ type SourceTranscriptionResult = {
   duration: number;
   uploader: string;
   note: string;
+  language?: string;
   heatmap?: { start: number; end: number; value: number }[];
   chapters?: { start: number; end: number; title: string }[];
 };

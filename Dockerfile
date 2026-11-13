@@ -7,6 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/requirements-whisper.txt /tmp/requirements-whisper.txt
+COPY scripts/darija_whisper.py /tmp/darija_whisper.py
 # Fetch the CPU-only PyTorch wheel from PyTorch. Resolve its dependencies on PyPI.
 RUN python3 -m venv /opt/media-tools \
     && /opt/media-tools/bin/python -m pip install --no-cache-dir --index-url https://pypi.org/simple 'pip==26.3' \
@@ -18,6 +19,7 @@ RUN python3 -m venv /opt/media-tools \
 
 ENV PATH="/opt/media-tools/bin:${PATH}" XDG_CACHE_HOME=/opt/clip-maker-cache
 RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
+    && python3 /tmp/darija_whisper.py \
     && chown -R node:node /opt/clip-maker-cache
 
 COPY package.json package-lock.json ./

@@ -47,6 +47,7 @@ export const videos = pgTable("videos", {
   duration: real("duration"),
   transcript: text("transcript"),
   transcriptWords: jsonb("transcriptWords"),
+  captionLanguage: varchar("captionLanguage", { length: 8 }).default("auto").notNull(),
   transcriptionEnabled: boolean("transcriptionEnabled").default(true).notNull(),
   sttCalls: integer("sttCalls").default(0).notNull(),
   sttSeconds: real("sttSeconds").default(0).notNull(),
