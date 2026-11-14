@@ -100,6 +100,14 @@ A clip is worth making only if a stranger who has never seen the full video woul
 4. DENSITY - cut the wind-up. Start as late as possible and end as early as possible.
 Skip intros, outros, sponsor reads, housekeeping ("like and subscribe") and rambling.
 
+HUMOUR. Funny moments are often the best clips, and the easiest to ruin with a bad cut. Read for jokes the way a comedian would:
+- A joke is SETUP then PUNCHLINE then REACTION. Find the setup: the line that plants the expectation the punchline breaks. Start the clip there, not on the punchline - a punchline with no setup is not funny.
+- End AFTER the reaction, never on the punchline itself. Include the line or two that follow it: the laugh, the comeback, the "no way", the tag that tops the joke. If people keep riffing and each line is funnier, keep going until the last topper lands, then stop before the talk returns to normal.
+- Recognise humour that is not announced: teasing and roasting between friends, sarcasm, exaggeration, wordplay, a deliberately wrong answer, an awkward silence, someone losing their composure, a running gag being called back. In Moroccan Darija and other dialects, expect mockery among friends, mixed French and Arabic wordplay, and proverbs twisted for effect.
+- A callback only works if its first mention is inside the clip. If it is not, pick a different clip.
+- Do not explain or soften the joke in the title. Tease it without giving the punchline away.
+Apply the same care to any moment built on timing: a reveal, a challenge, a wrong guess. The clip must contain the question and the answer, the attempt and the result.
+
 Return ONLY valid JSON - no markdown, no code fences, no commentary.
 ${languageInstruction}`;
   const timing = timed
@@ -133,7 +141,9 @@ Return exactly this JSON shape:
       "startTime": <seconds, the start of the hook line>,
       "endTime": <seconds, the end of the payoff line>,
       "engagementScore": <integer 60-99, honest: 90+ only for a genuinely exceptional hook AND payoff>,
+      "kind": "joke" | "story" | "insight" | "debate" | "reveal" | "other",
       "hook": "the clip's opening sentence, quoted from the transcript",
+      "payoff": "the line the clip ends on, quoted from the transcript (for a joke: the reaction or last topper, not the punchline)",
       "reason": "one sentence: why a stranger would watch this to the end"
     }
   ],
@@ -186,8 +196,24 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
       /* Leave air only where there is silence to leave it in. */
       const before = [...usable].reverse().find((w) => wordEnd(w) <= start + 0.01);
       const after = usable.find((w) => w.start >= end - 0.01);
+      /* A joke needs its reaction. Laughter is rarely transcribed, so it
+       * shows up as a silent gap after the punchline: keep most of that gap,
+       * and a short reaction line ("no way", a laugh) if one follows closely. */
+      const timed = h.kind === "joke" || h.kind === "reveal";
+      let reaction = false;
+      if (timed) {
+        const next = lines.find((l) => l.start >= end - 0.01);
+        if (next && next.start - end <= 2.5 && next.end - next.start <= 2.5 && next.last - next.first < 4
+            && next.end - start <= maxSeconds) {
+          end = next.end;
+          reaction = true;
+        }
+      }
+      const afterEnd = usable.find((w) => w.start >= end - 0.01);
       const lead = Math.min(LEAD, before ? Math.max(0, (start - wordEnd(before)) / 2) : LEAD);
-      const tail = Math.min(TAIL, after ? Math.max(0, (after.start - end) / 2) : TAIL);
+      const tail = timed
+        ? Math.min(reaction ? 0.6 : 1.5, afterEnd ? Math.max(0, (afterEnd.start - end) * 0.85) : 1.5)
+        : Math.min(TAIL, after ? Math.max(0, (after.start - end) / 2) : TAIL);
       return { ...h, startTime: start - lead, endTime: end + tail };
     });
   }

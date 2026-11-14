@@ -285,7 +285,7 @@ function NeedsHosting({
       </div>
       <div>
         <p className="text-xs font-bold text-white mb-1">
-          {downloading ? `Importing video… ${pct}%` : "Video not imported yet"}
+          {downloading ? (pct > 0 ? `Importing video… ${pct}%` : "Importing video…") : "Video not imported yet"}
         </p>
         <p className="text-[11px] text-white/55 leading-relaxed">
           {downloading

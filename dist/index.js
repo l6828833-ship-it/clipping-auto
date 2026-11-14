@@ -1669,7 +1669,9 @@ var HighlightSchema = z2.object({
   startTime: z2.coerce.number(),
   endTime: z2.coerce.number(),
   engagementScore: z2.coerce.number().catch(75),
+  kind: z2.string().optional(),
   hook: z2.string().optional(),
+  payoff: z2.string().optional(),
   reason: z2.string().catch("")
 });
 const titleLanguages = {
@@ -2510,6 +2512,18 @@ async function probeMedia(filePath) {
     }
   }
 }
+var youtubeBlockedUntil = 0;
+/* Imports in flight, by video and range, so the editor and the background
+ * prefetch never download the same clip twice at once. */
+var hostJobs = new Map();
+function hostVideoShared(opts) {
+  const key = `${opts.videoId}:${opts.range ? `${opts.range.start}-${opts.range.end}` : "full"}`;
+  const running = hostJobs.get(key);
+  if (running) return running;
+  const job = hostVideo(opts).finally(() => hostJobs.delete(key));
+  hostJobs.set(key, job);
+  return job;
+}
 async function hostVideo(opts) {
   const sourceUrl = assertSafeUrl(opts.sourceUrl);
   const networkArgs = youtubeNetworkArgs(sourceUrl);
@@ -2545,6 +2559,8 @@ async function hostVideo(opts) {
   if (cachedFull) return cachedFull;
   const cachedSection = range ? await describe(sectionFileName, offset) : null;
   if (cachedSection) return cachedSection;
+  /* Asked only whether this range is already on disk. */
+  if (opts.cacheOnly) return null;
   let fileName = sectionFileName;
   let outPath = path5.join(VIDEOS_DIR, fileName);
   const tmpDir = await fs6.mkdtemp(path5.join(os3.tmpdir(), `shortspro-host-${opts.videoId}-`));
@@ -2748,16 +2764,27 @@ async function hostVideo(opts) {
     };
     let downloaded;
     try {
+      /* Once YouTube has refused this server, skip straight to the download
+       * worker for a while. Retrying the blocked download first added most
+       * of a minute to every clip import. */
+      if (youtubeSourceId(sourceUrl) && Date.now() < youtubeBlockedUntil) {
+        throw new Error("Sign in to confirm you're not a bot (remembered from a recent attempt).");
+      }
       await downloadWithFallback();
       downloaded = await findWritten(tmpDir, "source");
     } catch (error) {
       if (!/403|429|forbidden|sign in|not a bot/i.test(error.message)) throw error;
+      if (youtubeSourceId(sourceUrl)) youtubeBlockedUntil = Date.now() + 10 * 60e3;
       const workerVideo = path5.join(tmpDir, "worker.mp4");
       const metadata = await downloadWithYouTubeWorker(youtubeSourceId(sourceUrl), workerVideo, {
         kind: "video",
         range: range ? { start: offset, duration: range.end + SECTION_BUFFER - offset } : undefined,
       });
-      if (!metadata) throw error;
+      if (!metadata) {
+        /* No worker to fall back on: try YouTube directly again next time. */
+        youtubeBlockedUntil = 0;
+        throw error;
+      }
       compatibleFullSource = false;
       downloaded = workerVideo;
     }
@@ -3728,6 +3755,17 @@ var appRouter = router({
           message: "This video has no downloadable source URL, so it cannot be hosted."
         });
       }
+      /* A range that is already on disk (this clip was opened before, or the
+       * background prefetch got to it) switches over at once. */
+      const wanted = input.startTime != null && input.endTime != null ? { start: input.startTime, end: input.endTime } : null;
+      const cached = wanted ? await hostVideo({ videoId: video.id, sourceUrl, range: wanted, cacheOnly: true }).catch(() => null) : null;
+      if (cached) {
+        await updateVideo(video.id, {
+          hostedStatus: "ready", hostedUrl: cached.url, hostError: null, hostProgress: 100,
+          hostedOffset: cached.offset, width: cached.width || null, height: cached.height || null
+        });
+        return { success: true, hostedStatus: "ready", hostedUrl: cached.url };
+      }
       await updateVideo(video.id, { hostedStatus: "downloading", hostError: null, hostProgress: 0 });
       void (async () => {
         let lastWrite = 0;
@@ -3742,7 +3780,7 @@ var appRouter = router({
         };
         try {
           const range = input.startTime != null && input.endTime != null ? { start: input.startTime, end: input.endTime } : null;
-          const result = await hostVideo({ videoId: video.id, sourceUrl, range, onProgress });
+          const result = await hostVideoShared({ videoId: video.id, sourceUrl, range, onProgress });
           const isLowRes = result.width > 0 && result.height > 0 && (result.width < 1280 || result.height < 720);
           const qualityState = isLowRes ? "LOW_QUALITY_FALLBACK" : "HIGH_QUALITY_SOURCE";
           await updateVideo(video.id, {
@@ -3771,6 +3809,32 @@ var appRouter = router({
         }
       })();
       return { success: true, hostedStatus: "downloading", hostedUrl: null };
+    }),
+    /**
+     * POST /api/trpc/videos.prefetch
+     * Downloads the given clip ranges in the background, one after another,
+     * without changing which range the editor is showing. Opening one of
+     * those clips afterwards is then instant.
+     */
+    prefetch: protectedProcedure.input(z4.object({
+      id: z4.number(),
+      ranges: z4.array(z4.object({ startTime: z4.number().min(0), endTime: z4.number().min(0) })).max(12)
+    })).mutation(async ({ input, ctx }) => {
+      const video = await getVideoById(input.id, ctx.user.id);
+      if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
+      const sourceUrl = video.sourceUrl;
+      if (video.sourceType !== "url" || !sourceUrl || !/^https?:\/\//i.test(sourceUrl)) return { queued: 0 };
+      const ranges = input.ranges.filter((r) => r.endTime > r.startTime && r.endTime - r.startTime <= 600);
+      void (async () => {
+        for (const r of ranges) {
+          try {
+            await hostVideoShared({ videoId: video.id, sourceUrl, range: { start: r.startTime, end: r.endTime } });
+          } catch (error) {
+            console.warn(`[Host] Prefetch of ${r.startTime}-${r.endTime}s for video ${video.id} failed: ${String(error?.message ?? error).slice(0, 160)}`);
+          }
+        }
+      })();
+      return { queued: ranges.length };
     })
   }),
   // ─── CLIPS ───────────────────────────────────────────────────────────────

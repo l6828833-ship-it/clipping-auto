@@ -1222,6 +1222,19 @@ function StepEdit({
 
   const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
 
+  /* Fetch every selected clip's range in the background, once, so moving to
+   * another clip does not start its import from zero. */
+  const prefetch = trpc.videos.prefetch.useMutation();
+  const prefetched = useRef("");
+  useEffect(() => {
+    if (videoId == null || clips.length === 0) return;
+    const key = `${videoId}:${clips.map(c => `${c.startTime}-${c.endTime}`).join(",")}`;
+    if (prefetched.current === key) return;
+    prefetched.current = key;
+    prefetch.mutate({ id: videoId, ranges: clips.slice(0, 12).map(c => ({ startTime: c.startTime, endTime: c.endTime })) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoId, clips]);
+
   /*
    * Create a row per selected clip, once. The ref guard matters: this effect can
    * run twice in development and duplicate rows would be created otherwise.
