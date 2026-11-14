@@ -1311,6 +1311,34 @@ function StepEdit({
     setEdits(prev => ({ ...prev, [clip.id]: { ...prev[clip.id], ...next } }));
   };
 
+  /** Jump cuts: the server finds pauses and filler sounds from the word timings. */
+  const tightenClip = trpc.clips.tighten.useMutation();
+  const [cutsByClip, setCutsByClip] = useState<Record<number, { start: number; end: number }[]>>({});
+  /* What the export will leave out for the clip being edited: cuts made in
+   * this session, else the ones already saved on the clip. */
+  const activeCuts: { start: number; end: number }[] = clip
+    ? cutsByClip[clip.id]
+      ?? ((existingClips as { id: number; cuts?: unknown }[] | undefined)?.find(c => c.id === current?.clipId)?.cuts as { start: number; end: number }[] | null | undefined)
+      ?? []
+    : [];
+  const playerCuts = clip
+    ? activeCuts.map(c => ({ start: clip.startTime + c.start - hostedOffset, end: clip.startTime + c.end - hostedOffset }))
+    : [];
+  const tighten = async () => {
+    if (!clip || !current) return;
+    const key = clip.id;
+    const enabled = activeCuts.length === 0;
+    try {
+      const data = await tightenClip.mutateAsync({ id: current.clipId, enabled });
+      setCutsByClip(prev => ({ ...prev, [key]: data.cuts }));
+      if (!enabled) toast.success("Cuts removed. The export is the full clip again.");
+      else if (data.cuts.length === 0) toast.info("No pauses long enough to cut in this clip.");
+      else toast.success(`Removed ${data.removedSeconds}s of pauses in ${data.cuts.length} cut${data.cuts.length === 1 ? "" : "s"}. The export will be ${(data.duration - data.removedSeconds).toFixed(1)}s.`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not tighten this clip.");
+    }
+  };
+
   /** AI reframing: the server follows the speaker's face and returns a framing timeline. */
   const autoFrame = trpc.clips.autoFrame.useMutation();
   const [reframing, setReframing] = useState<Set<number>>(new Set());
@@ -1544,6 +1572,7 @@ function StepEdit({
                 startTime={previewSpan.start - hostedOffset}
                 endTime={previewSpan.end - hostedOffset}
                 className="w-full shadow-2xl"
+                skip={playerCuts}
                 onTime={t => {
                   setPreviewTime(t);
                   setPlayhead(Math.max(0, t + hostedOffset - clip.startTime));
@@ -1612,6 +1641,7 @@ function StepEdit({
                 selectedSegment={selectedSegment}
                 onSelectSegment={setSelectedSegment}
                 playheadSeconds={playhead}
+                cuts={activeCuts}
                 onScrub={scrubTo}
                 baseFraming={current.framing}
                 editingKeyframe={editingKeyframe}
@@ -1629,6 +1659,16 @@ function StepEdit({
                   {clip && reframing.has(clip.id)
                     ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Finding the speaker…</>
                     : <><ScanFace className="w-3.5 h-3.5" /> AI reframe</>}
+                </button>
+                <button
+                  onClick={() => void tighten()}
+                  disabled={!clip || !current || tightenClip.isPending}
+                  title="Cut pauses and filler sounds out of the export"
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
+                  style={{ background: "rgba(49, 94, 245, 0.08)", color: "var(--cobalt)" }}
+                >
+                  {tightenClip.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Scissors className="w-3.5 h-3.5" />}
+                  {activeCuts.length ? `Undo ${activeCuts.length} cut${activeCuts.length === 1 ? "" : "s"}` : "Tighten"}
                 </button>
                 <button
                   onClick={() => renderOne(clips[active])}
