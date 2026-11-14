@@ -3060,7 +3060,42 @@ function buildAnimatedCropFilter(opts) {
     `setsar=1`
   ].join(",");
 }
-async function renderClipFromHosted(opts) {
+/* One heavy media job at a time. Four clips rendered together each ran their
+ * own ffmpeg and pushed a 2 GiB instance over its memory limit, which killed
+ * the server and failed every render in flight. Queued, they finish one after
+ * another within the same memory. */
+var heavyQueue = Promise.resolve();
+function queueHeavy(task) {
+  const run = heavyQueue.then(task, task);
+  heavyQueue = run.then(() => {}, () => {});
+  return run;
+}
+function renderClipFromHosted(opts) {
+  return queueHeavy(() => renderClipFromHostedNow(opts));
+}
+/**
+ * Runs scripts/auto_frame.py on part of a hosted file. Resolves to
+ * `{ found, segments, faceCoverage, shots, reason }`; `found` is false when
+ * too few faces were seen to trust the result.
+ */
+async function detectFraming(hostedPath, startInFile, duration) {
+  const ffmpeg = await findFfmpeg();
+  if (!ffmpeg) throw new Error(FFMPEG_MISSING);
+  const meta = await probeMedia(hostedPath);
+  const { stdout } = await queueHeavy(() => promisify(execFile)(
+    process.env.AUTO_FRAME_PYTHON ?? WHISPER_PYTHON,
+    [
+      path3.join(process.cwd(), "scripts", "auto_frame.py"), hostedPath,
+      String(Math.max(0, startInFile)), String(duration), String(meta.width), String(meta.height)
+    ],
+    { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
+  ));
+  const result = JSON.parse(stdout);
+  const segments = Array.isArray(result.segments) ? result.segments : [];
+  const found = segments.length > 0 && (result.faceCoverage ?? 0) >= 0.15;
+  return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null };
+}
+async function renderClipFromHostedNow(opts) {
   const offset = opts.hostedOffset ?? 0;
   const start = Math.max(0, opts.startTime - offset);
   const end = opts.endTime - offset;
@@ -3971,6 +4006,23 @@ var appRouter = router({
               `[Render] Clip ${clip.id} has no captions to burn in (video ${video.id} transcript ${video.transcript ? "present" : "missing"})`
             );
           }
+          /* AI reframing without a click: a clip still on the default centre
+           * crop gets the speaker-following framing before it is rendered. */
+          let framingSegments = clip.framingSegments;
+          const untouched = (!Array.isArray(framingSegments) || framingSegments.length === 0)
+            && crop.zoom === 1 && crop.offsetX === 0 && crop.offsetY === 0;
+          if (untouched && renderProfile === "standard" && process.env.CLIP_MAKER_AUTO_REFRAME !== "0") {
+            try {
+              const auto = await detectFraming(actualHostedPath, clip.startTime - actualHostedOffset, clip.endTime - clip.startTime);
+              if (auto.found) {
+                framingSegments = auto.segments;
+                await updateClip(clip.id, { framingSegments });
+                console.log(`[Render] Clip ${clip.id}: auto-reframed across ${auto.shots} shot(s).`);
+              }
+            } catch (error) {
+              console.warn(`[Render] Clip ${clip.id}: auto-reframe skipped (${String(error.stderr || error.message).slice(0, 160)}).`);
+            }
+          }
           const sharper = renderProfile === "standard"
             ? await sharperSectionFor(video, clip, actualHostedPath)
             : null;
@@ -3982,7 +4034,7 @@ var appRouter = router({
             hostedOffset: sharper?.offset ?? actualHostedOffset,
             crop,
             // Time-varying framing, when the clip has a timeline.
-            segments: clip.framingSegments,
+            segments: framingSegments,
             scale: clip.scale,
             barColor: crop.barColor,
             textOverlays: clip.textOverlays,
@@ -4180,30 +4232,18 @@ var appRouter = router({
       if (!meta || !(duration > 0) || clip.startTime < offset - 0.15 || clip.endTime > offset + meta.duration + 0.15) {
         throw new TRPCError5({ code: "PRECONDITION_FAILED", message: "Import the video for this clip first, then reframe it." });
       }
-      const ffmpeg = await findFfmpeg();
-      if (!ffmpeg) throw new TRPCError5({ code: "PRECONDITION_FAILED", message: FFMPEG_MISSING });
       let result;
       try {
-        const { stdout } = await promisify(execFile)(
-          process.env.AUTO_FRAME_PYTHON ?? WHISPER_PYTHON,
-          [
-            path3.join(process.cwd(), "scripts", "auto_frame.py"), hostedPath,
-            String(Math.max(0, clip.startTime - offset)), String(duration), String(meta.width), String(meta.height)
-          ],
-          { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
-        );
-        result = JSON.parse(stdout);
+        result = await detectFraming(hostedPath, clip.startTime - offset, duration);
       } catch (error) {
         console.warn("[AutoFrame] failed:", String(error.stderr || error.message).slice(0, 400));
         throw new TRPCError5({ code: "INTERNAL_SERVER_ERROR", message: "AI reframing could not analyse this clip. The server needs Python with numpy and onnxruntime." });
       }
-      const segments = Array.isArray(result.segments) ? result.segments : [];
       /* Too few faces to trust: leave the user's framing alone. */
-      const found = segments.length > 0 && (result.faceCoverage ?? 0) >= 0.15;
-      if (found) {
-        await updateClip(clip.id, { framingSegments: segments, zoom: 1, offsetX: 0, offsetY: 0 });
+      if (result.found) {
+        await updateClip(clip.id, { framingSegments: result.segments, zoom: 1, offsetX: 0, offsetY: 0 });
       }
-      return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null };
+      return result;
     }),
     delete: protectedProcedure.input(z4.object({ id: z4.number() })).mutation(async ({ input, ctx }) => {
       const clip = await getClipById(input.id, ctx.user.id);

@@ -1342,7 +1342,7 @@ function StepEdit({
   /** AI reframing: the server follows the speaker's face and returns a framing timeline. */
   const autoFrame = trpc.clips.autoFrame.useMutation();
   const [reframing, setReframing] = useState<Set<number>>(new Set());
-  const reframe = async () => {
+  const reframe = async (silent = false) => {
     if (!clip || !current) return;
     // Edits are keyed by the highlight; the server knows the saved clip row.
     const key = clip.id;
@@ -1350,17 +1350,27 @@ function StepEdit({
     try {
       const data = await autoFrame.mutateAsync({ id: current.clipId });
       if (!data.found) {
-        toast.info(data.reason ? `Nothing to reframe: ${data.reason}.` : "No face was found in this clip, so the framing was left as it is.");
+        if (!silent) toast.info(data.reason ? `Nothing to reframe: ${data.reason}.` : "No face was found in this clip, so the framing was left as it is.");
         return;
       }
       setEdits(prev => prev[key] ? { ...prev, [key]: { ...prev[key], framing: DEFAULT_FRAMING, segments: data.segments } } : prev);
       toast.success(`Framing now follows the speaker across ${data.shots} shot${data.shots === 1 ? "" : "s"}.`);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "AI reframing failed.");
+      if (!silent) toast.error(err instanceof Error ? err.message : "AI reframing failed.");
     } finally {
       setReframing(prev => { const next = new Set(prev); next.delete(key); return next; });
     }
   };
+  /* Reframe automatically, once per clip, as soon as its video is imported
+   * and it still has the default framing. The button stays for redoing it. */
+  const autoReframed = useRef(new Set<number>());
+  useEffect(() => {
+    if (!clip || !current || hostedStatus !== "ready") return;
+    if (autoReframed.current.has(clip.id) || current.segments.length > 0) return;
+    autoReframed.current.add(clip.id);
+    void reframe(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clip?.id, current?.clipId, hostedStatus]);
 
   /** Writes one clip's edits to the server. */
   const persist = async (e: ClipEdit) => {
@@ -1650,7 +1660,7 @@ function StepEdit({
 
               <div className="flex items-center justify-end gap-2">
                 <button
-                  onClick={() => void reframe()}
+                  onClick={() => void reframe(false)}
                   disabled={!clip || !current || hostedStatus !== "ready" || reframing.has(clip.id)}
                   title={hostedStatus === "ready" ? "Follow the speaker's face automatically" : "Available once the video is imported"}
                   className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
