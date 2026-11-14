@@ -5,7 +5,9 @@ import ClipPreview from "@/components/ClipPreview";
 import VideoFramer, { CropView, DEFAULT_FRAMING, type Framing } from "@/components/VideoFramer";
 import SubtitleOverlay, {
   DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE, PRESET_Y,
+  CAPTION_FONTS, CaptionPresetPicker, captionFrame,
 } from "@/components/SubtitleOverlay";
+import type { CaptionPresetId } from "@shared/captions.mjs";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { trpc } from "@/lib/trpc";
 import { useSourceTranscription, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
@@ -15,7 +17,7 @@ import {
   Loader2, Play, Clock, FileVideo, Youtube,
   X, Palette, Save, Film, ArrowRight, ChevronRight, Zap,
   Brain, AlertCircle, RefreshCw, Wand2, Key, ExternalLink,
-  Mic, Captions, Globe2, ChevronDown, Scissors, Move,
+  Mic, Captions, Globe2, ChevronDown, Scissors, Move, ScanFace,
 } from "lucide-react";
 import ClipTimeline, { type TimelineWord, type Keyframe } from "@/components/ClipTimeline";
 import {
@@ -38,6 +40,7 @@ type Highlight = {
   engagementScore: number; reason: string;
 };
 type SubStyle = {
+  preset?: CaptionPresetId;
   font: string; fontSize: number; color: string;
   highlightColor: string; position: "top"|"center"|"bottom"; outline: boolean;
   /** Free position as a percentage of the frame; overrides `position`. */
@@ -49,7 +52,7 @@ type SubStyle = {
  * assets/fonts/README.md) so the burned-in output matches this preview.
  * Impact and Arial Black rely on the server having them installed.
  */
-const FONTS = ["Montserrat", "Oswald", "Inter", "Impact", "Arial Black"];
+const FONTS = CAPTION_FONTS;
 const TEXT_COLORS = ["#FFFFFF","#FFE600","#39FF14","#00B4FF","#FF2D78"];
 const HL_COLORS   = ["#FFE600","#39FF14","#00B4FF","#FF2D78"];
 const LANGUAGES = [
@@ -895,6 +898,7 @@ function StepSubtitles({
   onNext: (style: SubStyle) => void;
 }) {
   const [font, setFont] = useState(DEFAULT_SUBTITLE_STYLE.font);
+  const [preset, setPreset] = useState<CaptionPresetId>("karaoke");
   // Pixels on the 1080-wide export canvas, so the preview and the burned-in
   // captions are the same size.
   const [fontSize, setFontSize] = useState(DEFAULT_SUBTITLE_STYLE.fontSize);
@@ -913,7 +917,7 @@ function StepSubtitles({
    */
   const [freePos, setFreePos] = useState<{ posX: number; posY: number } | null>(null);
   const style: SubStyle = {
-    font, fontSize, color, highlightColor: hlColor, position, outline,
+    preset, font, fontSize, color, highlightColor: hlColor, position, outline,
     ...(freePos ?? {}),
   };
 
@@ -966,7 +970,11 @@ function StepSubtitles({
           <div className="glass rounded-2xl p-5 space-y-4">
             <div className="flex items-center gap-2"><Type className="w-4 h-4" style={{ color: "var(--cobalt)" }} /><span className="text-sm font-semibold">Typography</span></div>
             <div>
-              <label className="text-xs text-muted-foreground mb-2 block">Font Family</label>
+              <label className="text-xs text-muted-foreground mb-2 block">Design</label>
+              <CaptionPresetPicker value={preset} onChange={setPreset} />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-2 block">Font Family <span className="opacity-70">(Arabic text always uses Tajawal or Almarai)</span></label>
               <div className="flex flex-wrap gap-2">{FONTS.map(f => <button key={f} onClick={() => setFont(f)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${font === f ? "text-white" : "text-muted-foreground hover:text-foreground bg-secondary/60"}`} style={font === f ? { background: "var(--cobalt)" } : {}}>{f}</button>)}</div>
             </div>
             <div>
@@ -1303,6 +1311,29 @@ function StepEdit({
     setEdits(prev => ({ ...prev, [clip.id]: { ...prev[clip.id], ...next } }));
   };
 
+  /** AI reframing: the server follows the speaker's face and returns a framing timeline. */
+  const autoFrame = trpc.clips.autoFrame.useMutation();
+  const [reframing, setReframing] = useState<Set<number>>(new Set());
+  const reframe = async () => {
+    if (!clip || !current) return;
+    // Edits are keyed by the highlight; the server knows the saved clip row.
+    const key = clip.id;
+    setReframing(prev => new Set(prev).add(key));
+    try {
+      const data = await autoFrame.mutateAsync({ id: current.clipId });
+      if (!data.found) {
+        toast.info(data.reason ? `Nothing to reframe: ${data.reason}.` : "No face was found in this clip, so the framing was left as it is.");
+        return;
+      }
+      setEdits(prev => prev[key] ? { ...prev, [key]: { ...prev[key], framing: DEFAULT_FRAMING, segments: data.segments } } : prev);
+      toast.success(`Framing now follows the speaker across ${data.shots} shot${data.shots === 1 ? "" : "s"}.`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "AI reframing failed.");
+    } finally {
+      setReframing(prev => { const next = new Set(prev); next.delete(key); return next; });
+    }
+  };
+
   /** Writes one clip's edits to the server. */
   const persist = async (e: ClipEdit) => {
     await updateClip.mutateAsync({
@@ -1405,7 +1436,7 @@ function StepEdit({
     return { start: clip.startTime ?? 0, end: clip.endTime ?? 1 };
   }, [clip, current, selectedSegment, duration]);
 
-  const visibleCaption = captionsOn && previewWords.find(word => playhead >= word.start && playhead < word.end);
+  const visibleCaption = captionsOn ? captionFrame(previewWords, style, playhead) : null;
 
   /** Moves the playhead and takes both players with it. */
   const scrubTo = (t: number) => {
@@ -1522,8 +1553,8 @@ function StepEdit({
               >
                 {visibleCaption && (
                   <SubtitleOverlay
-                    words={[visibleCaption.word]}
-                    activeIndex={0}
+                    words={visibleCaption.words}
+                    activeIndex={visibleCaption.activeIndex}
                     style={style}
                   />
                 )}
@@ -1588,6 +1619,17 @@ function StepEdit({
               />
 
               <div className="flex items-center justify-end gap-2">
+                <button
+                  onClick={() => void reframe()}
+                  disabled={!clip || !current || hostedStatus !== "ready" || reframing.has(clip.id)}
+                  title={hostedStatus === "ready" ? "Follow the speaker's face automatically" : "Available once the video is imported"}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
+                  style={{ background: "rgba(49, 94, 245, 0.08)", color: "var(--cobalt)" }}
+                >
+                  {clip && reframing.has(clip.id)
+                    ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Finding the speaker…</>
+                    : <><ScanFace className="w-3.5 h-3.5" /> AI reframe</>}
+                </button>
                 <button
                   onClick={() => renderOne(clips[active])}
                   disabled={rendering.has(clips[active]?.id)}

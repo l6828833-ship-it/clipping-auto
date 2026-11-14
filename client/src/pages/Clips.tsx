@@ -3,7 +3,7 @@ import AppLayout from "@/components/AppLayout";
 import ClipPreview from "@/components/ClipPreview";
 import VideoFramer, { CropView, FramingBadge, DEFAULT_FRAMING, type Framing } from "@/components/VideoFramer";
 import SubtitleOverlay, {
-  previewWordsFor, DEFAULT_SUBTITLE_STYLE, type SubtitleStyle,
+  previewWordsFor, captionFrame, DEFAULT_SUBTITLE_STYLE, type SubtitleStyle,
 } from "@/components/SubtitleOverlay";
 import ClipTimeline, {
   type FramingSegment as TimelineSegment, type TimelineWord, type Keyframe, type MusicTrack,
@@ -26,7 +26,7 @@ import {
 import {
   Film, Download, Clock, TrendingUp, Loader2, Play, CheckCircle2,
   AlertCircle, Zap, X, Maximize2, Scissors, Save, ExternalLink, CloudDownload, Trash2, Mic, Captions,
-  ChevronDown, Undo2, Redo2,
+  ChevronDown, Undo2, Redo2, ScanFace,
 } from "lucide-react";
 
 // ─── Status badge ─────────────────────────────────────────────────────────────
@@ -181,6 +181,20 @@ function ClipEditorModal({
     return () => clearTimeout(t);
   }, [start, end]);
 
+  /** AI reframing: the server follows the speaker's face and returns a framing timeline. */
+  const autoFrame = trpc.clips.autoFrame.useMutation({
+    onSuccess: (data: { found: boolean; segments: TimelineSegment[]; shots: number; reason: string | null }) => {
+      if (!data.found) {
+        toast.info(data.reason ? `Nothing to reframe: ${data.reason}.` : "No face was found in this clip, so the framing was left as it is.");
+        return;
+      }
+      setFraming({ zoom: 1, offsetX: 0, offsetY: 0 });
+      setSegments(data.segments);
+      setSelectedSegment(null);
+      toast.success(`Framing now follows the speaker across ${data.shots} shot${data.shots === 1 ? "" : "s"}.`);
+    },
+    onError: (err: { message: string }) => toast.error(err.message),
+  });
   const update = trpc.clips.update.useMutation({
     onSuccess: async () => {
       await utils.clips.list.invalidate();
@@ -284,17 +298,12 @@ function ClipEditorModal({
    */
   const visibleCaption = useMemo(() => {
     if (effectiveWords.length > 0) {
-      // Exact match: playhead is inside this word's spoken range.
-      const at = effectiveWords.findIndex(w => playhead >= w.start && playhead < w.end);
-      if (at !== -1) {
-        return { words: [effectiveWords[at].word], activeIndex: 0, wordIndex: at };
-      }
-      // Between words: show nothing. Displaying a stale word during silence
-      // (music, pauses, B-roll) is worse than showing nothing at all.
-      return null;
+      // The line the renderer would show at the playhead, in the chosen design.
+      const frame = captionFrame(effectiveWords, captionStyle, playhead);
+      return frame ? { words: frame.words, activeIndex: frame.activeIndex, wordIndex: frame.anchorIndex } : null;
     }
     return captionWords.length > 0 ? { words: captionWords, activeIndex: 0, wordIndex: -1 } : null;
-  }, [effectiveWords, playhead, captionWords]);
+  }, [effectiveWords, playhead, captionWords, captionStyle.preset, captionStyle.fontSize, captionStyle.uppercase]);
 
   const hostedStatus = (video?.hostedStatus ?? "none") as "none" | "downloading" | "ready" | "error";
   const hostedUrl = video?.hostedUrl ?? null;
@@ -717,6 +726,15 @@ function ClipEditorModal({
                 className="px-4 py-2.5 rounded-xl text-sm font-semibold text-muted-foreground bg-secondary/60 hover:text-foreground transition-colors"
               >
                 Reset
+              </button>
+              <button
+                onClick={() => autoFrame.mutate({ id: clip.id })}
+                disabled={hostedStatus !== "ready" || autoFrame.isPending}
+                title={hostedStatus === "ready" ? "Follow the speaker's face automatically" : "Import the video first"}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+                style={{ background: "var(--cobalt)" }}
+              >
+                {autoFrame.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ScanFace className="w-4 h-4" />} AI reframe
               </button>
             </div>
 

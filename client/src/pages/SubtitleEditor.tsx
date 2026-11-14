@@ -3,11 +3,11 @@ import AppLayout from "@/components/AppLayout";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import SubtitleOverlay, {
-  DEFAULT_SUBTITLE_STYLE, type SubtitleStyle,
+  DEFAULT_SUBTITLE_STYLE, CAPTION_FONTS, CaptionPresetPicker, type SubtitleStyle,
 } from "@/components/SubtitleOverlay";
 import { Type, Palette, Save, Loader2, Eye } from "lucide-react";
 
-const FONTS = ["Montserrat", "Inter", "Arial Black", "Impact", "Oswald"];
+const FONTS = CAPTION_FONTS;
 const COLORS = [
   { name: "White",        value: "#FFFFFF" },
   { name: "Yellow",       value: "#FFE600" },
@@ -28,6 +28,7 @@ export default function SubtitleEditorPage() {
   const { data: clips, isLoading } = trpc.clips.list.useQuery();
   const [selectedClip, setSelectedClip] = useState<number | null>(null);
   const [font, setFont]       = useState(DEFAULT_SUBTITLE_STYLE.font);
+  const [preset, setPreset]   = useState<NonNullable<SubtitleStyle["preset"]>>("karaoke");
   const [fontSize, setFontSize] = useState(DEFAULT_SUBTITLE_STYLE.fontSize);
   const [color, setColor]     = useState(DEFAULT_SUBTITLE_STYLE.color);
   const [highlightColor, setHighlightColor] = useState(DEFAULT_SUBTITLE_STYLE.highlightColor);
@@ -37,7 +38,7 @@ export default function SubtitleEditorPage() {
   const [posY, setPosY] = useState<number | undefined>(undefined);
   const [activeWord, setActiveWord] = useState(5);
 
-  const style: SubtitleStyle = { font, fontSize, color, highlightColor, position, outline, posX, posY };
+  const style: SubtitleStyle = { preset, font, fontSize, color, highlightColor, position, outline, posX, posY };
 
   const saveSubtitles = trpc.subtitles.save.useMutation({
     onSuccess: () => toast.success("Subtitle style saved!"),
@@ -48,7 +49,7 @@ export default function SubtitleEditorPage() {
     if (!selectedClip) { toast.error("Please select a clip first"); return; }
     saveSubtitles.mutate({
       clipId: selectedClip,
-      words: SAMPLE_WORDS.map((word, i) => ({ word, start: i * 0.3, end: (i + 1) * 0.3 })),
+      // Style only. Sending the sample words here replaced the clip's real captions.
       style,
     });
   };
@@ -106,6 +107,10 @@ export default function SubtitleEditorPage() {
               <div className="flex items-center gap-2 mb-1">
                 <Type className="w-4 h-4" style={{ color: "var(--cobalt)" }} />
                 <span className="text-sm font-semibold text-foreground">Typography</span>
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground mb-2 block">Design</label>
+                <CaptionPresetPicker value={preset} onChange={setPreset} />
               </div>
               <div>
                 <label className="text-xs text-muted-foreground mb-2 block">Font Family</label>

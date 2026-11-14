@@ -4,7 +4,10 @@ import express2 from "express";
 import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
+import { totalmem } from "os";
 import { registerMediaUpload } from "../server/media-upload.mjs";
+import { buildHighlightPrompts, clipCountFor, countOnPeaks, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
+import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker } from "../server/youtube-worker.mjs";
@@ -1284,7 +1287,11 @@ async function transcribeSource(input, reportStage = () => {}) {
     success: true, ...meta, source, transcript, words, wordCount: words.length, note, language
   });
   reportStage("checking-captions");
-  const captions = language === "ar-ma" ? null : await tryYouTubeTranscript(url, language);
+  /* YouTube's automatic Arabic captions are weak and carry no usable word
+   * timings. When this machine can run the large Whisper model (the same RAM
+   * rule as scripts/whisper_words.py), Arabic goes straight to Whisper. */
+  const whisperFirst = language === "ar-ma" || (/^ar\b/.test(language) && totalmem() >= 7.5 * 2 ** 30);
+  const captions = whisperFirst ? null : await tryYouTubeTranscript(url, language);
   if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
     return result("none", "", [], "Subtitles are off for this import.");
@@ -1630,12 +1637,13 @@ var INWORLD_POPULAR_MODELS = [
   "auto"
 ];
 var HighlightSchema = z2.object({
-  id: z2.number(),
+  id: z2.coerce.number().optional(),
   title: z2.string(),
-  startTime: z2.number(),
-  endTime: z2.number(),
-  engagementScore: z2.number(),
-  reason: z2.string()
+  startTime: z2.coerce.number(),
+  endTime: z2.coerce.number(),
+  engagementScore: z2.coerce.number().catch(75),
+  hook: z2.string().optional(),
+  reason: z2.string().catch("")
 });
 const titleLanguages = {
   "ar-ma": "Moroccan Darija in Arabic script",
@@ -1685,7 +1693,10 @@ var geminiRouter = router({
    */
   detectHighlights: protectedProcedure.input(z2.object({
     transcript: z2.string().min(10, "Transcript is too short"),
-    transcriptWords: z2.array(z2.object({ word: z2.string(), start: z2.number().nonnegative() })).optional(),
+    transcriptWords: z2.array(z2.object({ word: z2.string(), start: z2.number().nonnegative(), end: z2.number().optional() })).optional(),
+    /** YouTube's most-replayed curve and chapter list, when the source has them. */
+    heatmap: z2.array(z2.object({ start: z2.number(), end: z2.number(), value: z2.number() })).max(2000).optional(),
+    chapters: z2.array(z2.object({ start: z2.number(), end: z2.number().optional(), title: z2.string() })).max(200).optional(),
     videoDuration: z2.number().optional(),
     titleLanguage: titleLanguageInput,
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
@@ -1695,61 +1706,28 @@ var geminiRouter = router({
     rank: z2.number().int().min(1).max(99).optional(),
     sourceTitle: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
-    const timedLines = new Map();
-    for (const { word, start } of input.transcriptWords ?? []) {
-      const interval = Math.floor(start / 10) * 10;
-      if (!timedLines.has(interval)) timedLines.set(interval, []);
-      timedLines.get(interval).push(word);
-    }
-    const transcript = timedLines.size
-      ? [...timedLines].map(([start, words]) => `[${start}s] ${words.join(" ")}`).join("\n")
-      : input.transcript;
-    const defaultSystemPrompt = `You are an expert viral video editor and content strategist specializing in short-form content for TikTok, YouTube Shorts, and Instagram Reels.
-
-Analyze the transcript and identify the TOP 5 most viral and engaging moments that would make excellent short clips (15-60 seconds each).
-
-For each highlight, evaluate:
-- Hook strength (does it grab attention in the first 3 seconds?)
-- Emotional resonance (surprise, laughter, inspiration, shock)
-- Information density (clear insight or punchline)
-- Shareability
-- Audio energy and pacing
-
-Return ONLY valid JSON \u2014 no markdown, no code fences, no extra text.`;
-    const defaultUserPrompt = `Analyze this transcript and identify the 5 best moments for viral short-form clips.
-
-TRANSCRIPT:
-${transcript}
-${input.videoDuration ? `
-Total video duration: ${Math.floor(input.videoDuration / 60)}m ${Math.floor(input.videoDuration % 60)}s` : ""}
-
-Return this exact JSON structure:
-{
-  "highlights": [
-    {
-      "id": 1,
-      "title": "SHORT CATCHY TITLE IN CAPS (max 8 words)",
-      "startTime": <integer seconds>,
-      "endTime": <integer seconds, VARY lengths: some 15-25s, some 25-40s, some 40-60s>,
-      "engagementScore": <integer 60-99>,
-      "reason": "One sentence explaining viral potential"
-    }
-  ],
-  "reelTitle": "TOP 5 REEL TITLE IN ALL CAPS"
-}
-
-Rules: exactly 5 highlights sorted by engagementScore desc, IDs 1-5. IMPORTANT RULES:
-1. SPREAD clips across the ENTIRE video — pick moments from the beginning, middle, AND end. Do NOT cluster all clips in the first few minutes.
-2. Vary durations: mix short (15-25s), medium (25-40s), and long (40-60s). Do NOT make all clips the same length.
-3. Each startTime must be at least 30 seconds apart from any other clip's startTime.
-4. If the video is longer than 10 minutes, at least 2 clips MUST come from the second half.`;
+    const timedWords = (input.transcriptWords ?? []).filter((w) => w.word.trim());
+    const lines = timedWords.length >= 5 ? transcriptLines(timedWords) : [];
+    const transcript = lines.length ? formatTimedTranscript(lines) : input.transcript;
+    const peaks = replayPeaks(input.heatmap);
+    const prompts = buildHighlightPrompts({
+      transcript,
+      timed: lines.length > 0,
+      videoDuration: input.videoDuration,
+      peaks,
+      chapters: input.chapters ?? [],
+      count: clipCountFor(input.videoDuration)
+    });
+    const timingNote = lines.length
+      ? `Each transcript line is "[start-end] text" in seconds. Start a clip at the start of one line and end it at the end of a later line.`
+      : "";
     const rankingMode = input.rankingMode === true;
     const rank = input.rank ?? 1;
     const systemPrompt = rankingMode
       ? `You are an expert short-form ranking editor. Select the strongest self-contained video moments from ONE source for a ranked countdown reel. The selected moment must make sense without the surrounding video, open with a clear hook, and end on a payoff. Generate clean, short, all-caps display titles. Return only valid JSON.`
-      : defaultSystemPrompt;
+      : prompts.system;
     const userPrompt = rankingMode
-      ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 8-15 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates.
+      ? `Choose the best 3 candidate clips from this source for rank #${rank} in a multi-source countdown. Source title: ${input.sourceTitle || "Untitled source"}. Each candidate must be 8-15 seconds, have a strong opening and a complete payoff. Do not repeat or overlap candidates. ${timingNote}
 
 TRANSCRIPT:
 ${transcript}
@@ -1770,7 +1748,7 @@ Return exactly this JSON:
   "reelTitle": "A SHORT ALL-CAPS LABEL FOR THIS RANK"
 }
 Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTime must be no more than 15 seconds after its startTime.`
-      : defaultUserPrompt;
+      : prompts.user;
     try {
       const { response, modelUsed, substituted } = await inworldChatResilient({
         model: input.model,
@@ -1779,8 +1757,9 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage)}` },
           { role: "user", content: userPrompt }
         ],
-        temperature: 0.7,
-        // Headroom so 5 highlights are never cut off mid-object.
+        // Low enough to keep timestamps faithful to the transcript lines.
+        temperature: 0.4,
+        // Headroom so the highlights are never cut off mid-object.
         max_tokens: 4096
       });
       if (substituted) {
@@ -1798,8 +1777,20 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           message: "The model did not return any usable highlights. Try again or pick a different model."
         });
       }
-      const ordered = highlights.sort((a, b) => b.engagementScore - a.engagementScore).map((h, i) => ({ ...h, id: i + 1 }));
+      /* Land every clip on real speech boundaries and drop overlapping picks. */
+      const ordered = snapHighlights(highlights, timedWords, {
+        videoDuration: input.videoDuration,
+        ...(rankingMode ? { minSeconds: 5, maxSeconds: 15, reach: 2 } : {})
+      });
+      if (ordered.length === 0) {
+        throw new TRPCError3({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "The model did not return any usable highlights. Try again or pick a different model."
+        });
+      }
       return {
+        hasWordTimings: lines.length > 0,
+        heatPeaksUsed: countOnPeaks(ordered, peaks),
         highlights: ordered,
         reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : ordered[0].title),
         modelUsed,
@@ -2029,52 +2020,7 @@ import { SignJWT as SignJWT2 } from "jose";
 import { promises as fsp } from "fs";
 
 // server/subtitles.ts
-var CAPTION_CANVAS_W = 1080;
-var CAPTION_CANVAS_H = 1920;
-var DEFAULT_CAPTION_STYLE = {
-  font: "Montserrat",
-  fontSize: 72,
-  color: "#FFFFFF",
-  highlightColor: "#FFE600",
-  position: "bottom",
-  outline: true
-};
-var PRESET_Y = { top: 12, center: 50, bottom: 82 };
-function resolveCaptionAnchor(style, word) {
-  const xPct = word?.posX ?? style.posX;
-  const yPct = word?.posY ?? style.posY;
-  if (xPct == null && yPct == null) return null;
-  const clamp = (v) => Math.min(100, Math.max(0, v));
-  const x = clamp(xPct ?? 50);
-  const y = clamp(yPct ?? PRESET_Y[style.position] ?? 82);
-  return {
-    x: Math.round(x / 100 * CAPTION_CANVAS_W),
-    y: Math.round(y / 100 * CAPTION_CANVAS_H)
-  };
-}
-function cleanWord(raw) {
-  return raw.replace(/>>+/g, "").replace(/\[[^\]]*\]/g, "").replace(/\([^)]*\)/g, "").replace(/[\u266A\u266B\u266C\u2669\u25AA\u25CF]/g, "").replace(/\*{2,}/g, "").replace(/<[^>]+>/g, "").replace(/&nbsp;|&amp;|&lt;|&gt;|&#39;|&apos;|&quot;/gi, "").replace(/-{2,}/g, "").trim();
-}
-function toAssColor(hex) {
-  const m = /^#?([0-9a-f]{6})$/i.exec((hex ?? "").trim());
-  if (!m) return "&H00FFFFFF";
-  const rgb = m[1];
-  const r = rgb.slice(0, 2), g = rgb.slice(2, 4), b = rgb.slice(4, 6);
-  return `&H00${b}${g}${r}`.toUpperCase();
-}
-function toAssTime(seconds) {
-  const total = Math.max(0, seconds);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor(total % 3600 / 60);
-  const s = Math.floor(total % 60);
-  const cs = Math.round((total - Math.floor(total)) * 100);
-  const carry = cs === 100 ? 1 : 0;
-  const cs2 = cs === 100 ? 0 : cs;
-  return `${h}:${String(m).padStart(2, "0")}:${String(s + carry).padStart(2, "0")}.${String(cs2).padStart(2, "0")}`;
-}
-function escapeAssText(text2) {
-  return text2.replace(/\\/g, "\\\\").replace(/\{/g, "\\{").replace(/\}/g, "\\}").replace(/\r?\n/g, " ").trim();
-}
+/* Caption layout and the ASS builder are shared with the editor preview. */
 function synthesiseWordTimings(text2, durationSeconds) {
   const words = text2.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0 || durationSeconds <= 0) return [];
@@ -2087,84 +2033,6 @@ function synthesiseWordTimings(text2, durationSeconds) {
     elapsed += span;
     return { word, start, end: Math.min(durationSeconds, elapsed) };
   });
-}
-function buildAssFile(words, style, clipDuration, synced = true, overlays = []) {
-  const s = { ...DEFAULT_CAPTION_STYLE, ...style };
-  const alignment = s.position === "top" ? 8 : s.position === "center" ? 5 : 2;
-  const marginV = s.position === "center" ? 0 : Math.round(CAPTION_CANVAS_H * 0.12);
-  const fontSize = Math.max(16, Math.round(s.fontSize));
-  const outlineWidth = s.outline ? Math.max(2, Math.round(fontSize * 0.09)) : 0;
-  const primary = toAssColor(s.color);
-  const highlight = toAssColor(s.highlightColor);
-  const header = [
-    "[Script Info]",
-    "ScriptType: v4.00+",
-    `PlayResX: ${CAPTION_CANVAS_W}`,
-    `PlayResY: ${CAPTION_CANVAS_H}`,
-    "WrapStyle: 0",
-    "ScaledBorderAndShadow: yes",
-    "YCbCr Matrix: TV.709",
-    "",
-    "[V4+ Styles]",
-    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: Default,${s.font},${fontSize},${primary},${primary},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,${outlineWidth},0,${alignment},60,60,${marginV},1`,
-    "Style: Overlay,Montserrat,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,5,60,60,0,1",
-    "",
-    "[Events]",
-    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
-  ];
-  const events = [];
-  if (synced) {
-    const MAX_WORD_SECONDS = 1.2;
-    const MIN_WORD_SECONDS = 0.12;
-    for (let i = 0; i < words.length; i++) {
-      const w = words[i];
-      const token = escapeAssText(w.word).toUpperCase();
-      if (!token) continue;
-      const anchor = resolveCaptionAnchor(s, w);
-      const posTag = anchor ? `{\\an5\\pos(${anchor.x},${anchor.y})}` : "";
-      const text2 = `${posTag}{\\c${highlight}}${token}{\\c${primary}}`;
-      const start = Math.max(0, w.start);
-      const nextStart = i + 1 < words.length ? words[i + 1].start : Infinity;
-      let end = Math.min(
-        w.end,
-        nextStart,
-        start + MAX_WORD_SECONDS,
-        clipDuration
-      );
-      if (end < start + MIN_WORD_SECONDS) {
-        end = Math.min(start + MIN_WORD_SECONDS, nextStart, clipDuration);
-      }
-      if (end <= start) continue;
-      events.push(`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text2}`);
-    }
-  } else {
-    const GROUP_SIZE = 3;
-    for (let g = 0; g < words.length; g += GROUP_SIZE) {
-      const group = words.slice(g, g + GROUP_SIZE);
-      if (group.length === 0) continue;
-      const phrase = group.map((gw) => escapeAssText(gw.word).toUpperCase()).filter(Boolean).join(" ");
-      if (!phrase) continue;
-      const anchor = resolveCaptionAnchor(s, group[0]);
-      const text2 = anchor ? `{\\an5\\pos(${anchor.x},${anchor.y})}${phrase}` : phrase;
-      const start = Math.max(0, group[0].start);
-      const nextStart = g + GROUP_SIZE < words.length ? words[g + GROUP_SIZE].start : clipDuration;
-      const end = Math.min(clipDuration, Math.max(start + 0.2, nextStart));
-      if (end <= start) continue;
-      events.push(`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text2}`);
-    }
-  }
-  for (const overlay of overlays) {
-    const end = Math.min(overlay.end, clipDuration);
-    if (end <= overlay.start || !overlay.text.trim()) continue;
-    const x = Math.round(overlay.posX * CAPTION_CANVAS_W);
-    const y = Math.round(overlay.posY * CAPTION_CANVAS_H);
-    const tag = `{\\an5\\pos(${x},${y})\\fs${overlay.fontSize}\\c${toAssColor(overlay.color)}}`;
-    events.push(`Dialogue: 1,${toAssTime(overlay.start)},${toAssTime(end)},Overlay,,0,0,0,,${tag}${escapeAssText(overlay.text)}`);
-  }
-  return `${header.join("\n")}
-${events.join("\n")}
-`;
 }
 function hasCaptions(words) {
   return Array.isArray(words) && words.length > 0;
@@ -2628,8 +2496,17 @@ async function hostVideo(opts) {
   await ensureDirs();
   const SECTION_BUFFER = 5;
   const offset = range ? Math.max(0, range.start - SECTION_BUFFER) : 0;
+  /* Resolution cap. A whole video is kept at 1080p so imports stay small. A
+   * short clip range may go higher: a 9:16 crop keeps only a third of a 16:9
+   * frame, so 1080p sources are enlarged 1.8x while 1440p needs 1.3x and 4K
+   * none at all. */
+  const envHeight = (name, fallback) => {
+    const n = Number(process.env[name]);
+    return Number.isFinite(n) && n >= 360 ? n : fallback;
+  };
+  const cap = Math.min(maxHeight, range ? envHeight("CLIP_MAKER_MAX_SECTION_HEIGHT", 1440) : envHeight("CLIP_MAKER_MAX_FULL_HEIGHT", 1080));
   const fullFileName = videoFileName(opts.videoId, `${sourceUrl}:full:h${maxHeight}`);
-  const sectionFileName = range ? videoFileName(opts.videoId, `${sourceUrl}:${range.start}-${range.end}:h${maxHeight}`) : fullFileName;
+  const sectionFileName = range ? videoFileName(opts.videoId, `${sourceUrl}:${range.start}-${range.end}:h${maxHeight}:c${cap}`) : fullFileName;
   const describe = async (name, hostedOffset) => {
     const p = path5.join(VIDEOS_DIR, name);
     const stat = await fs6.stat(p).catch(() => null);
@@ -2637,7 +2514,7 @@ async function hostVideo(opts) {
     const meta = await probeMedia(p).catch(() => ({ duration: 0, width: 0, height: 0 }));
     return { fileName: name, url: urlFor("video", name), bytes: stat.size, offset: hostedOffset, ...meta };
   };
-  const cachedFull = await describe(fullFileName, 0);
+  const cachedFull = opts.sectionOnly ? null : await describe(fullFileName, 0);
   if (cachedFull) return cachedFull;
   const cachedSection = range ? await describe(sectionFileName, offset) : null;
   if (cachedSection) return cachedSection;
@@ -2654,23 +2531,16 @@ async function hostVideo(opts) {
    * unavailable 1440p/4K streams: the first available level is 1080p, then
    * 720p, 480p, and finally 360p. The last selector remains only as a
    * last-resort "do not get stuck" option for unusual source platforms. */
-  const qualityLadder = [1080, 720, 480, 360].filter((height) => height <= maxHeight);
-  const adaptiveFormatSelector = [
-    ...qualityLadder.flatMap((height) => [
-      `bv*[height=${height}][vcodec^=avc1]+ba[acodec^=mp4a]`,
-      `bv*[height=${height}]+ba`,
-      `b[height=${height}]`
-    ]),
-    "b[height<=360]",
-    "b"
-  ].join("/");
+  /* Formats are chosen by yt-dlp's resolution sort, not by exact heights.
+   * Exact matches (height=1080, 720, ...) missed every source that is not a
+   * standard 16:9 size - vertical videos (1080x1920), cinema crops (1920x804),
+   * 540p uploads - and dropped those straight to 360p. "res" is the smaller
+   * side, so a vertical 1080x1920 counts as 1080. */
+  const adaptiveFormatSelector = "bv*+ba/b";
   const compatibleFormatSelector = [
-    ...qualityLadder.flatMap((height) => [
-      `b[ext=mp4][height=${height}]`,
-      `b[height=${height}]`
-    ]),
-    "b[ext=mp4][height<=360]",
-    "b[height<=360]",
+    `b[ext=mp4][height<=${cap}]`,
+    `b[height<=${cap}]`,
+    "b[ext=mp4]",
     "b"
   ].join("/");
   try {
@@ -2699,9 +2569,9 @@ async function hostVideo(opts) {
        */
       "-f",
       adaptiveFormatSelector,
-      /* Each fallback has an exact height, so only sort within that level. */
+      /* Largest resolution up to the cap, then frame rate, then H.264/AAC. */
       "-S",
-      ["fps", "codec:avc:m4a", "vbr", "abr"].join(","),
+      ["hdr:SDR", `res:${cap}`, "fps", "codec:avc:m4a", "vbr", "abr"].join(","),
       "--merge-output-format",
       "mp4",
       "--ffmpeg-location",
@@ -2810,6 +2680,8 @@ async function hostVideo(opts) {
       try {
         await downloadFull();
       } catch (err) {
+        /* A sharper-source attempt has a usable import to fall back on. */
+        if (opts.noFallback) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         if (/403|Forbidden|requested format|no video formats|format is not available|no downloadable|SABR/i.test(msg)) {
           console.warn(`[Host] Preferred adaptive format was unavailable. Downloading one stable public muxed MP4 source before local normalization to avoid the FFmpeg section-cut failure...`);
@@ -3410,6 +3282,36 @@ function detectFontSubstitution(ffmpegLog, requestedFont) {
 }
 
 // server/routers.ts
+/**
+ * A higher-resolution copy of just this clip's range, when the imported file
+ * is 1080p or less and the source can supply more. The import is what the
+ * editor previews, so it stays small; the export is where sharpness matters.
+ * Returns null (render from the import) when nothing better is available.
+ */
+async function sharperSectionFor(video, clip, hostedPath) {
+  if (process.env.CLIP_MAKER_HQ_SECTIONS === "0") return null;
+  if (video.sourceType !== "url" || !/^https?:\/\//i.test(video.sourceUrl ?? "")) return null;
+  if (clip.endTime - clip.startTime > 180) return null;
+  try {
+    const current = await probeMedia(hostedPath).catch(() => null);
+    const currentRes = current ? Math.min(current.width, current.height) : 0;
+    if (currentRes >= 1400) return null;
+    const result = await hostVideo({
+      videoId: video.id,
+      sourceUrl: video.sourceUrl,
+      range: { start: clip.startTime, end: clip.endTime },
+      maxHeight: 2160,
+      sectionOnly: true,
+      noFallback: true
+    });
+    if (Math.min(result.width, result.height) < currentRes * 1.15) return null;
+    console.log(`[Render] Clip ${clip.id}: using a ${result.width}x${result.height} source section instead of the ${current?.width}x${current?.height} import.`);
+    return { path: localPathFromUrl(result.url), offset: result.offset };
+  } catch (error) {
+    console.warn(`[Render] Clip ${clip.id}: no sharper source section (${String(error?.message ?? error).slice(0, 160)}); rendering from the import.`);
+    return null;
+  }
+}
 async function captionsForClip(clip, video) {
   const saved = await getSubtitleByClip(clip.id);
   return buildClipCaptions({
@@ -4040,12 +3942,15 @@ var appRouter = router({
               `[Render] Clip ${clip.id} has no captions to burn in (video ${video.id} transcript ${video.transcript ? "present" : "missing"})`
             );
           }
+          const sharper = renderProfile === "standard"
+            ? await sharperSectionFor(video, clip, actualHostedPath)
+            : null;
           const result = await renderClipFromHosted({
             clipId: clip.id,
-            hostedPath: actualHostedPath,
+            hostedPath: sharper?.path ?? actualHostedPath,
             startTime: clip.startTime,
             endTime: clip.endTime,
-            hostedOffset: actualHostedOffset,
+            hostedOffset: sharper?.offset ?? actualHostedOffset,
             crop,
             // Time-varying framing, when the clip has a timeline.
             segments: clip.framingSegments,
@@ -4201,6 +4106,47 @@ var appRouter = router({
      * POST /api/trpc/clips.delete
      * Removes a clip, its subtitles, and its rendered file.
      */
+    /**
+     * POST /api/trpc/clips.autoFrame
+     * Chooses the 9:16 framing for a clip by following the speaker's face
+     * (scripts/auto_frame.py) and stores it as the clip's framing timeline.
+     */
+    autoFrame: protectedProcedure.input(z4.object({ id: z4.number() })).mutation(async ({ input, ctx }) => {
+      const clip = await getClipById(input.id, ctx.user.id);
+      if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
+      const video = await getVideoById(clip.videoId, ctx.user.id);
+      const hostedPath = video && video.hostedStatus === "ready" ? localPathFromUrl(video.hostedUrl) : null;
+      const meta = hostedPath ? await probeMedia(hostedPath).catch(() => null) : null;
+      const offset = video?.hostedOffset ?? 0;
+      const duration = (clip.endTime ?? 0) - (clip.startTime ?? 0);
+      if (!meta || !(duration > 0) || clip.startTime < offset - 0.15 || clip.endTime > offset + meta.duration + 0.15) {
+        throw new TRPCError5({ code: "PRECONDITION_FAILED", message: "Import the video for this clip first, then reframe it." });
+      }
+      const ffmpeg = await findFfmpeg();
+      if (!ffmpeg) throw new TRPCError5({ code: "PRECONDITION_FAILED", message: FFMPEG_MISSING });
+      let result;
+      try {
+        const { stdout } = await promisify(execFile)(
+          process.env.AUTO_FRAME_PYTHON ?? WHISPER_PYTHON,
+          [
+            path3.join(process.cwd(), "scripts", "auto_frame.py"), hostedPath,
+            String(Math.max(0, clip.startTime - offset)), String(duration), String(meta.width), String(meta.height)
+          ],
+          { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
+        );
+        result = JSON.parse(stdout);
+      } catch (error) {
+        console.warn("[AutoFrame] failed:", String(error.stderr || error.message).slice(0, 400));
+        throw new TRPCError5({ code: "INTERNAL_SERVER_ERROR", message: "AI reframing could not analyse this clip. The server needs Python with numpy and onnxruntime." });
+      }
+      const segments = Array.isArray(result.segments) ? result.segments : [];
+      /* Too few faces to trust: leave the user's framing alone. */
+      const found = segments.length > 0 && (result.faceCoverage ?? 0) >= 0.15;
+      if (found) {
+        await updateClip(clip.id, { framingSegments: segments, zoom: 1, offsetX: 0, offsetY: 0 });
+      }
+      return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null };
+    }),
     delete: protectedProcedure.input(z4.object({ id: z4.number() })).mutation(async ({ input, ctx }) => {
       const clip = await getClipById(input.id, ctx.user.id);
       if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
@@ -4287,6 +4233,8 @@ var appRouter = router({
         posY: z4.number().min(0).max(100).optional()
       })).optional(),
       style: z4.object({
+        preset: z4.enum(CAPTION_PRESET_IDS).optional(),
+        uppercase: z4.boolean().optional(),
         font: z4.string().optional(),
         fontSize: z4.number().optional(),
         color: z4.string().optional(),

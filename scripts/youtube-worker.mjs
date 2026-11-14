@@ -59,11 +59,11 @@ async function processJob({ id, videoId, kind, range, language }) {
     }
     const { filepath, ...info } = JSON.parse(stdout);
     const selectedLanguage = language && language !== "auto" ? language : info.language || "auto";
-    if (audio && (selectedLanguage === "ar-ma" || info.duration >= 600)) {
+    if (audio && (/^ar\b/.test(selectedLanguage) || info.duration >= 600)) {
       await request(`${id}/transcribing`);
       const subprocess = run(process.env.WHISPER_PYTHON || "python3", [
         fileURLToPath(new URL("./whisper_words.py", import.meta.url)),
-        filepath, selectedLanguage, "base",
+        filepath, selectedLanguage, workerEnv.WHISPER_MODEL || "base",
       ], { timeout: 2_400_000, maxBuffer: 8 * 1024 * 1024, env: {
         ...workerEnv, CLIP_MAKER_WHISPER_ACCELERATE: workerEnv.CLIP_MAKER_WHISPER_ACCELERATE ?? "1",
         CLIP_MAKER_WHISPER_PROGRESS: "1",

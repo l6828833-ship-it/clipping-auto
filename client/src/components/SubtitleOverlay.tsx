@@ -1,4 +1,9 @@
 import { useRef, useState } from "react";
+import {
+  CAPTION_PRESETS, CAPTION_PRESET_IDS, ARABIC_FONTS, captionAt, captionFitScale, captionFontFor,
+  contrastOn, displayWord, groupCaptionWords, resolveCaptionStyle,
+  type CaptionPresetId, type CaptionStyle, type CaptionWord,
+} from "@shared/captions.mjs";
 
 /**
  * Caption overlay drawn on top of our own player.
@@ -19,21 +24,11 @@ import { useRef, useState } from "react";
 /** Width of the export canvas the styling is authored against. */
 export const CAPTION_CANVAS_W = 1080;
 
-export type SubtitleStyle = {
-  font: string;
-  /** Pixel height on a 1080-wide canvas. */
-  fontSize: number;
-  color: string;
-  highlightColor: string;
-  /** Vertical preset, used when no free position is set. */
-  position: "top" | "center" | "bottom";
-  outline: boolean;
-  /** Free position as a percentage of the frame (0-100), to the text centre. */
-  posX?: number;
-  posY?: number;
-};
+/** Shared with the renderer, so the preview and the export cannot disagree. */
+export type SubtitleStyle = CaptionStyle;
 
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
+  preset: "pop",
   font: "Montserrat",
   fontSize: 72,
   color: "#FFFFFF",
@@ -41,6 +36,46 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
   position: "bottom",
   outline: true,
 };
+
+/** Fonts offered for captions. The last two contain Arabic letters. */
+export const CAPTION_FONTS = ["Montserrat", "Oswald", "Inter", "Impact", "Arial Black", ...ARABIC_FONTS];
+
+/**
+ * What is on screen at `t` seconds into the clip: the words of the current
+ * line, which of them is being spoken, and that word's index in `words`.
+ * Uses the same line-splitting as the burned-in captions.
+ */
+export function captionFrame(words: CaptionWord[], style: SubtitleStyle, t: number) {
+  const hit = captionAt(groupCaptionWords(words, style), t);
+  if (!hit) return null;
+  return {
+    words: hit.group.words.map(w => w.text),
+    activeIndex: hit.activeIndex,
+    wordIndex: hit.group.words[hit.activeIndex].index,
+    /** Index of the line's first word; per-caption positions are stored on it. */
+    anchorIndex: hit.group.words[0].index,
+  };
+}
+
+/** Buttons for choosing the caption design. */
+export function CaptionPresetPicker({ value, onChange }: {
+  value: CaptionPresetId | undefined;
+  onChange: (preset: CaptionPresetId) => void;
+}) {
+  const current = value ?? "pop";
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      {CAPTION_PRESET_IDS.map(id => (
+        <button key={id} type="button" onClick={() => onChange(id)}
+          className={`rounded-lg px-3 py-2 text-left transition-all ${current === id ? "text-white" : "text-muted-foreground hover:text-foreground bg-secondary/60"}`}
+          style={current === id ? { background: "var(--cobalt)" } : {}}>
+          <span className="block text-xs font-semibold">{CAPTION_PRESETS[id].label}</span>
+          <span className="block text-[10px] opacity-80">{CAPTION_PRESETS[id].hint}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 /** Font size limits offered by the styling UI, in export pixels. */
 export const MIN_FONT_SIZE = 32;
@@ -84,12 +119,28 @@ export function SubtitleOverlay({
 
   if (words.length === 0) return null;
 
+  const resolved = resolveCaptionStyle(style);
+  const preset = resolved.preset;
+  /* Show one line's worth: callers that pass a sample of several words still
+   * get the design's real line length. */
+  const perLine = CAPTION_PRESETS[preset].wordsPerLine;
+  const lineStart = Math.floor(Math.max(0, activeIndex) / perLine) * perLine;
+  const shown = words.slice(lineStart, lineStart + perLine).map(w => displayWord(w, resolved)).filter(Boolean);
+  const activeShown = activeIndex - lineStart;
+  if (shown.length === 0) return null;
+  const lineText = shown.join(" ");
+  const fit = captionFitScale(lineText, resolved);
+  const family = captionFontFor(resolved, lineText);
+
   const anchor = captionAnchor(style, positionOverride);
   const draggable = !!onPositionChange;
 
-  const fontSize = `${(style.fontSize / CAPTION_CANVAS_W) * 100}cqw`;
+  const cqw = (px: number) => `${(px / CAPTION_CANVAS_W) * 100}cqw`;
+  const fontSize = cqw(style.fontSize * fit);
   // Outline thickness tracks the ASS outline (9% of font size).
-  const outline = `${(style.fontSize * 0.09 / CAPTION_CANVAS_W) * 100}cqw`;
+  const outline = cqw(style.fontSize * 0.09);
+  const stroke = `0 0 ${outline} #000, ${outline} ${outline} 0 #000, -${outline} -${outline} 0 #000, ${outline} -${outline} 0 #000, -${outline} ${outline} 0 #000`;
+  const pad = cqw(Math.max(6, style.fontSize * 0.14));
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (!draggable) return;
@@ -146,25 +197,30 @@ export function SubtitleOverlay({
         />
       )}
 
-      <div dir="auto" className="inline-flex flex-wrap justify-center items-baseline gap-x-[0.25em] gap-y-[0.1em]">
-        {words.map((word, i) => (
-          <span
-            key={`${word}-${i}`}
-            onClick={onWordClick ? () => onWordClick(i) : undefined}
-            className={`font-black uppercase leading-tight transition-colors duration-150 ${onWordClick ? "cursor-pointer" : ""}`}
-            style={{
-              fontFamily: `${style.font}, Montserrat, sans-serif`,
-              fontSize,
-              color: i === activeIndex ? style.highlightColor : style.color,
-              // Approximates libass's stroke with a ring of shadows.
-              textShadow: style.outline
-                ? `0 0 ${outline} #000, ${outline} ${outline} 0 #000, -${outline} -${outline} 0 #000, ${outline} -${outline} 0 #000, -${outline} ${outline} 0 #000`
-                : "none",
-            }}
-          >
-            {word}
-          </span>
-        ))}
+      <div dir="auto" className="inline-flex flex-nowrap whitespace-nowrap justify-center items-baseline gap-x-[0.25em]"
+        style={preset === "clean" ? { background: "rgba(0,0,0,0.65)", padding: pad } : undefined}>
+        {shown.map((word, i) => {
+          const active = i === activeShown;
+          const boxed = active && preset === "box";
+          return (
+            <span
+              key={`${word}-${i}`}
+              onClick={onWordClick ? () => onWordClick(perLine === 1 ? (activeIndex + 1) % words.length : lineStart + i) : undefined}
+              className={`font-bold leading-tight transition-colors duration-150 ${onWordClick ? "cursor-pointer" : ""}`}
+              style={{
+                fontFamily: `"${family}", Montserrat, sans-serif`,
+                fontSize: active && preset === "impact" ? `calc(${fontSize} * 1.15)` : fontSize,
+                color: boxed ? contrastOn(style.highlightColor) : active ? style.highlightColor : style.color,
+                background: boxed ? style.highlightColor : undefined,
+                boxShadow: boxed ? `0 0 0 ${pad} ${style.highlightColor}` : undefined,
+                // Approximates libass's stroke with a ring of shadows.
+                textShadow: style.outline && !boxed && preset !== "clean" ? stroke : "none",
+              }}
+            >
+              {word}
+            </span>
+          );
+        })}
       </div>
     </div>
   );

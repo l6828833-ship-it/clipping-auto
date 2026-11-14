@@ -10,9 +10,19 @@ match what the editor shows.
 | `Montserrat-Bold.ttf` | Montserrat | [google/fonts](https://github.com/google/fonts/tree/main/ofl/montserrat) | SIL Open Font License 1.1 |
 | `Oswald-Bold.ttf` | Oswald | [google/fonts](https://github.com/google/fonts/tree/main/ofl/oswald) | SIL Open Font License 1.1 |
 | `Inter-Bold.ttf` | Inter | [google/fonts](https://github.com/google/fonts/tree/main/ofl/inter) | SIL Open Font License 1.1 |
+| `Tajawal-Bold.ttf` | Tajawal (Arabic + Latin) | [google/fonts](https://github.com/google/fonts/tree/main/ofl/tajawal) | SIL Open Font License 1.1 |
+| `Almarai-Bold.ttf` | Almarai (Arabic + Latin) | [google/fonts](https://github.com/google/fonts/tree/main/ofl/almarai) | SIL Open Font License 1.1 |
 
-All three are licensed under the [SIL Open Font License 1.1](https://openfontlicense.org/),
+All of them are licensed under the [SIL Open Font License 1.1](https://openfontlicense.org/),
 which permits bundling and redistribution with software.
+
+## Arabic captions
+
+Montserrat, Oswald, Inter, Impact and Arial Black have no Arabic letters. When a
+caption contains Arabic, `captionFontFor` in `shared/captions.mjs` switches it
+to Tajawal (or Almarai, if that is the chosen font), so libass never has to
+guess a substitute. Both families also cover Latin, which keeps mixed
+Darija/French lines in one typeface.
 
 `Impact` and `Arial Black` are not bundled: they ship with Windows and macOS and
 are not redistributable. On a server without them, libass falls back — the

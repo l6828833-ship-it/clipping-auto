@@ -20,6 +20,10 @@ Rundploy advertises GitHub and folder uploads. Docker builds and persistent volu
 
 The image includes OpenAI Whisper and its multilingual `base` model. When a source has no usable captions, the server downloads its audio and transcribes it on the CPU. Selecting Moroccan Darija uses a [Darija-trained Whisper model](https://huggingface.co/Anass-Srk/fine-tuned-whisper-small-darija) and timed words from the source audio. Allocate 4 GiB for server-side Darija transcription and allow background analysis to finish before stopping the instance. The Inworld key is used for AI highlights.
 
+Arabic and Darija accuracy depends on the model. `scripts/whisper_words.py` picks it from the machine's memory: 8 GiB or more uses `large-v3-turbo` for Arabic and Darija (downloaded on first use, about 1.5 GB); less than that keeps the Darija fine-tune for Darija and uses `small` (4 GiB) or `WHISPER_MODEL` for Arabic. Override with `WHISPER_MODEL_ARABIC` or `WHISPER_MODEL_DARIJA` (`darija-finetune` selects the fine-tune). On a small instance, run the download worker on a Mac instead: it transcribes all Arabic sources locally on the Apple GPU.
+
+Rendered clips fetch their own source range at up to 1440p (`CLIP_MAKER_MAX_SECTION_HEIGHT`, set `2160` for 4K or `CLIP_MAKER_HQ_SECTIONS=0` to render from the 1080p import only). A 9:16 crop keeps a third of a 16:9 frame, so the extra resolution is what keeps exports sharp.
+
 ### YouTube blocks the server's downloads
 
 If the logs show “Sign in to confirm you’re not a bot,” set `YTDLP_YOUTUBE_PROXY` as a Rundploy runtime secret to an HTTP CONNECT proxy you control and that can reach YouTube. Use `http://host:port` or `http://username:password@host:port`. Redeploy and try the same video again. The web app uses this connection for YouTube metadata, source audio, and video downloads. Whisper still runs in the app container.
