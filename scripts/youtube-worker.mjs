@@ -109,7 +109,14 @@ async function processJob({ id, videoId, kind, range, language }) {
     if (!response.ok) throw new Error(`Rundploy rejected the media upload (HTTP ${response.status}).`);
     console.log(`Sent ${kind} for ${videoId}.`);
   } catch (error) {
-    console.warn(`YouTube job ${videoId} failed:`, String(error.stderr || error.message).slice(-500));
+    /* Say how a child process ended, not only what it printed: a process
+     * that is killed or times out leaves nothing useful on stderr. */
+    const ending = [
+      error.killed ? "killed (timeout)" : "",
+      error.signal ? `signal ${error.signal}` : "",
+      error.code != null ? `exit ${error.code}` : "",
+    ].filter(Boolean).join(", ");
+    console.warn(`YouTube job ${videoId} failed${ending ? ` [${ending}]` : ""}:`, String(error.stderr || error.message).slice(-500));
     await request(`${id}/failed`).catch(() => {});
   } finally {
     await rm(directory, { recursive: true, force: true });
