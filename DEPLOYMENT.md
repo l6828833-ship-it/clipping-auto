@@ -22,6 +22,8 @@ The image includes OpenAI Whisper and its multilingual `base` model. When a sour
 
 Arabic and Darija accuracy depends on the model. `scripts/whisper_words.py` picks it from the machine's memory: 8 GiB or more uses `large-v3-turbo` for Arabic and Darija (downloaded on first use, about 1.5 GB); less than that keeps the Darija fine-tune for Darija and uses `small` (4 GiB) or `WHISPER_MODEL` for Arabic. Override with `WHISPER_MODEL_ARABIC` or `WHISPER_MODEL_DARIJA` (`darija-finetune` selects the fine-tune). On a small instance, run the download worker on a Mac instead: it transcribes all Arabic sources locally on the Apple GPU.
 
+Jump cuts ("Tighten") are stored in a new nullable `clips.cuts` column (migration `0002_clip_cuts`). The server also adds it on start-up with `ADD COLUMN IF NOT EXISTS`, so a deploy works before `npm run db:migrate` has been run. AI reframing needs `onnxruntime` (in `scripts/requirements-whisper.txt`) and `assets/models/face-rfb-320.onnx`.
+
 Rendered clips fetch their own source range at up to 1440p (`CLIP_MAKER_MAX_SECTION_HEIGHT`, set `2160` for 4K or `CLIP_MAKER_HQ_SECTIONS=0` to render from the 1080p import only). A 9:16 crop keeps a third of a 16:9 frame, so the extra resolution is what keeps exports sharp.
 
 ### YouTube blocks the server's downloads

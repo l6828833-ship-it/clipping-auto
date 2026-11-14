@@ -227,6 +227,7 @@ export function ClipTimeline({
   words = [],
   onWordsChange,
   playheadSeconds,
+  cuts,
   onScrub,
   baseFraming,
   editingKeyframe = "from",
@@ -246,6 +247,8 @@ export function ClipTimeline({
   words?: TimelineWord[];
   onWordsChange?: (next: TimelineWord[]) => void;
   playheadSeconds?: number;
+  /** Jump cuts (clip seconds): shown hatched, as they are left out of the export. */
+  cuts?: { start: number; end: number }[];
   onScrub?: (seconds: number) => void;
   /** Framing used for the clip when no segments exist yet. */
   baseFraming: Crop;
@@ -1034,6 +1037,22 @@ export function ClipTimeline({
                 );
               })()}
             </div>
+
+            {/* Jump cuts: parts removed from the export */}
+            {cuts?.map((cut, i) => (
+              <div
+                key={`cut-${i}`}
+                title={`Cut from the export (${(cut.end - cut.start).toFixed(1)}s)`}
+                className="absolute top-0 bottom-0 pointer-events-none z-20"
+                style={{
+                  left: xOf(cut.start),
+                  width: Math.max(2, xOf(cut.end) - xOf(cut.start)),
+                  background: "repeating-linear-gradient(45deg, rgba(221,125,113,0.38) 0 6px, rgba(221,125,113,0.14) 6px 12px)",
+                  borderLeft: "1px solid var(--coral)",
+                  borderRight: "1px solid var(--coral)",
+                }}
+              />
+            ))}
 
             {/* Playhead, spanning every lane */}
             {playheadSeconds != null && (
