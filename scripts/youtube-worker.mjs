@@ -35,24 +35,49 @@ async function processJob({ id, videoId, kind, range, language }) {
   try {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     const audio = kind === "audio";
-    const format = audio
-      ? ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "64K"]
-      : ["-f", "b[height<=720][ext=mp4]/b[height<=480]/b"];
-    const { stdout } = await run(ytDlp, [
+    const section = !audio && range && Number.isFinite(range.start) && Number.isFinite(range.duration) && range.duration > 0;
+    const format = audio ? "ba[ext=m4a]/ba/b" : "bv[height<=480][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[height<=720][ext=mp4]/b";
+    const ytArgs = [
       "--ignore-config", "--no-playlist", "--no-progress", "--socket-timeout", "15", "--retries", "1",
-      "--js-runtimes", `node:${process.execPath}`, "--max-filesize", "350M", ...format,
+      "--js-runtimes", `node:${process.execPath}`, "--max-filesize", "350M", "--check-formats", "-f", format,
       ...(process.env.CLIP_MAKER_FFMPEG ? ["--ffmpeg-location", ffmpeg] : []),
       "--print", "after_move:%(.{title,duration,uploader,language,filepath})j",
-      "-o", path.join(directory, "download.%(ext)s"), "--", url,
-    ], { timeout: 180_000, maxBuffer: 1024 * 1024 });
+    ];
+    const download = (stem, extra = []) => run(ytDlp, [
+      ...ytArgs, ...extra, "-o", path.join(directory, `${stem}.%(ext)s`), "--", url,
+    ], { timeout: 180_000, maxBuffer: 1024 * 1024, env: workerEnv });
+    let downloadedSection = false;
+    let stdout;
+    try {
+      const sectionArgs = section ? ["--download-sections", `*${Math.max(0, range.start)}-${Math.max(0, range.start) + range.duration}`, "--merge-output-format", "mp4"] : [];
+      ({ stdout } = await download("download", sectionArgs));
+      if (!stdout.trim()) throw new Error("YouTube returned no downloadable stream.");
+      downloadedSection = Boolean(section);
+    } catch (error) {
+      if (!section) throw error;
+      ({ stdout } = await download("fallback", ["-f", "b[height<=720][ext=mp4]/b[height<=480]/b"]));
+    }
     const { filepath, ...info } = JSON.parse(stdout);
     const selectedLanguage = language && language !== "auto" ? language : info.language || "auto";
     if (audio && (selectedLanguage === "ar-ma" || info.duration >= 600)) {
       await request(`${id}/transcribing`);
-      const { stdout: words } = await run(process.env.WHISPER_PYTHON || "python3", [
+      const subprocess = run(process.env.WHISPER_PYTHON || "python3", [
         fileURLToPath(new URL("./whisper_words.py", import.meta.url)),
         filepath, selectedLanguage, "base",
-      ], { timeout: 660_000, maxBuffer: 4 * 1024 * 1024, env: workerEnv });
+      ], { timeout: 2_400_000, maxBuffer: 8 * 1024 * 1024, env: {
+        ...workerEnv, CLIP_MAKER_WHISPER_ACCELERATE: workerEnv.CLIP_MAKER_WHISPER_ACCELERATE ?? "1",
+        CLIP_MAKER_WHISPER_PROGRESS: "1",
+      } });
+      let progressBuffer = "";
+      subprocess.child.stderr?.setEncoding("utf8").on("data", chunk => {
+        const lines = (progressBuffer + chunk).split("\n");
+        progressBuffer = lines.pop();
+        for (const line of lines) {
+          const progress = /^clip-maker-progress:(\d+(?:\.\d+)?)$/.exec(line)?.[1];
+          if (progress) void request(`${id}/transcribing?progress=${progress}`).catch(() => {});
+        }
+      });
+      const { stdout: words } = await subprocess;
       const response = await request(`${id}/transcript`, {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ metadata: info, transcript: JSON.parse(words) }),
@@ -62,12 +87,14 @@ async function processJob({ id, videoId, kind, range, language }) {
       return;
     }
     let output = filepath;
-    if (!audio) {
+    if (audio) {
+      output = path.join(directory, "source.mp3");
+      await run(ffmpeg, ["-nostdin", "-loglevel", "error", "-i", filepath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", "-y", output], { timeout: 90_000 });
+    } else {
       output = path.join(directory, "source.mp4");
-      const rangeArgs = range && Number.isFinite(range.start) && Number.isFinite(range.duration)
-        ? ["-ss", String(Math.max(0, range.start)), "-t", String(range.duration)] : [];
+      const rangeArgs = section && !downloadedSection ? ["-ss", String(Math.max(0, range.start))] : [];
       await run(ffmpeg, [
-        "-nostdin", "-loglevel", "error", ...rangeArgs, "-i", filepath,
+        "-nostdin", "-loglevel", "error", ...rangeArgs, "-i", filepath, ...(section ? ["-t", String(range.duration)] : []),
         "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-movflags", "+faststart", "-y", output,
       ], { timeout: 90_000, maxBuffer: 1024 * 1024 });
