@@ -4,6 +4,7 @@ import { rename, rm } from "node:fs/promises";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import express from "express";
+import { hostedSttAvailable } from "./hosted-stt.mjs";
 
 const prefix = "/api/internal/youtube-worker";
 const maxBytes = 28 * 1024 * 1024;
@@ -60,7 +61,9 @@ export function registerYouTubeWorker(app) {
     for (const [id, job] of jobs) {
       if (job.state !== "waiting") continue;
       job.state = "claimed";
-      return res.json({ id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language });
+      /* With hosted transcription the worker only fetches the audio; the
+       * server transcribes it. Otherwise the worker may run Whisper itself. */
+      return res.json({ id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: !hostedSttAvailable() });
     }
     return res.sendStatus(204);
   });

@@ -4,7 +4,8 @@ import express2 from "express";
 import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
-import { totalmem } from "os";
+import { totalmem, tmpdir as systemTmpdir } from "os";
+import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildHighlightPrompts, clipCountFor, countOnPeaks, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
@@ -1006,6 +1007,24 @@ async function localWhisperWords(audioPath, language = "auto") {
   ).map((w) => ({ word: w.word.trim(), start: w.start, end: w.end }));
   return { text: typeof parsed.text === "string" ? parsed.text.trim() : "", words };
 }
+/**
+ * Word-timed transcript for an audio file: the hosted speech API when the
+ * server has a key for it, local Whisper otherwise or if the API fails.
+ */
+async function transcribeWords(audioPath, language = "auto") {
+  if (hostedSttAvailable()) {
+    try {
+      const hosted = await hostedWords({ audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir() });
+      if (hosted) {
+        console.log(`[STT] Hosted transcription (${hosted.model}): ${hosted.words.length} words.`);
+        return { text: hosted.text, words: hosted.words };
+      }
+    } catch (error) {
+      console.warn("[STT] Hosted transcription failed, using local Whisper:", String(error.message ?? error).slice(0, 300));
+    }
+  }
+  return localWhisperWords(audioPath, language);
+}
 var FFMPEG_MISSING = "ffmpeg is not installed on the server. Install it with `winget install Gyan.FFmpeg` (or your package manager) and restart the dev server.";
 function q(value) {
   return value.includes(" ") ? `"${value}"` : value;
@@ -1298,7 +1317,7 @@ async function transcribeSource(input, reportStage = () => {}) {
   /* YouTube's automatic Arabic captions are weak and carry no usable word
    * timings. When this machine can run the large Whisper model (the same RAM
    * rule as scripts/whisper_words.py), Arabic goes straight to Whisper. */
-  const whisperFirst = language === "ar-ma" || (/^ar\b/.test(language) && totalmem() >= 7.5 * 2 ** 30);
+  const whisperFirst = language === "ar-ma" || (/^ar\b/.test(language) && (hostedSttAvailable() || totalmem() >= 7.5 * 2 ** 30));
   const captions = whisperFirst ? null : await tryYouTubeTranscript(url, language);
   if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
@@ -1334,7 +1353,7 @@ async function transcribeSource(input, reportStage = () => {}) {
     }
     reportStage("transcribing");
     try {
-      const { text, words } = await localWhisperWords(audioPath, language);
+      const { text, words } = await transcribeWords(audioPath, language);
       if (text && words.length) return result("whisper", text, words);
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {
@@ -3984,7 +4003,7 @@ var appRouter = router({
               const seekStart = Math.max(0, clip.startTime - actualHostedOffset);
               const duration = clip.endTime - clip.startTime;
               audioPath = await extractAudioRange(actualHostedPath, seekStart, duration);
-              const { words } = await localWhisperWords(audioPath, video.captionLanguage);
+              const { words } = await transcribeWords(audioPath, video.captionLanguage);
               if (words.length) {
                 const saved = await getSubtitleByClip(clip.id);
                 finalCaptions = { words, style: saved?.style ?? DEFAULT_CAPTION_STYLE };
@@ -4164,7 +4183,7 @@ var appRouter = router({
       let audioPath = null;
       try {
         audioPath = await extractAudioRange(hostedPath, localStart, duration);
-        const local = await localWhisperWords(audioPath, input.language ?? video.captionLanguage);
+        const local = await transcribeWords(audioPath, input.language ?? video.captionLanguage);
         if (!local.words.length) {
           throw new TRPCError5({ code: "BAD_REQUEST", message: "Whisper didn’t detect speech in this clip." });
         }
@@ -4617,7 +4636,7 @@ async function startServer() {
   registerMediaRoutes(app);
   registerMediaUpload(app, {
     authenticate: req => sdk.authenticateRequest(req),
-    ensureDirs, findFfmpeg, probeMedia, transcribe: localWhisperWords,
+    ensureDirs, findFfmpeg, probeMedia, transcribe: transcribeWords,
     storeVideo: createVideo, videoDirectory: VIDEOS_DIR, workDirectory: RENDER_TMP_DIR
   });
   registerReelRoutes(app, {

@@ -81,7 +81,7 @@ const STAGE_LABELS: Record<Stage, string> = {
   "fetching-info": "Fetching video info…",
   "checking-captions": "Checking for YouTube captions…",
   downloading: "Downloading source audio…",
-  transcribing: "Transcribing with local Whisper…",
+  transcribing: "Transcribing the audio…",
   uploading: "Uploading and preparing your file…",
   done: "Transcript ready!",
   error: "Extraction failed",

@@ -5,7 +5,7 @@
   "license": "MIT",
   "scripts": {
     "dev": "vite --host",
-    "build": "node --check dist/index.js && node --check server/media-upload.mjs && node --check server/reels.mjs && node --check server/highlights.mjs && node --check server/cuts.mjs && python3 -m py_compile scripts/auto_frame.py scripts/whisper_words.py && node --check shared/captions.mjs && node --check server/native-youtube.mjs && node --check server/youtube-worker.mjs && node --check scripts/youtube-worker.mjs && vite build",
+    "build": "node --check dist/index.js && node --check server/media-upload.mjs && node --check server/reels.mjs && node --check server/highlights.mjs && node --check server/cuts.mjs && node --check server/hosted-stt.mjs && python3 -m py_compile scripts/auto_frame.py scripts/whisper_words.py && node --check shared/captions.mjs && node --check server/native-youtube.mjs && node --check server/youtube-worker.mjs && node --check scripts/youtube-worker.mjs && vite build",
     "youtube:worker": "node scripts/youtube-worker.mjs",
     "start": "NODE_ENV=production node dist/index.js",
     "check": "tsc --noEmit",

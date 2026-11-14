@@ -29,7 +29,7 @@ async function request(endpoint, options = {}) {
   });
 }
 
-async function processJob({ id, videoId, kind, range, language }) {
+async function processJob({ id, videoId, kind, range, language, transcribe }) {
   if (!/^[0-9a-f-]{36}$/i.test(id) || !/^[A-Za-z0-9_-]{11}$/.test(videoId) || !["audio", "video"].includes(kind)) return;
   const directory = await mkdtemp(path.join(tmpdir(), "clip-maker-worker-"));
   try {
@@ -59,7 +59,9 @@ async function processJob({ id, videoId, kind, range, language }) {
     }
     const { filepath, ...info } = JSON.parse(stdout);
     const selectedLanguage = language && language !== "auto" ? language : info.language || "auto";
-    if (audio && (/^ar\b/.test(selectedLanguage) || info.duration >= 600)) {
+    /* `transcribe: false` means the server transcribes (hosted speech API),
+     * so this machine only has to deliver the audio. */
+    if (audio && transcribe !== false && (/^ar\b/.test(selectedLanguage) || info.duration >= 600)) {
       await request(`${id}/transcribing`);
       const subprocess = run(process.env.WHISPER_PYTHON || "python3", [
         fileURLToPath(new URL("./whisper_words.py", import.meta.url)),
@@ -89,7 +91,12 @@ async function processJob({ id, videoId, kind, range, language }) {
     let output = filepath;
     if (audio) {
       output = path.join(directory, "source.mp3");
-      await run(ffmpeg, ["-nostdin", "-loglevel", "error", "-i", filepath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", "-y", output], { timeout: 90_000 });
+      /* The upload is capped at 28 MiB. 64 kbit/s covers about 55 minutes;
+       * longer recordings drop the bitrate (speech stays intelligible to
+       * a transcriber well below that) instead of failing. */
+      const seconds = Number.isFinite(info.duration) && info.duration > 0 ? info.duration : 0;
+      const kbps = Math.max(16, Math.min(64, Math.floor(26 * 1024 * 8 / Math.max(1, seconds))));
+      await run(ffmpeg, ["-nostdin", "-loglevel", "error", "-i", filepath, "-vn", "-ac", "1", "-ar", "16000", "-b:a", `${kbps}k`, "-y", output], { timeout: 300_000 });
     } else {
       output = path.join(directory, "source.mp4");
       const rangeArgs = section && !downloadedSection ? ["-ss", String(Math.max(0, range.start))] : [];
