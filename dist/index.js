@@ -7,6 +7,8 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { totalmem, tmpdir as systemTmpdir } from "os";
 import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
 import { registerMediaUpload } from "../server/media-upload.mjs";
+import { montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
+import { VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildHighlightPrompts, clipCountFor, countOnPeaks, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
@@ -109,6 +111,8 @@ var clips = pgTable("clips", {
   textOverlays: jsonb("textOverlays"),
   /** Jump cuts: clip-relative ranges removed from the export. */
   cuts: jsonb("cuts"),
+  /** Video style: { style, backgroundVideoId }. Null means Normal. */
+  layout: jsonb("layout"),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
@@ -146,6 +150,9 @@ async function getDb() {
        * here so a deploy that has not run migrations yet keeps serving clips. */
       await _db.execute(sql`ALTER TABLE "clips" ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
         console.warn("[Database] Could not add clips.cuts; run `npm run db:migrate`:", String(error?.message ?? error));
+      });
+      await _db.execute(sql`ALTER TABLE "clips" ADD COLUMN IF NOT EXISTS "layout" jsonb`).catch((error) => {
+        console.warn("[Database] Could not add clips.layout; run `npm run db:migrate`:", String(error?.message ?? error));
       });
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
@@ -1670,6 +1677,7 @@ var HighlightSchema = z2.object({
   endTime: z2.coerce.number(),
   engagementScore: z2.coerce.number().catch(75),
   kind: z2.string().optional(),
+  montage: z2.string().optional(),
   hook: z2.string().optional(),
   payoff: z2.string().optional(),
   reason: z2.string().catch("")
@@ -3040,7 +3048,8 @@ function canvasForSegment(seg, bandW, bandH) {
   const k = 2 * Math.ceil(
     Math.max((maxX - minX) / TARGET_W, (maxY - minY) / TARGET_H) * (TARGET_W / 9) / 2
   );
-  const canvasW = 9 * k, canvasH = 16 * k;
+  /* Same shape as the output frame: 9:16 normally, 9:8 for a split-screen panel. */
+  const canvasW = 9 * k, canvasH = 2 * Math.round(9 * k * TARGET_H / TARGET_W / 2);
   const originX = 2 * Math.floor(((minX + maxX) / 2 - canvasW / 2) / 2);
   const originY = 2 * Math.floor(((minY + maxY) / 2 - canvasH / 2) / 2);
   return { canvasW, canvasH, originX, originY };
@@ -3117,7 +3126,18 @@ function queueHeavy(task) {
   return run;
 }
 function renderClipFromHosted(opts) {
-  return queueHeavy(() => renderClipFromHostedNow(opts));
+  return queueHeavy(async () => {
+    /* A split-screen style renders the speaker into the top half. The crop
+     * helpers read the frame height from TARGET_H; renders run one at a time,
+     * so it can be switched for the length of this one. */
+    const fullHeight = TARGET_H;
+    if (splitKind(opts.layout?.style)) TARGET_H = fullHeight / 2;
+    try {
+      return await renderClipFromHostedNow(opts);
+    } finally {
+      TARGET_H = fullHeight;
+    }
+  });
 }
 /**
  * Runs scripts/auto_frame.py on part of a hosted file. Resolves to
@@ -3189,14 +3209,22 @@ async function renderClipFromHostedNow(opts) {
   const outputCrf = rankedProfile ? "18" : (hostedMeta && hostedMeta.width >= 1280 ? "17" : "18");
   const renderTimeout = rankedProfile ? 3e5 : 9e5;
   const captionKey = captions ? crypto2.createHash("sha1").update(JSON.stringify({ w: captions.words, s: captions.style })).digest("hex").slice(0, 8) : "nocap";
-  const normalised = normaliseSegments(cutSegments, duration, crop);
+  /* Video style: split-screen geometry for the top panel and what goes below. */
+  const styleId = VIDEO_STYLES[opts.layout?.style] ? opts.layout.style : "normal";
+  const split = splitKind(styleId) && hostedMeta?.width > 0
+    ? planSplit({ kind: splitKind(styleId), people: opts.layout.people, srcW: hostedMeta.width, srcH: hostedMeta.height, crop, segments: cutSegments })
+    : null;
+  if (splitKind(styleId) && !split) throw new MediaError("This video style could not be built for this clip.");
+  const bottom = split?.bottom ?? null;
+  const normalised = normaliseSegments(split ? split.segments : cutSegments, duration, split ? split.crop : crop);
   const segments = hostedMeta && hostedMeta.width > 0 && hostedMeta.height > 0 ? normalised.flatMap(
     (s) => isAnimated(s) ? splitForZoomCap(s, hostedMeta.width, hostedMeta.height) : [s]
   ) : normalised;
   const moving = segments.some(isAnimated);
   const segmentKey = segments.length > 1 || moving ? crypto2.createHash("sha1").update(JSON.stringify(segments)).digest("hex").slice(0, 8) : "static";
-  const effectsKey = scale !== 1 || overlays.length || cuts.length
-    ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays, ...(cuts.length ? { cuts } : {}) })).digest("hex").slice(0, 8)
+  const styleKey = styleId === "normal" ? null : { style: styleId, bg: opts.layout.backgroundPath ? path5.basename(opts.layout.backgroundPath) : null, people: opts.layout.people ?? null };
+  const effectsKey = scale !== 1 || overlays.length || cuts.length || styleKey
+    ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays, ...(cuts.length ? { cuts } : {}), ...(styleKey ? { styleKey } : {}) })).digest("hex").slice(0, 8)
     : "";
   const fileName = clipFileName(
     opts.clipId,
@@ -3225,8 +3253,9 @@ async function renderClipFromHostedNow(opts) {
   await fs6.rm(publishPath, { force: true }).catch(() => {});
   const tmpDir = await fs6.mkdtemp(path5.join(RENDER_TMP_DIR, `clip-${opts.clipId}-`));
   try {
-    const captionFilter = [];
-    if (scale < 1) {
+    /* Picture treatment for the style (zooms, grade), before captions. */
+    const captionFilter = bottom ? [] : montageFilters(styleId, { words: cutCaptions?.words ?? [], duration, fps: outputFps });
+    if (scale < 1 && !bottom) {
       const width = 2 * Math.round(TARGET_W * scale / 2);
       const height = 2 * Math.round(TARGET_H * scale / 2);
       captionFilter.push(`scale=${width}:${height}:flags=lanczos`, `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=0x${barColor.slice(1)}`);
@@ -3234,7 +3263,7 @@ async function renderClipFromHostedNow(opts) {
     if (captions || overlays.length) {
       await fs6.writeFile(
         path5.join(tmpDir, CAPTION_FILE),
-        buildAssFile(cutCaptions?.words ?? [], captions?.style ?? DEFAULT_CAPTION_STYLE, duration, captions?.synced ?? true, cutOverlays),
+        buildAssFile(cutCaptions?.words ?? [], montageCaptionStyle(styleId, captions?.style ?? DEFAULT_CAPTION_STYLE), duration, captions?.synced ?? true, cutOverlays),
         "utf8"
       );
       const fontsRel = filterRelativePath(tmpDir, FONTS_DIR);
@@ -3259,7 +3288,24 @@ async function renderClipFromHostedNow(opts) {
       );
       return buildCropFilter(framingAt(seg, seg.start), hostedMeta?.width ?? 0, hostedMeta?.height ?? 0);
     };
-    if (segments.length <= 1 && !moving) {
+    /* Split screen: the speaker panel, the lower panel, stacked, then captions
+     * across the join. */
+    const stacked = (mainGraph) => {
+      const w = hostedMeta?.width ?? 0, h = hostedMeta?.height ?? 0;
+      const lower = bottom.type === "background"
+        ? `[1:v]fps=${outputFps},scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${TARGET_W}:${TARGET_H},setsar=1,format=yuv420p[vbot]`
+        : `[0:v]${[...cutVideo, buildCropFilter(bottom.crop, w, h), "format=yuv420p"].join(",")}[vbot]`;
+      return [
+        ...mainGraph,
+        lower,
+        `[vmain][vbot]vstack=inputs=2:shortest=1[vstk]`,
+        `[vstk]${captionFilter.length ? captionFilter.join(",") : "null"}[vout]`
+      ].join(";");
+    };
+    if (bottom && segments.length <= 1 && !moving) {
+      const main = [...cutVideo, buildCropFilter(segments[0], hostedMeta?.width ?? 0, hostedMeta?.height ?? 0), "format=yuv420p"].join(",");
+      videoArgs.push("-filter_complex", stacked([`[0:v]${main}[vmain]`]), "-map", "[vout]", "-map", "0:a?");
+    } else if (segments.length <= 1 && !moving) {
       videoArgs.push(
         "-vf",
         [
@@ -3274,12 +3320,14 @@ async function renderClipFromHostedNow(opts) {
         (seg, i) => `${source(i)}trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},setpts=PTS-STARTPTS,${framingFor(seg)}[v${i}]`
       );
       const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
-      const graph = [
+      const pieces = [
         ...(keep ? [`[0:v]${cutVideo.join(",")},split=${segments.length}${segments.map((_, i) => `[cut${i}]`).join("")}`] : []),
         ...parts,
-        `${concatInputs}concat=n=${segments.length}:v=1:a=0[vcat]`,
-        captionFilter.length > 0 ? `[vcat]${captionFilter.join(",")}[vout]` : `[vcat]null[vout]`
-      ].join(";");
+        `${concatInputs}concat=n=${segments.length}:v=1:a=0[vcat]`
+      ];
+      const graph = bottom
+        ? stacked([...pieces, `[vcat]format=yuv420p[vmain]`])
+        : [...pieces, captionFilter.length > 0 ? `[vcat]${captionFilter.join(",")}[vout]` : `[vcat]null[vout]`].join(";");
       videoArgs.push("-filter_complex", graph, "-map", "[vout]", "-map", "0:a?");
     }
     if (keep) videoArgs.push("-af", `aselect='${keep}',asetpts=N/SR/TB`);
@@ -3294,6 +3342,10 @@ async function renderClipFromHostedNow(opts) {
       String(sourceDuration),
       "-i",
       opts.hostedPath,
+      /* Lower-panel footage, looped so a short background covers any clip. */
+      ...(bottom?.type === "background"
+        ? ["-stream_loop", "-1", "-ss", String(opts.layout.backgroundStart ?? 0), "-t", String(sourceDuration), "-i", opts.layout.backgroundPath]
+        : []),
       ...videoArgs,
       /*
        * This is the deliverable, so it is encoded for quality rather than speed.
@@ -3418,6 +3470,52 @@ async function sharperSectionFor(video, clip, hostedPath) {
     console.warn(`[Render] Clip ${clip.id}: no sharper source section (${String(error?.message ?? error).slice(0, 160)}); rendering from the import.`);
     return null;
   }
+}
+/**
+ * Turns a clip's saved video style into what the renderer needs: the
+ * background file for the footage styles, face positions for the two that
+ * split the source itself. Styles that cannot be built fall back to Normal,
+ * except a footage style with no footage chosen, which is the user's to fix.
+ */
+async function resolveLayout(clip, userId, hostedPath, hostedOffset) {
+  const style = VIDEO_STYLES[clip.layout?.style] ? clip.layout.style : "normal";
+  if (style === "normal") return null;
+  const kind = splitKind(style);
+  if (!kind) return { style };
+  const duration = clip.endTime - clip.startTime;
+  if (kind === "background") {
+    const background = clip.layout.backgroundVideoId != null ? await getVideoById(clip.layout.backgroundVideoId, userId) : null;
+    const backgroundPath = background?.hostedStatus === "ready" ? localPathFromUrl(background.hostedUrl) : null;
+    const meta = backgroundPath ? await probeMedia(backgroundPath).catch(() => null) : null;
+    if (!meta) {
+      throw new MediaError(`Choose a background video for the "${VIDEO_STYLES[style].label}" style. Upload your gameplay or satisfying footage as a video first, then pick it in the style menu.`);
+    }
+    /* Start somewhere different for each clip so they do not all open on
+     * the same frames of the footage. */
+    const room = Math.max(0, meta.duration - duration - 1);
+    return { style, backgroundPath, backgroundStart: room > 0 ? Math.round((clip.id * 37.7) % room) : 0 };
+  }
+  let people = [];
+  try {
+    const ffmpeg = await findFfmpeg();
+    const meta = await probeMedia(hostedPath);
+    const { stdout } = await queueHeavy(() => promisify(execFile)(
+      process.env.AUTO_FRAME_PYTHON ?? WHISPER_PYTHON,
+      [
+        path3.join(process.cwd(), "scripts", "auto_frame.py"), hostedPath,
+        String(Math.max(0, clip.startTime - hostedOffset)), String(duration), String(meta.width), String(meta.height), "people"
+      ],
+      { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
+    ));
+    people = JSON.parse(stdout).people ?? [];
+  } catch (error) {
+    console.warn(`[Render] Clip ${clip.id}: could not find faces for the ${style} style (${String(error.stderr || error.message).slice(0, 160)}).`);
+  }
+  if (people.length < (kind === "dual" ? 2 : 1)) {
+    console.warn(`[Render] Clip ${clip.id}: ${people.length} face(s) found, "${style}" needs ${kind === "dual" ? 2 : 1}. Rendering as Normal.`);
+    return null;
+  }
+  return { style, people: people.slice(0, 2) };
 }
 async function captionsForClip(clip, video) {
   const saved = await getSubtitleByClip(clip.id);
@@ -3862,12 +3960,18 @@ var appRouter = router({
       title: z4.string(),
       startTime: z4.number(),
       endTime: z4.number(),
-      engagementScore: z4.number().optional()
+      engagementScore: z4.number().optional(),
+      /** Video style suggested by the AI for this clip. */
+      style: z4.enum(VIDEO_STYLE_IDS).optional()
     })).mutation(async ({ input, ctx }) => {
       if (!await getVideoById(input.videoId, ctx.user.id)) {
         throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
       }
-      const id = await createClip({ ...input, userId: ctx.user.id, status: "pending" });
+      const { style, ...fields } = input;
+      const id = await createClip({
+        ...fields, userId: ctx.user.id, status: "pending",
+        ...(style && style !== "normal" ? { layout: { style } } : {})
+      });
       return { id };
     }),
     /**
@@ -3879,6 +3983,11 @@ var appRouter = router({
       title: z4.string().min(1).optional(),
       startTime: z4.number().min(0).optional(),
       endTime: z4.number().min(0).optional(),
+      /** Video style and, for split-screen styles, the lower-panel video. */
+      layout: z4.object({
+        style: z4.enum(VIDEO_STYLE_IDS),
+        backgroundVideoId: z4.number().nullish()
+      }).nullish(),
       // Reframing set by dragging/zooming the preview.
       zoom: z4.number().min(0.1).max(10).optional(),
       offsetX: z4.number().min(-1).max(1).optional(),
@@ -3953,7 +4062,8 @@ var appRouter = router({
         ...input.barColor !== void 0 ? { barColor: input.barColor } : {},
         ...input.textOverlays !== void 0 ? { textOverlays: input.textOverlays } : {},
         ...input.captionsEnabled !== void 0 ? { captionsEnabled: input.captionsEnabled } : {},
-        ...captionsChanged && clip.status === "done" ? { status: "pending", downloadUrl: null, errorMessage: null } : {},
+        ...input.layout !== void 0 ? { layout: input.layout && input.layout.style !== "normal" ? input.layout : null } : {},
+        ...(captionsChanged || (input.layout !== void 0 && JSON.stringify(input.layout ?? null) !== JSON.stringify(clip.layout ?? null))) && clip.status === "done" ? { status: "pending", downloadUrl: null, errorMessage: null } : {},
         // An empty array means "no timeline", stored as null.
         ...input.framingSegments !== void 0 ? { framingSegments: input.framingSegments.length > 0 ? input.framingSegments : null } : {}
       });
@@ -4091,6 +4201,7 @@ var appRouter = router({
           }
           /* AI reframing without a click: a clip still on the default centre
            * crop gets the speaker-following framing before it is rendered. */
+          const layout = await resolveLayout(clip, ctx.user.id, actualHostedPath, actualHostedOffset);
           let framingSegments = clip.framingSegments;
           const untouched = (!Array.isArray(framingSegments) || framingSegments.length === 0)
             && crop.zoom === 1 && crop.offsetX === 0 && crop.offsetY === 0;
@@ -4122,6 +4233,7 @@ var appRouter = router({
             barColor: crop.barColor,
             textOverlays: clip.textOverlays,
             cuts: clip.cuts,
+            layout,
             captions: finalCaptions,
             renderProfile
           });
@@ -4178,6 +4290,7 @@ var appRouter = router({
                   barColor: crop.barColor,
                   textOverlays: clip.textOverlays,
             cuts: clip.cuts,
+            layout,
                   captions: finalCaptions,
                   renderProfile
                 });

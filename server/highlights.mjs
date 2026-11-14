@@ -142,6 +142,7 @@ Return exactly this JSON shape:
       "endTime": <seconds, the end of the payoff line>,
       "engagementScore": <integer 60-99, honest: 90+ only for a genuinely exceptional hook AND payoff>,
       "kind": "joke" | "story" | "insight" | "debate" | "reveal" | "other",
+      "montage": "viral" | "dynamic" | "podcast" | "cinematic" | "normal",
       "hook": "the clip's opening sentence, quoted from the transcript",
       "payoff": "the line the clip ends on, quoted from the transcript (for a joke: the reaction or last topper, not the punchline)",
       "reason": "one sentence: why a stranger would watch this to the end"
@@ -149,6 +150,14 @@ Return exactly this JSON shape:
   ],
   "reelTitle": "TITLE FOR THE WHOLE SET IN ALL CAPS"
 }
+"montage" is the editing style that suits the clip best:
+- "viral": jokes, banter, hot takes, fast or high-energy moments. Big bold captions carry it.
+- "dynamic": explanations, arguments, tips and lists, where key sentences deserve emphasis. Punch-in zooms land on them.
+- "podcast": calm conversation and interviews where the words matter more than the energy. Clean, quiet presentation.
+- "cinematic": emotional stories, confessions, motivation, serious or dramatic moments. Dark grade and a slow push-in.
+- "normal": none of the above clearly fits.
+Choose per clip; a set of clips from one video should not all get the same style unless they truly are alike.
+
 Sort highlights by engagementScore, highest first. Return fewer than ${count} rather than include a weak clip.`;
   return { system, user };
 }

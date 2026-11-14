@@ -8,6 +8,8 @@ import SubtitleOverlay, {
   CAPTION_FONTS, CaptionPresetPicker, captionFrame,
 } from "@/components/SubtitleOverlay";
 import type { CaptionPresetId } from "@shared/captions.mjs";
+import { AI_VIDEO_STYLES, type VideoLayout } from "@shared/video-styles.mjs";
+import VideoStylePicker from "@/components/VideoStylePicker";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { trpc } from "@/lib/trpc";
 import { useSourceTranscription, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
@@ -38,6 +40,8 @@ const STEPS = [
 type Highlight = {
   id: number; title: string; startTime: number; endTime: number;
   engagementScore: number; reason: string;
+  /** Editing style the AI suggested for this clip. */
+  montage?: string;
 };
 type SubStyle = {
   preset?: CaptionPresetId;
@@ -1278,6 +1282,8 @@ function StepEdit({
             startTime: h.startTime,
             endTime: h.endTime,
             engagementScore: h.engagementScore,
+            // Start from the style the AI suggested; the picker can change it.
+            ...(h.montage && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage } : {}),
           });
           next[h.id] = {
             clipId: id,
@@ -1322,6 +1328,18 @@ function StepEdit({
   const patch = (next: Partial<ClipEdit>) => {
     if (!clip || !current) return;
     setEdits(prev => ({ ...prev, [clip.id]: { ...prev[clip.id], ...next } }));
+  };
+
+  /* Video style per clip: what was chosen here, else what is saved on the
+   * clip (which starts as the AI's suggestion). */
+  const [layouts, setLayouts] = useState<Record<number, VideoLayout>>({});
+  const savedLayout = (existingClips as { id: number; layout?: unknown }[] | undefined)
+    ?.find(c => c.id === current?.clipId)?.layout as VideoLayout | null | undefined;
+  const activeLayout = clip ? layouts[clip.id] ?? savedLayout ?? null : null;
+  const chooseLayout = (layout: VideoLayout) => {
+    if (!clip || !current) return;
+    setLayouts(prev => ({ ...prev, [clip.id]: layout }));
+    updateClip.mutate({ id: current.clipId, layout });
   };
 
   /** Jump cuts: the server finds pauses and filler sounds from the word timings. */
@@ -1670,6 +1688,11 @@ function StepEdit({
                 editingKeyframe={editingKeyframe}
                 onEditingKeyframeChange={setEditingKeyframe}
               />
+
+              <div className="glass rounded-2xl p-4">
+                <p className="text-sm font-semibold text-foreground mb-2">Video style</p>
+                <VideoStylePicker value={activeLayout} onChange={chooseLayout} excludeVideoId={videoId} />
+              </div>
 
               <div className="flex items-center justify-end gap-2">
                 <button

@@ -16,6 +16,8 @@ import {
 } from "@shared/framing";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
+import VideoStylePicker from "@/components/VideoStylePicker";
+import type { VideoLayout } from "@shared/video-styles.mjs";
 import {
   youTubeThumbnail,
   youTubeWatchUrl,
@@ -65,6 +67,7 @@ type ClipRow = {
   barColor?: string | null;
   textOverlays?: unknown;
   cuts?: unknown;
+  layout?: unknown;
 };
 
 type VideoRow = {
@@ -200,6 +203,13 @@ function ClipEditorModal({
     },
     onError: (err: { message: string }) => toast.error(err.message),
   });
+  /** Video style the clip is exported in. Saved as soon as it is chosen. */
+  const [layout, setLayout] = useState<VideoLayout | null>((clip.layout as VideoLayout | null) ?? null);
+  const saveLayout = trpc.clips.update.useMutation({ onError: (err: { message: string }) => toast.error(err.message) });
+  const chooseLayout = (next: VideoLayout) => {
+    setLayout(next);
+    saveLayout.mutate({ id: clip.id, layout: next });
+  };
   /** Jump cuts: the server finds pauses and filler sounds from the word timings. */
   const tighten = trpc.clips.tighten.useMutation({
     onSuccess: (data: { cuts: { start: number; end: number }[]; removedSeconds: number; duration: number }, vars: { enabled?: boolean }) => {
@@ -777,6 +787,11 @@ function ClipEditorModal({
                 {tighten.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Scissors className="w-4 h-4" />}
                 {cuts.length ? `Undo ${cuts.length} cut${cuts.length === 1 ? "" : "s"}` : "Tighten"}
               </button>
+            </div>
+
+            <div className="rounded-2xl border border-border p-4">
+              <p className="text-sm font-semibold text-foreground mb-2">Video style</p>
+              <VideoStylePicker value={layout} onChange={chooseLayout} excludeVideoId={video?.id} />
             </div>
 
             {/* Undo / Redo */}

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Choose 9:16 framing for a clip by following the speaker's face.
 
-usage: auto_frame.py <video> <start> <duration> <src-width> <src-height>
+usage: auto_frame.py <video> <start> <duration> <src-width> <src-height> [people]
+
+With "people" as the last argument it prints {"people": [...]} instead: one
+entry per person's face position, for the split-screen layouts.
 
 Samples the clip a few times a second, finds faces, splits the clip at camera
 cuts, and prints JSON framing segments (clip-relative seconds, the same shape
@@ -79,7 +82,8 @@ def nms(boxes, scores, limit=0.3):
 
 
 def detect(session, frame):
-    """Faces as (centre-x, centre-y, area), all as fractions of the frame."""
+    """Faces as (centre-x, centre-y, weighted area, width, height), all as
+    fractions of the frame."""
     h, w, _ = frame.shape
     canvas = np.zeros((NET_H, NET_W, 3), np.float32)
     canvas[:h, :w] = frame
@@ -95,7 +99,7 @@ def detect(session, frame):
         x1, y1, x2, y2 = boxes[i] * [NET_W / w, NET_H / h, NET_W / w, NET_H / h]
         if x2 <= x1 or y2 <= y1:
             continue
-        faces.append(((x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) * (y2 - y1) * float(scores[i])))
+        faces.append(((x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) * (y2 - y1) * float(scores[i]), x2 - x1, y2 - y1))
     return faces
 
 
@@ -181,7 +185,49 @@ def calm(pieces):
     return merged
 
 
+def load_detector():
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    options.intra_op_num_threads = int(os.environ.get("AUTO_FRAME_THREADS", "2"))
+    return ort.InferenceSession(str(MODEL), options, providers=["CPUExecutionProvider"])
+
+
+def people(video, start, duration, width, height):
+    """Where each person's face sits across the clip, for split-screen
+    layouts. Faces are grouped by horizontal position; each group is one
+    person: {"cx", "cy", "w", "h"} as fractions of the frame, plus "share",
+    the fraction of sampled frames they appear in. Most present first."""
+    session = load_detector()
+    groups, total = [], 0
+    for frame in read_frames(video, start, duration, width, height):
+        total += 1
+        seen = set()
+        for face in detect(session, frame):
+            match = next((g for g in groups if abs(float(np.median(g["cx"])) - face[0]) < 0.12), None)
+            if match is None:
+                match = {"cx": [], "cy": [], "w": [], "h": [], "frames": 0}
+                groups.append(match)
+            for key, value in zip(("cx", "cy", "w", "h"), (face[0], face[1], face[3], face[4])):
+                match[key].append(float(value))
+            if id(match) not in seen:
+                seen.add(id(match))
+                match["frames"] += 1
+    if total == 0:
+        raise RuntimeError("no frames could be read from the clip")
+    result = [{**{k: round(float(np.median(g[k])), 4) for k in ("cx", "cy", "w", "h")}, "share": round(g["frames"] / total, 3)}
+              for g in groups]
+    result = [p for p in result if p["share"] >= 0.2]
+    result.sort(key=lambda p: -p["share"])
+    return result
+
+
 def main():
+    if len(sys.argv) > 6 and sys.argv[6] == "people":
+        found = people(sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(float(sys.argv[4])), int(float(sys.argv[5])))
+        json.dump({"people": found}, sys.stdout)
+        return
     if len(sys.argv) < 6:
         raise ValueError("usage: auto_frame.py <video> <start> <duration> <src-width> <src-height>")
     video = sys.argv[1]
@@ -199,12 +245,7 @@ def main():
         json.dump({"segments": [], "faceCoverage": 0, "shots": 0, "reason": "source is already vertical"}, sys.stdout)
         return
 
-    import onnxruntime as ort
-
-    options = ort.SessionOptions()
-    options.log_severity_level = 3
-    options.intra_op_num_threads = int(os.environ.get("AUTO_FRAME_THREADS", "2"))
-    session = ort.InferenceSession(str(MODEL), options, providers=["CPUExecutionProvider"])
+    session = load_detector()
 
     centres, cuts = [], [0]
     previous_luma, previous_x = None, None

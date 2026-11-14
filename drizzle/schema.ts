@@ -88,6 +88,8 @@ export const clips = pgTable("clips", {
   textOverlays: jsonb("textOverlays"),
   /** Jump cuts: clip-relative ranges removed from the export. */
   cuts: jsonb("cuts"),
+  /** Video style: { style, backgroundVideoId }. Null means Normal. */
+  layout: jsonb("layout"),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 });

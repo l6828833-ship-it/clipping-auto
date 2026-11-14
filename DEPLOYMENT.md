@@ -24,6 +24,8 @@ Arabic and Darija accuracy depends on the model. `scripts/whisper_words.py` pick
 
 When `INWORLD_API_KEY` is set, transcription uses the hosted Inworld speech API with word timings instead of local Whisper (`server/hosted-stt.mjs`). It tries `groq/whisper-large-v3`, then `inworld/inworld-stt-1`, and keeps the first that returns word timings; set `INWORLD_STT_MODEL` to force one, or `CLIP_MAKER_HOSTED_STT=0` to go back to local Whisper. If the API fails or returns no timings, local Whisper is used. The download worker then only delivers the audio and no longer runs Whisper.
 
+Video styles (Normal, four single-speaker looks and four split-screen layouts) are stored per clip in a new nullable `clips.layout` column (migration `0003_clip_layout`, also added on start-up). The style is applied at render time (`server/montage.mjs`). The two footage styles use one of the user's own uploaded videos as the lower half; no footage ships with the app.
+
 Jump cuts ("Tighten") are stored in a new nullable `clips.cuts` column (migration `0002_clip_cuts`). The server also adds it on start-up with `ADD COLUMN IF NOT EXISTS`, so a deploy works before `npm run db:migrate` has been run. AI reframing needs `onnxruntime` (in `scripts/requirements-whisper.txt`) and `assets/models/face-rfb-320.onnx`.
 
 Rendered clips fetch their own source range at up to 1440p (`CLIP_MAKER_MAX_SECTION_HEIGHT`, set `2160` for 4K or `CLIP_MAKER_HQ_SECTIONS=0` to render from the 1080p import only). A 9:16 crop keeps a third of a 16:9 frame, so the extra resolution is what keeps exports sharp.
