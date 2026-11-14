@@ -422,7 +422,6 @@ export function CropView({
   children,
   scale: videoScale = 1,
   barColor = "#000000",
-  skip,
 }: {
   src: string;
   framing: Framing;
@@ -451,12 +450,6 @@ export function CropView({
   scale?: number;
   /** Colour for the bars when scale < 1. */
   barColor?: string;
-  /**
-   * Ranges (seconds in this video) that playback jumps over: the clip's jump
-   * cuts, so the preview plays what the export will contain. Only applied
-   * while playing, so a paused scrub can still look inside a cut.
-   */
-  skip?: { start: number; end: number }[];
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
@@ -471,16 +464,6 @@ export function CropView({
 
   const start = Math.max(0, startTime ?? 0);
   const end = endTime ?? null;
-
-  const skipRef = useRef(skip);
-  useEffect(() => { skipRef.current = skip; }, [skip]);
-  const jumpOverCuts = (v: HTMLVideoElement) => {
-    if (v.paused) return;
-    const t = v.currentTime;
-    // The small margin stops a seek that lands a hair early from re-triggering.
-    const cut = skipRef.current?.find(c => t >= c.start && t < c.end - 0.04);
-    if (cut) v.currentTime = cut.end;
-  };
 
   const rangeRef = useRef({ start, end, loop });
   useEffect(() => { rangeRef.current = { start, end, loop }; }, [start, end, loop]);
@@ -518,7 +501,6 @@ export function CropView({
       if (r.loop) v.currentTime = r.start;
       else { v.pause(); setPlaying(false); }
     }
-    jumpOverCuts(v);
     onTime?.(v.currentTime);
   };
 
@@ -534,10 +516,7 @@ export function CropView({
     let raf = 0;
     const tick = () => {
       const v = videoRef.current;
-      if (v) {
-        jumpOverCuts(v);
-        onTimeRef.current?.(v.currentTime);
-      }
+      if (v) onTimeRef.current?.(v.currentTime);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);

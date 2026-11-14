@@ -86,8 +86,6 @@ export const clips = pgTable("clips", {
   scale: real("scale").default(1).notNull(),
   barColor: varchar("barColor", { length: 9 }).default("#000000").notNull(),
   textOverlays: jsonb("textOverlays"),
-  /** Jump cuts: clip-relative ranges removed from the export. */
-  cuts: jsonb("cuts"),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 });

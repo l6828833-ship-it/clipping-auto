@@ -64,7 +64,6 @@ type ClipRow = {
   scale?: number | null;
   barColor?: string | null;
   textOverlays?: unknown;
-  cuts?: unknown;
 };
 
 type VideoRow = {
@@ -94,12 +93,8 @@ function ClipEditorModal({
 }) {
   const utils = trpc.useUtils();
   const [title, setTitle] = useState(clip.title ?? `Clip #${clip.id}`);
-  /* Keep the clip's exact edges. They are chosen on word boundaries, and
-   * rounding to whole seconds on open cut into the neighbouring words. */
-  const [start, setStart] = useState(Math.max(0, Math.round((clip.startTime ?? 0) * 100) / 100));
-  const [end, setEnd] = useState(Math.round((clip.endTime ?? (clip.startTime ?? 0) + 30) * 100) / 100);
-  /** Jump cuts stored on the clip: pauses removed from the export. */
-  const [cuts, setCuts] = useState<{ start: number; end: number }[]>((clip.cuts as { start: number; end: number }[] | null) ?? []);
+  const [start, setStart] = useState(Math.max(0, Math.floor(clip.startTime ?? 0)));
+  const [end, setEnd] = useState(Math.ceil(clip.endTime ?? (clip.startTime ?? 0) + 30));
   const [framing, setFraming] = useState<Framing>({
     zoom: clip.zoom ?? DEFAULT_FRAMING.zoom,
     offsetX: clip.offsetX ?? DEFAULT_FRAMING.offsetX,
@@ -200,16 +195,6 @@ function ClipEditorModal({
     },
     onError: (err: { message: string }) => toast.error(err.message),
   });
-  /** Jump cuts: the server finds pauses and filler sounds from the word timings. */
-  const tighten = trpc.clips.tighten.useMutation({
-    onSuccess: (data: { cuts: { start: number; end: number }[]; removedSeconds: number; duration: number }, vars: { enabled?: boolean }) => {
-      setCuts(data.cuts);
-      if (vars.enabled === false) toast.success("Cuts removed. The export is the full clip again.");
-      else if (data.cuts.length === 0) toast.info("No pauses long enough to cut in this clip.");
-      else toast.success(`Removed ${data.removedSeconds}s of pauses in ${data.cuts.length} cut${data.cuts.length === 1 ? "" : "s"}. The export will be ${(data.duration - data.removedSeconds).toFixed(1)}s.`);
-    },
-    onError: (err: { message: string }) => toast.error(err.message),
-  });
   const update = trpc.clips.update.useMutation({
     onSuccess: async () => {
       await utils.clips.list.invalidate();
@@ -293,17 +278,11 @@ function ClipEditorModal({
   const storedWords = savedSubtitle?.words as TimelineWord[] | null | undefined;
   const effectiveWords = useMemo<TimelineWord[]>(() => {
     if (timelineWords) return timelineWords;
-    /* Same order as the renderer: this clip's saved words, else the video's
-     * transcript. Without the fallback the preview showed a static sample
-     * while the export burned in the real, timed captions. */
-    const transcriptWords = video?.transcriptWords as TimelineWord[] | null | undefined;
-    const source = Array.isArray(storedWords) && storedWords.length > 0 ? storedWords : transcriptWords;
-    if (!Array.isArray(source)) return [];
-    const length = (clip.endTime ?? Infinity) - clipStartAbs;
-    return source
+    if (!Array.isArray(storedWords)) return [];
+    return storedWords
       .map(w => ({ ...w, start: w.start - clipStartAbs, end: w.end - clipStartAbs }))
-      .filter(w => w.end > 0 && w.start < length);
-  }, [timelineWords, storedWords, video?.transcriptWords, clip.endTime, clipStartAbs]);
+      .filter(w => w.end > 0);
+  }, [timelineWords, storedWords, clipStartAbs]);
 
   /**
    * Only the caption belonging at the playhead.
@@ -330,15 +309,6 @@ function ClipEditorModal({
   const hostedUrl = video?.hostedUrl ?? null;
   // Partial imports shift the hosted timeline; clip times are absolute.
   const hostedOffset = video?.hostedOffset ?? 0;
-  /* Cuts are measured from the saved clip start; the player runs on the
-   * imported file's clock. */
-  const playerCuts = useMemo(
-    () => cuts.map(c => ({
-      start: (clip.startTime ?? 0) + c.start - hostedOffset,
-      end: (clip.startTime ?? 0) + c.end - hostedOffset,
-    })),
-    [cuts, clip.startTime, hostedOffset]
-  );
   const sourceYtId = parseYouTubeId(video?.sourceUrl);
   const duration = Math.max(0, end - start);
   const valid = end > start;
@@ -503,7 +473,6 @@ function ClipEditorModal({
                   className="w-full shadow-2xl"
                   scale={videoScale}
                   barColor={barColor}
-                  skip={playerCuts}
                   onTime={t => {
                     setPreviewTime(t);
                     setPlayhead(Math.max(0, t + hostedOffset - start));
@@ -738,8 +707,8 @@ function ClipEditorModal({
               <button
                 onClick={() => {
                   setTitle(clip.title ?? `Clip #${clip.id}`);
-                  setStart(Math.max(0, Math.round((clip.startTime ?? 0) * 100) / 100));
-                  setEnd(Math.round((clip.endTime ?? (clip.startTime ?? 0) + 30) * 100) / 100);
+                  setStart(Math.max(0, Math.floor(clip.startTime ?? 0)));
+                  setEnd(Math.ceil(clip.endTime ?? (clip.startTime ?? 0) + 30));
                   setFraming({
                     zoom: clip.zoom ?? DEFAULT_FRAMING.zoom,
                     offsetX: clip.offsetX ?? DEFAULT_FRAMING.offsetX,
@@ -766,16 +735,6 @@ function ClipEditorModal({
                 style={{ background: "var(--cobalt)" }}
               >
                 {autoFrame.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ScanFace className="w-4 h-4" />} AI reframe
-              </button>
-              <button
-                onClick={() => tighten.mutate({ id: clip.id, enabled: cuts.length === 0 })}
-                disabled={tighten.isPending}
-                title={cuts.length ? "Put the removed pauses back" : "Cut pauses and filler sounds out of the export"}
-                className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-40"
-                style={{ background: cuts.length ? "var(--coral)" : "var(--cobalt)" }}
-              >
-                {tighten.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Scissors className="w-4 h-4" />}
-                {cuts.length ? `Undo ${cuts.length} cut${cuts.length === 1 ? "" : "s"}` : "Tighten"}
               </button>
             </div>
 
@@ -978,7 +937,6 @@ function ClipEditorModal({
               words={effectiveWords}
               onWordsChange={setTimelineWords}
               playheadSeconds={playhead}
-              cuts={cuts}
               onScrub={scrubTo}
               baseFraming={framing}
               editingKeyframe={editingKeyframe}

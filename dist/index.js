@@ -6,7 +6,6 @@ import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { totalmem } from "os";
 import { registerMediaUpload } from "../server/media-upload.mjs";
-import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildHighlightPrompts, clipCountFor, countOnPeaks, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
@@ -106,8 +105,6 @@ var clips = pgTable("clips", {
   scale: real("scale").default(1).notNull(),
   barColor: varchar("barColor", { length: 9 }).default("#000000").notNull(),
   textOverlays: jsonb("textOverlays"),
-  /** Jump cuts: clip-relative ranges removed from the export. */
-  cuts: jsonb("cuts"),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
@@ -141,11 +138,6 @@ async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
       _db = drizzle(process.env.DATABASE_URL);
-      /* Additive and idempotent, the same statement as migration 0002. Run
-       * here so a deploy that has not run migrations yet keeps serving clips. */
-      await _db.execute(sql`ALTER TABLE "clips" ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
-        console.warn("[Database] Could not add clips.cuts; run `npm run db:migrate`:", String(error?.message ?? error));
-      });
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
@@ -3089,14 +3081,7 @@ async function renderClipFromHosted(opts) {
     );
   }
   await ensureDirs();
-  const sourceDuration = end - start;
-  /* Jump cuts shorten the clip. Everything below works on the cut timeline:
-   * captions, overlays and framing are shifted onto it first. */
-  const cuts = normaliseCuts(opts.cuts, sourceDuration);
-  const duration = sourceDuration - cutSeconds(cuts);
-  const cutCaptions = captions && cuts.length ? { ...captions, words: shiftTimed(captions.words, cuts) } : captions;
-  const cutOverlays = shiftTimed(overlays, cuts);
-  const cutSegments = shiftTimed(opts.segments, cuts);
+  const duration = end - start;
   /* Top 5 clips already have no captions and receive their shared overlay in
    * the final composition. Encode them with a bounded fast profile so one
    * rank cannot spend fifteen minutes on an unnecessarily slow intermediate. */
@@ -3108,14 +3093,14 @@ async function renderClipFromHosted(opts) {
   const outputCrf = rankedProfile ? "18" : (hostedMeta && hostedMeta.width >= 1280 ? "17" : "18");
   const renderTimeout = rankedProfile ? 3e5 : 9e5;
   const captionKey = captions ? crypto2.createHash("sha1").update(JSON.stringify({ w: captions.words, s: captions.style })).digest("hex").slice(0, 8) : "nocap";
-  const normalised = normaliseSegments(cutSegments, duration, crop);
+  const normalised = normaliseSegments(opts.segments, duration, crop);
   const segments = hostedMeta && hostedMeta.width > 0 && hostedMeta.height > 0 ? normalised.flatMap(
     (s) => isAnimated(s) ? splitForZoomCap(s, hostedMeta.width, hostedMeta.height) : [s]
   ) : normalised;
   const moving = segments.some(isAnimated);
   const segmentKey = segments.length > 1 || moving ? crypto2.createHash("sha1").update(JSON.stringify(segments)).digest("hex").slice(0, 8) : "static";
-  const effectsKey = scale !== 1 || overlays.length || cuts.length
-    ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays, ...(cuts.length ? { cuts } : {}) })).digest("hex").slice(0, 8)
+  const effectsKey = scale !== 1 || overlays.length
+    ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays })).digest("hex").slice(0, 8)
     : "";
   const fileName = clipFileName(
     opts.clipId,
@@ -3153,17 +3138,13 @@ async function renderClipFromHosted(opts) {
     if (captions || overlays.length) {
       await fs6.writeFile(
         path5.join(tmpDir, CAPTION_FILE),
-        buildAssFile(cutCaptions?.words ?? [], captions?.style ?? DEFAULT_CAPTION_STYLE, duration, captions?.synced ?? true, cutOverlays),
+        buildAssFile(captions?.words ?? [], captions?.style ?? DEFAULT_CAPTION_STYLE, duration, captions?.synced ?? true, overlays),
         "utf8"
       );
       const fontsRel = filterRelativePath(tmpDir, FONTS_DIR);
       captionFilter.push(`ass=${CAPTION_FILE}:fontsdir=${fontsRel}`);
     }
     const videoArgs = [];
-    /* Drop the cut ranges from picture and sound, then renumber timestamps so
-     * the remaining pieces sit back to back. */
-    const keep = cuts.length ? keepExpression(cuts, sourceDuration) : null;
-    const cutVideo = keep ? [`select='${keep}'`, "setpts=N/FRAME_RATE/TB"] : [];
     const framingFor = (seg) => {
       if (!isAnimated(seg)) return buildCropFilter(seg, hostedMeta?.width ?? 0, hostedMeta?.height ?? 0);
       const animated = buildAnimatedCropFilter({
@@ -3182,37 +3163,30 @@ async function renderClipFromHosted(opts) {
       videoArgs.push(
         "-vf",
         [
-          ...cutVideo,
           buildCropFilter(segments[0], hostedMeta?.width ?? 0, hostedMeta?.height ?? 0),
           ...captionFilter
         ].join(",")
       );
     } else {
-      const source = (i) => keep ? `[cut${i}]` : "[0:v]";
       const parts = segments.map(
-        (seg, i) => `${source(i)}trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},setpts=PTS-STARTPTS,${framingFor(seg)}[v${i}]`
+        (seg, i) => `[0:v]trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},setpts=PTS-STARTPTS,${framingFor(seg)}[v${i}]`
       );
       const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
       const graph = [
-        ...(keep ? [`[0:v]${cutVideo.join(",")},split=${segments.length}${segments.map((_, i) => `[cut${i}]`).join("")}`] : []),
         ...parts,
         `${concatInputs}concat=n=${segments.length}:v=1:a=0[vcat]`,
         captionFilter.length > 0 ? `[vcat]${captionFilter.join(",")}[vout]` : `[vcat]null[vout]`
       ].join(";");
       videoArgs.push("-filter_complex", graph, "-map", "[vout]", "-map", "0:a?");
     }
-    if (keep) videoArgs.push("-af", `aselect='${keep}',asetpts=N/SR/TB`);
     const args = [
       // -ss before -i seeks quickly; a local file keeps it accurate enough.
       "-ss",
       String(start),
-      /* Before -i so it bounds what is read. As an output option it would
-       * never be reached once cuts shorten the clip, and ffmpeg would decode
-       * the rest of the source for nothing. */
-      "-t",
-      String(sourceDuration),
       "-i",
       opts.hostedPath,
+      "-t",
+      String(duration),
       ...videoArgs,
       /*
        * This is the deliverable, so it is encoded for quality rather than speed.
@@ -3825,9 +3799,6 @@ var appRouter = router({
         ...input.title !== void 0 ? { title: input.title } : {},
         ...input.startTime !== void 0 ? { startTime } : {},
         ...input.endTime !== void 0 ? { endTime } : {},
-        /* Cuts are measured from the clip's start, so moving its edges
-         * invalidates them. */
-        ...clip.cuts && (Math.abs(startTime - (clip.startTime ?? 0)) > 0.01 || Math.abs(endTime - (clip.endTime ?? 0)) > 0.01) ? { cuts: null } : {},
         ...input.zoom !== void 0 ? { zoom: input.zoom } : {},
         ...input.offsetX !== void 0 ? { offsetX: input.offsetX } : {},
         ...input.offsetY !== void 0 ? { offsetY: input.offsetY } : {},
@@ -3986,7 +3957,6 @@ var appRouter = router({
             scale: clip.scale,
             barColor: crop.barColor,
             textOverlays: clip.textOverlays,
-            cuts: clip.cuts,
             captions: finalCaptions,
             renderProfile
           });
@@ -4042,7 +4012,6 @@ var appRouter = router({
                   scale: clip.scale,
                   barColor: crop.barColor,
                   textOverlays: clip.textOverlays,
-            cuts: clip.cuts,
                   captions: finalCaptions,
                   renderProfile
                 });
@@ -4142,33 +4111,6 @@ var appRouter = router({
      * Chooses the 9:16 framing for a clip by following the speaker's face
      * (scripts/auto_frame.py) and stores it as the clip's framing timeline.
      */
-    /**
-     * POST /api/trpc/clips.tighten
-     * Finds dead air and filler sounds from the clip's word timings and stores
-     * them as jump cuts. `enabled: false` removes the cuts again.
-     */
-    tighten: protectedProcedure.input(z4.object({ id: z4.number(), enabled: z4.boolean().default(true) })).mutation(async ({ input, ctx }) => {
-      const clip = await getClipById(input.id, ctx.user.id);
-      if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
-      const duration = (clip.endTime ?? 0) - (clip.startTime ?? 0);
-      const rerender = clip.status === "done" ? { status: "pending", downloadUrl: null, errorMessage: null } : {};
-      if (!input.enabled) {
-        if (clip.cuts) await updateClip(clip.id, { cuts: null, ...rerender });
-        return { cuts: [], removedSeconds: 0, duration };
-      }
-      const video = await getVideoById(clip.videoId, ctx.user.id);
-      const saved = await getSubtitleByClip(clip.id);
-      const timed = Array.isArray(saved?.words) && saved.words.length ? saved.words : video?.transcriptWords;
-      const words = (Array.isArray(timed) ? timed : [])
-        .map((w) => ({ word: w.word, start: w.start - clip.startTime, end: w.end - clip.startTime }))
-        .filter((w) => w.end > 0 && w.start < duration);
-      if (words.length < 2) {
-        throw new TRPCError5({ code: "PRECONDITION_FAILED", message: "This clip has no word timings yet. Turn on captions or transcribe it first, then tighten." });
-      }
-      const cuts = detectCuts(words, duration);
-      await updateClip(clip.id, { cuts: cuts.length ? cuts : null, ...(cuts.length || clip.cuts ? rerender : {}) });
-      return { cuts, removedSeconds: Math.round(cutSeconds(cuts) * 10) / 10, duration };
-    }),
     autoFrame: protectedProcedure.input(z4.object({ id: z4.number() })).mutation(async ({ input, ctx }) => {
       const clip = await getClipById(input.id, ctx.user.id);
       if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
