@@ -10,8 +10,8 @@ model (see `pick_model`) because the small models are not usable for it.
 Environment:
   WHISPER_MODEL                 default model when none is passed (base)
   WHISPER_MODEL_ARABIC          model for Arabic and Darija (default: by RAM)
-  WHISPER_MODEL_DARIJA          model for Darija only; "darija-finetune" selects
-                                the small Darija fine-tune in darija_whisper.py
+  WHISPER_MODEL_DARIJA          model for Darija only (default "darija-finetune",
+                                the small Darija fine-tune in darija_whisper.py)
   WHISPER_BEAM_SIZE             beam width on the CPU engine (default 5 for Arabic)
   WHISPER_THREADS               CPU threads for PyTorch (default 2)
   CLIP_MAKER_WHISPER_ACCELERATE "0" disables Apple-GPU (MLX) transcription
@@ -80,10 +80,13 @@ def pick_model(locale: str, language: str | None, default: str) -> str:
     chosen = (darija and os.environ.get("WHISPER_MODEL_DARIJA")) or os.environ.get("WHISPER_MODEL_ARABIC")
     if not chosen:
         ram = total_ram_gb()
-        if ram >= 7.5:
-            chosen = "large-v3-turbo"
-        elif darija:
+        if darija:
+            # On real Moroccan speech the Darija fine-tune kept nearly twice
+            # the words large-v3-turbo did, and in Darija rather than
+            # rewritten into standard Arabic.
             chosen = DARIJA_FINETUNE
+        elif ram >= 7.5:
+            chosen = "large-v3-turbo"
         elif ram >= 3.5 and default in {"tiny", "base"}:
             chosen = "small"
         else:
@@ -334,9 +337,14 @@ def main() -> None:
         "verbose": None,
         "compression_ratio_threshold": 2.2,
         "no_speech_threshold": 0.6,
+        # Retry a window only when the text loops (compression ratio), never
+        # for low confidence. Dialects such as Darija always score low, so
+        # the confidence rule re-decoded nearly every window up to six times
+        # and made a 30-minute video take longer than it lasts.
+        "logprob_threshold": None,
+        "temperature": (0.0, 0.4, 0.8),
     }
     if not engine.finetune:
-        options["hallucination_silence_threshold"] = 2.0
         prompt = PROMPTS.get(locale) or PROMPTS.get(language or "")
         if prompt:
             options["initial_prompt"] = prompt

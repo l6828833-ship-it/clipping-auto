@@ -9,6 +9,8 @@ const prefix = "/api/internal/youtube-worker";
 const maxBytes = 28 * 1024 * 1024;
 const jobs = new Map();
 let lastPoll = 0;
+const IDLE_JOB_MS = 900_000;
+const MAX_JOB_MS = 3_600_000;
 
 function workerToken() {
   return process.env.CLIP_MAKER_YOUTUBE_WORKER_TOKEN?.trim() || "";
@@ -20,14 +22,25 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
 
   const id = randomUUID();
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => finish(new Error("The YouTube download worker timed out.")), 900_000);
+    /* The worker has 15 minutes between signs of life, and an hour in all.
+     * A fixed 15-minute limit failed every long video: transcribing an hour
+     * of speech with the large Whisper model takes longer than that, and the
+     * worker reports progress the whole time. */
+    const started = Date.now();
+    let timeout;
     const finish = (error, metadata) => {
       clearTimeout(timeout);
       jobs.delete(id);
       if (error) reject(error);
       else resolve(metadata);
     };
-    jobs.set(id, { videoId, destination, kind, range, language, onTranscribing, finish, state: "waiting" });
+    const touch = () => {
+      clearTimeout(timeout);
+      const left = started + MAX_JOB_MS - Date.now();
+      timeout = setTimeout(() => finish(new Error("The YouTube download worker timed out.")), Math.max(1_000, Math.min(IDLE_JOB_MS, left)));
+    };
+    touch();
+    jobs.set(id, { videoId, destination, kind, range, language, onTranscribing, finish, touch, state: "waiting" });
   });
 }
 
@@ -62,6 +75,7 @@ export function registerYouTubeWorker(app) {
   app.post(`${prefix}/:id/transcribing`, (req, res) => {
     const job = jobs.get(req.params.id);
     if (job?.state !== "claimed" || job.kind !== "audio") return res.sendStatus(404);
+    job.touch();
     job.onTranscribing?.();
     return res.sendStatus(204);
   });

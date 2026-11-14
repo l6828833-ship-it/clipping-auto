@@ -996,7 +996,7 @@ async function localWhisperWords(audioPath, language = "auto") {
   // Keep PyTorch inference to one process at a time on the shared server.
   const transcription = whisperQueue.then(() => promisify(execFile)(
     WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
-    { timeout: 9e5, maxBuffer: 64 * 1024 * 1024 }
+    { timeout: 36e5, maxBuffer: 64 * 1024 * 1024 }
   ));
   whisperQueue = transcription.then(() => {}, () => {});
   const { stdout } = await transcription;
