@@ -13,6 +13,9 @@ the editor's timeline stores):
   {"segments": [{"start", "end", "zoom", "offsetX", "offsetY", "to"?, "ease"?}],
    "faceCoverage": 0..1, "shots": n}
 
+When two people share a shot and are too far apart for one crop, the crop
+cuts to whoever is speaking, judged by how much each mouth moves.
+
 A shot where the subject holds still gets one fixed crop. A shot where the
 subject moves gets a chain of short panning pieces that follow them. A shot
 with no face keeps the centre crop.
@@ -36,14 +39,22 @@ CUT_DIFF = 26.0        # mean absolute luma change (0-255) that marks a camera c
 PAN_SPEED = 0.3        # fastest camera glide, in source widths per second
 MIN_GLIDE = 0.7        # seconds; shorter moves read as a jolt
 MIN_SHOT = 0.75
+DETAIL = 2             # frames are read this many times larger than the detector needs,
+                       # so a small face still has enough pixels to see its mouth move
+SPEAK_MIN = 1.2        # mouth movement (luma units) below this is not speech
+SPEAK_LEAD = 1.35      # how much more a second person must move to take the shot
+SPEAK_CONFIRM = 1.0    # seconds they must keep that lead
+SPEAK_HOLD = 2.0       # shortest time on one person
 
 
-def read_frames(video, start, duration, width, height):
-    """Yields RGB frames scaled to fit the detector's input, without distortion."""
+def read_frames(video, start, duration, width, height, detail=1):
+    """Yields RGB frames scaled to fit the detector's input, without distortion.
+    With `detail` above 1 the frames are that many times larger; take every
+    `detail`-th pixel for the detector."""
     scale = min(NET_W / width, NET_H / height)
     w = max(2, int(round(width * scale / 2)) * 2)
     h = max(2, int(round(height * scale / 2)) * 2)
-    w, h = min(w, NET_W), min(h, NET_H)
+    w, h = min(w, NET_W) * detail, min(h, NET_H) * detail
     ffmpeg = os.environ.get("CLIP_MAKER_FFMPEG") or "ffmpeg"
     process = subprocess.Popen(
         [ffmpeg, "-v", "error", "-ss", f"{start:.3f}", "-i", video, "-t", f"{duration:.3f}", "-an",
@@ -115,6 +126,82 @@ def main_face(faces, previous):
         if abs(near[0] - previous) < 0.12 and near[2] >= 0.45 * largest[2]:
             return near
     return largest
+
+
+def mouth_motion(luma, previous, face):
+    """How much the mouth moved since the last frame, beyond the movement of
+    the face as a whole (a nod or a camera shake moves both)."""
+    if previous is None:
+        return 0.0
+    h, w = luma.shape
+    cx, cy, _, fw, fh = face
+    x1, x2 = int((cx - fw * 0.3) * w), int((cx + fw * 0.3) * w)
+    top, middle, bottom = int((cy - fh * 0.4) * h), int((cy + fh * 0.1) * h), int((cy + fh * 0.5) * h)
+    x1, x2 = max(0, x1), min(w, x2)
+    top, bottom = max(0, top), min(h, bottom)
+    if x2 - x1 < 3 or middle - top < 2 or bottom - middle < 2:
+        return 0.0
+    change = np.abs(luma - previous)
+    return max(0.0, float(change[middle:bottom, x1:x2].mean()) - float(change[top:middle, x1:x2].mean()))
+
+
+def follow_speaker(frames, kept):
+    """For one shot, picks who the crop follows in each frame.
+
+    `frames` is a list of face lists, each face (cx, cy, area, w, h, motion).
+    Returns (centres, switches): the followed face's centre-x per frame (None
+    where it was not found) and the frame indexes where the crop should cut to
+    another person. One person, or people close enough to share a crop, gives
+    the plain "largest face" behaviour and no switches."""
+    count = len(frames)
+    groups = []
+    for index, faces in enumerate(frames):
+        for face in faces:
+            group = next((g for g in groups if abs(float(np.median(g["x"])) - face[0]) < 0.12), None)
+            if group is None:
+                group = {"x": [], "at": {}, "area": []}
+                groups.append(group)
+            if index not in group["at"]:
+                group["x"].append(face[0])
+                group["area"].append(face[2])
+                group["at"][index] = face
+    present = [g for g in groups if len(g["at"]) >= max(3, 0.3 * count)]
+    if present:
+        biggest = max(float(np.median(g["area"])) for g in present)
+        # A face far in the background is audience, not a second speaker.
+        present = [g for g in present if float(np.median(g["area"])) >= 0.25 * biggest]
+    spread = max((float(np.median(g["x"])) for g in present), default=0) - min((float(np.median(g["x"])) for g in present), default=0)
+    if len(present) < 2 or spread < 0.55 * kept:
+        centres, previous = [], None
+        for faces in frames:
+            face = main_face(faces, previous)
+            previous = face[0] if face else previous
+            centres.append(face[0] if face else None)
+        return centres, []
+
+    radius = max(1, int(round(0.75 * SAMPLE_FPS)))
+    scores = []
+    for group in present:
+        raw = [group["at"][i][5] if i in group["at"] else 0.0 for i in range(count)]
+        scores.append([float(np.mean(raw[max(0, i - radius): i + radius + 1])) for i in range(count)])
+    opening = min(count, int(2 * SAMPLE_FPS))
+    active = max(range(len(present)), key=lambda p: (sum(scores[p][:opening]), float(np.median(present[p]["area"]))))
+    chosen, switches, lead, last = [], [], 0, 0
+    confirm, hold = int(round(SPEAK_CONFIRM * SAMPLE_FPS)), int(round(SPEAK_HOLD * SAMPLE_FPS))
+    for i in range(count):
+        rival = max(range(len(present)), key=lambda p: scores[p][i])
+        ahead = rival != active and scores[rival][i] > SPEAK_MIN and scores[rival][i] > SPEAK_LEAD * scores[active][i]
+        lead = lead + 1 if ahead else 0
+        chosen.append(active)
+        if lead >= confirm and i - last >= hold:
+            # Cut back to where they started talking, not where it was confirmed.
+            begin = max(last + hold, i - lead + 1)
+            for k in range(begin, i + 1):
+                chosen[k] = rival
+            switches.append(begin)
+            active, last, lead = rival, begin, 0
+    centres = [present[p]["at"][i][0] if i in present[p]["at"] else None for i, p in enumerate(chosen)]
+    return centres, switches
 
 
 def smooth(values, radius=2):
@@ -247,20 +334,29 @@ def main():
 
     session = load_detector()
 
-    centres, cuts = [], [0]
-    previous_luma, previous_x = None, None
-    for index, frame in enumerate(read_frames(video, start, duration, width, height)):
+    found, cuts = [], [0]
+    previous_luma = None
+    for index, frame in enumerate(read_frames(video, start, duration, width, height, DETAIL)):
         luma = frame.mean(axis=2)
-        if previous_luma is not None and float(np.abs(luma - previous_luma).mean()) > CUT_DIFF:
+        cut = previous_luma is not None and float(np.abs(luma - previous_luma).mean()) > CUT_DIFF
+        if cut:
             cuts.append(index)
-            previous_x = None
+        faces = detect(session, frame[::DETAIL, ::DETAIL])
+        # Nothing to compare a mouth against on the first frame of a shot.
+        found.append([(*face, mouth_motion(luma, None if cut else previous_luma, face)) for face in faces])
         previous_luma = luma
-        face = main_face(detect(session, frame), previous_x)
-        previous_x = face[0] if face else previous_x
-        centres.append(face[0] if face else None)
-    total = len(centres)
+    total = len(found)
     if total == 0:
         raise RuntimeError("no frames could be read from the clip")
+
+    # Who to follow in each camera shot. A change of speaker inside a shot is
+    # treated as a cut of its own: the crop jumps rather than sweeping across.
+    centres, speaker_cuts = [], []
+    for a, b in zip(cuts, cuts[1:] + [total]):
+        shot, switches = follow_speaker(found[a:b], kept)
+        centres.extend(shot)
+        speaker_cuts.extend(a + k for k in switches)
+    cuts = sorted(set(cuts) | set(speaker_cuts))
 
     def to_offset(x):
         return round(max(-1.0, min(1.0, (x - 0.5) / ((1 - kept) / 2))), 3)
@@ -317,7 +413,8 @@ def main():
         segments.extend(calm(pieces))
 
     coverage = sum(c is not None for c in centres) / total
-    json.dump({"segments": segments, "faceCoverage": round(coverage, 3), "shots": len(bounds)}, sys.stdout)
+    json.dump({"segments": segments, "faceCoverage": round(coverage, 3), "shots": len(bounds),
+               "speakerChanges": len(speaker_cuts)}, sys.stdout)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ import {
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import VideoStylePicker from "@/components/VideoStylePicker";
-import type { VideoLayout } from "@shared/video-styles.mjs";
+import { montageCaptionStyle, punchIns, type VideoLayout } from "@shared/video-styles.mjs";
 import {
   youTubeThumbnail,
   youTubeWatchUrl,
@@ -206,7 +206,8 @@ function ClipEditorModal({
   /** Video style the clip is exported in. Saved as soon as it is chosen. */
   const [layout, setLayout] = useState<VideoLayout | null>((clip.layout as VideoLayout | null) ?? null);
   const saveLayout = trpc.clips.update.useMutation({ onError: (err: { message: string }) => toast.error(err.message) });
-  const chooseLayout = (next: VideoLayout) => {
+  const chooseLayout = (next: VideoLayout | null) => {
+    if (!next) return;
     setLayout(next);
     saveLayout.mutate({ id: clip.id, layout: next });
   };
@@ -264,6 +265,9 @@ function ClipEditorModal({
     ...DEFAULT_SUBTITLE_STYLE,
     ...((savedSubtitle?.style as Partial<SubtitleStyle> | null) ?? {}),
   };
+  /* What the chosen video style does to the captions at render time, so the
+   * preview shows the same design. The saved style itself is left alone. */
+  const shownCaptionStyle = montageCaptionStyle(layout?.style, captionStyle) as SubtitleStyle;
   const captionWords = useMemo(
     () => previewWordsFor(video?.transcript ?? "", clip.startTime, []),
     [video?.transcript, clip.startTime]
@@ -330,11 +334,11 @@ function ClipEditorModal({
   const visibleCaption = useMemo(() => {
     if (effectiveWords.length > 0) {
       // The line the renderer would show at the playhead, in the chosen design.
-      const frame = captionFrame(effectiveWords, captionStyle, playhead);
+      const frame = captionFrame(effectiveWords, shownCaptionStyle, playhead);
       return frame ? { words: frame.words, activeIndex: frame.activeIndex, wordIndex: frame.anchorIndex } : null;
     }
     return captionWords.length > 0 ? { words: captionWords, activeIndex: 0, wordIndex: -1 } : null;
-  }, [effectiveWords, playhead, captionWords, captionStyle.preset, captionStyle.fontSize, captionStyle.uppercase]);
+  }, [effectiveWords, playhead, captionWords, shownCaptionStyle.preset, shownCaptionStyle.fontSize, shownCaptionStyle.uppercase]);
 
   const hostedStatus = (video?.hostedStatus ?? "none") as "none" | "downloading" | "ready" | "error";
   const hostedUrl = video?.hostedUrl ?? null;
@@ -351,6 +355,21 @@ function ClipEditorModal({
   );
   const sourceYtId = parseYouTubeId(video?.sourceUrl);
   const duration = Math.max(0, end - start);
+
+  /* The video style as the preview player imitates it. */
+  const { data: library } = trpc.videos.list.useQuery(undefined, { enabled: layout?.backgroundVideoId != null });
+  const backgroundUrl = layout?.backgroundVideoId != null
+    ? ((library as { id: number; hostedUrl?: string | null }[] | undefined)?.find(v => v.id === layout.backgroundVideoId)?.hostedUrl ?? null)
+    : null;
+  const punches = useMemo(
+    () => (layout?.style === "dynamic" ? punchIns(effectiveWords, duration) : []),
+    [layout?.style, effectiveWords, duration],
+  );
+  const look = {
+    style: layout?.style ?? "normal",
+    backgroundUrl,
+    punch: punches.some(([a, b]) => playhead >= a && playhead < b),
+  };
   const valid = end > start;
   const isRendered = !!clip.downloadUrl && clip.downloadUrl !== "#";
   const rendering = clip.status === "rendering";
@@ -514,6 +533,7 @@ function ClipEditorModal({
                   scale={videoScale}
                   barColor={barColor}
                   skip={playerCuts}
+                  look={look}
                   onTime={t => {
                     setPreviewTime(t);
                     setPlayhead(Math.max(0, t + hostedOffset - start));
@@ -534,7 +554,7 @@ function ClipEditorModal({
                       <SubtitleOverlay
                         words={visibleCaption.words}
                         activeIndex={visibleCaption.activeIndex}
-                        style={captionStyle}
+                        style={shownCaptionStyle}
                         positionOverride={posOverride}
                         onPositionChange={pos => {
                           if (captionIdx >= 0) {
@@ -725,7 +745,7 @@ function ClipEditorModal({
             <div className="flex items-center justify-between text-xs">
               <span className="text-muted-foreground">Clip length</span>
               <span className={`font-bold ${valid ? "text-foreground" : "text-red-400"}`}>
-                {valid ? `${duration}s` : "End must be after start"}
+                {valid ? `${Math.round(duration * 10) / 10}s` : "End must be after start"}
               </span>
             </div>
 
@@ -1172,7 +1192,9 @@ export default function ClipsPage() {
                 {/* Thumbnail — real poster frame when we have one */}
                 <div
                   className="relative cursor-pointer overflow-hidden"
-                  style={{ aspectRatio: "9/16", maxHeight: "200px", background: "linear-gradient(135deg, #0a0a1a, #1a0a2e)" }}
+                  /* A fixed height across the whole card. A 9:16 box capped at this
+                   * height came out a third of the card wide, with a blank strip beside it. */
+                  style={{ height: "200px", background: "linear-gradient(135deg, #0a0a1a, #1a0a2e)" }}
                   onClick={open}
                 >
                   {ytId && (

@@ -10,6 +10,7 @@
         "HOST=127.0.0.1",
         "PORT=3000",
         "CLIP_MAKER_YOUTUBE_WORKER_TOKEN=",
+        "CLIP_MAKER_DB_POOL_MAX=1",
         "node",
         "dist/index.js"
       ],

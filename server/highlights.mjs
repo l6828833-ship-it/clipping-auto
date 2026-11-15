@@ -9,8 +9,10 @@
  * clip starts on the first word of a thought and ends after the last word of
  * its payoff.
  */
+import { transcriptLines } from "../shared/lines.mjs";
 
-const SENTENCE_END = /[.!?؟…]["'»)\]]*$/;
+export { transcriptLines };
+
 /** Words a clip should not open on: they point back at something unseen. */
 const WEAK_OPENERS = new Set([
   "and", "but", "so", "because", "or", "then", "also", "which", "that",
@@ -19,37 +21,6 @@ const WEAK_OPENERS = new Set([
 ]);
 
 const fmt = (seconds) => (Math.round(seconds * 10) / 10).toFixed(1);
-
-/**
- * Groups timed words into lines that break at sentence ends and pauses.
- * Returns `[{ start, end, text, first, last }]` (`first`/`last` index `words`).
- */
-export function transcriptLines(words, { maxWords = 16, maxSeconds = 9, pause = 0.7 } = {}) {
-  const lines = [];
-  let current = null;
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    const text = String(w.word ?? "").trim();
-    if (!text || !Number.isFinite(w.start)) continue;
-    const end = Number.isFinite(w.end) && w.end > w.start ? w.end : w.start + 0.3;
-    const prev = current ? words[current.last] : null;
-    const prevEnd = prev ? (Number.isFinite(prev.end) && prev.end > prev.start ? prev.end : prev.start + 0.3) : 0;
-    const breakHere = !current
-      || current.count >= maxWords
-      || end - current.start > maxSeconds
-      || w.start - prevEnd >= pause
-      || SENTENCE_END.test(String(prev.word).trim());
-    if (breakHere) {
-      current = { start: w.start, end, text: "", first: i, last: i, count: 0 };
-      lines.push(current);
-    }
-    current.text += (current.text ? " " : "") + text;
-    current.end = Math.max(current.end, end);
-    current.last = i;
-    current.count += 1;
-  }
-  return lines;
-}
 
 /** The transcript as the model sees it: one `[start-end] text` line per thought. */
 export function formatTimedTranscript(lines) {
@@ -124,7 +95,7 @@ ${languageInstruction}`;
   const user = `Find the ${count} best clips in this video.
 
 ${timing}
-Length: 20 to 60 seconds each; go up to 90 only when a story needs it. Let the content decide the length - do not pad and do not make every clip the same length.
+Length: 20 to 60 seconds each; go up to 90 only when a story needs it. NEVER shorter than 18 seconds: a clip of a few seconds is a punchline with no setup and means nothing to a stranger. If a moment is short, start earlier so the clip includes what leads up to it. Let the content decide the length - do not pad and do not make every clip the same length.
 Clips must not overlap. Take them from wherever the best moments are; do not spread them evenly for its own sake.
 
 ${extras.join("\n\n")}
@@ -137,7 +108,7 @@ Return exactly this JSON shape:
   "highlights": [
     {
       "id": 1,
-      "title": "SHORT CATCHY TITLE IN CAPS (max 8 words)",
+      "title": "short catchy title, max 8 words, in the required language (capitals where the script has them)",
       "startTime": <seconds, the start of the hook line>,
       "endTime": <seconds, the end of the payoff line>,
       "engagementScore": <integer 60-99, honest: 90+ only for a genuinely exceptional hook AND payoff>,
@@ -173,7 +144,7 @@ const wordEnd = (w) => (Number.isFinite(w.end) && w.end > w.start ? w.end : w.st
  * after the last so the cut is not clipped. Overlapping picks are dropped,
  * weakest first.
  */
-export function snapHighlights(highlights, words, { videoDuration, minSeconds = 8, maxSeconds = 95, reach = 3 } = {}) {
+export function snapHighlights(highlights, words, { videoDuration, minSeconds = 8, maxSeconds = 95, reach = 3, growTo = 18 } = {}) {
   const usable = (words ?? []).filter((w) => Number.isFinite(w.start));
   const limit = videoDuration && videoDuration > 0 ? videoDuration : Infinity;
   let out = highlights.map((h) => ({ ...h }));
@@ -202,6 +173,27 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
         const prev = [...usable].reverse().find((w) => wordEnd(w) <= h.endTime + 0.05);
         if (prev && h.endTime - wordEnd(prev) <= reach && wordEnd(prev) > start) end = wordEnd(prev);
       }
+      /* Too short to mean anything: a few seconds is a punchline with no
+       * setup, or half a sentence. Grow it line by line, backwards first (the
+       * setup comes before the moment the model picked), then forwards, until
+       * it is long enough to stand on its own. */
+      if (growTo > 0 && end - start < growTo) {
+        let first = lines.findIndex((l) => l.start >= start - 0.01);
+        let last = -1;
+        for (let i = lines.length - 1; i >= 0; i--) if (lines[i].end <= end + 0.01) { last = i; break; }
+        if (first >= 0 && last >= first) {
+          let back = true;
+          for (let guard = 0; guard < 40 && lines[last].end - lines[first].start < growTo; guard++) {
+            const canBack = first > 0 && lines[first].start - lines[first - 1].end < 4;
+            const canForward = last + 1 < lines.length && lines[last + 1].start - lines[last].end < 4;
+            if (!canBack && !canForward) break;
+            if ((back && canBack) || !canForward) first--; else last++;
+            back = !back;
+          }
+          start = lines[first].start;
+          end = lines[last].end;
+        }
+      }
       /* Leave air only where there is silence to leave it in. */
       const before = [...usable].reverse().find((w) => wordEnd(w) <= start + 0.01);
       const after = usable.find((w) => w.start >= end - 0.01);
@@ -229,8 +221,14 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
   const round = (n) => Math.round(n * 100) / 100;
   out = out
     .map((h) => {
-      const startTime = round(Math.max(0, Math.min(h.startTime, limit - 1)));
+      let startTime = round(Math.max(0, Math.min(h.startTime, limit - 1)));
       let endTime = round(Math.min(limit, h.endTime));
+      /* Without word timings there are no lines to grow along, so widen a
+       * too-short pick around itself, mostly backwards into the setup. */
+      if (growTo > 0 && usable.length < 5 && endTime - startTime < growTo) {
+        startTime = round(Math.max(0, startTime - (growTo - (endTime - startTime)) * 0.6));
+        endTime = round(Math.min(limit, Math.max(endTime, startTime + growTo)));
+      }
       if (endTime - startTime > maxSeconds) endTime = round(startTime + maxSeconds);
       return { ...h, startTime, endTime };
     })
@@ -251,4 +249,57 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
 /** How many highlights sit on a most-replayed peak. */
 export function countOnPeaks(highlights, peaks) {
   return highlights.filter((h) => peaks.some((p) => Math.min(p.end, h.endTime) - Math.max(p.start, h.startTime) > 2)).length;
+}
+
+/* ── Language of the generated titles ────────────────────────────────────── */
+
+const SCRIPTS = [
+  ["Arabic", /[؀-ۿݐ-ݿ]/g],
+  ["Chinese", /[一-鿿]/g],
+  ["Japanese", /[぀-ヿ]/g],
+  ["Korean", /[가-힯]/g],
+  ["Hindi", /[ऀ-ॿ]/g],
+  ["Russian", /[Ѐ-ӿ]/g],
+];
+/* Very common words that rarely appear in the other languages listed. */
+const LATIN_WORDS = {
+  English: ["the", "and", "you", "that", "this", "with", "was", "have", "what", "they", "are", "it's"],
+  French: ["les", "des", "est", "une", "pas", "que", "vous", "mais", "dans", "c'est", "avec", "pour"],
+  Spanish: ["los", "las", "que", "una", "pero", "porque", "como", "muy", "esto", "está", "para", "eso"],
+  German: ["der", "die", "das", "und", "ist", "nicht", "ich", "auch", "eine", "wir", "aber", "mit"],
+  Portuguese: ["não", "uma", "você", "isso", "mas", "com", "para", "muito", "também", "está", "então", "como"],
+  /* Darija typed in Latin letters ("3" and "7" stand for Arabic sounds). */
+  "Moroccan Darija": ["wach", "bzaf", "dyal", "hada", "hadchi", "ghadi", "3la", "m3a", "7ta", "kayn", "chno", "walakin"],
+};
+const DARIJA_ARABIC = ["ديال", "بزاف", "واش", "هادشي", "غادي", "دابا", "كاين", "شنو", "علاش", "مزيان", "هاد", "ماشي", "كيفاش", "بغيت"];
+
+/**
+ * Names the language a transcript is spoken in, or "" when it cannot tell.
+ * A cheap guess from the letters and the commonest words: it only has to be
+ * good enough to tell the model which language to answer in.
+ */
+export function detectTextLanguage(text) {
+  const sample = String(text ?? "").slice(0, 60000).toLowerCase();
+  const letters = (sample.match(/\p{L}/gu) ?? []).length;
+  if (letters < 20) return "";
+  for (const [name, pattern] of SCRIPTS) {
+    const share = (sample.match(pattern) ?? []).length / letters;
+    /* Japanese text is mostly kanji, so a small share of kana is enough. */
+    if (share < (name === "Japanese" ? 0.1 : 0.4)) continue;
+    if (name === "Chinese" && /[぀-ヿ]/.test(sample)) continue;
+    if (name !== "Arabic") return name;
+    const tokens = sample.split(/[^\p{L}]+/u);
+    const darija = tokens.filter((t) => DARIJA_ARABIC.includes(t)).length;
+    return darija >= 3 && darija / tokens.length > 0.004 ? "Moroccan Darija in Arabic script" : "Arabic";
+  }
+  const tokens = sample.split(/[^\p{L}\p{N}']+/u).filter(Boolean);
+  if (tokens.length < 20) return "";
+  let best = "", bestHits = 0, second = 0;
+  for (const [name, list] of Object.entries(LATIN_WORDS)) {
+    const hits = tokens.filter((t) => list.includes(t)).length;
+    if (hits > bestHits) { second = bestHits; best = name; bestHits = hits; }
+    else if (hits > second) second = hits;
+  }
+  /* Needs a clear lead: a wrong guess is worse than no guess. */
+  return bestHits / tokens.length > 0.03 && bestHits >= second * 1.5 ? best : "";
 }

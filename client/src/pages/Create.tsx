@@ -2,13 +2,13 @@ import { useState, useRef, useMemo, useEffect } from "react";
 // (useRef/useEffect drive the one-shot import trigger in StepSubtitles)
 import AppLayout from "@/components/AppLayout";
 import ClipPreview from "@/components/ClipPreview";
-import VideoFramer, { CropView, DEFAULT_FRAMING, type Framing } from "@/components/VideoFramer";
+import { CropView, DEFAULT_FRAMING } from "@/components/VideoFramer";
 import SubtitleOverlay, {
-  DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE, PRESET_Y,
-  CAPTION_FONTS, CaptionPresetPicker, captionFrame,
+  DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE,
+  CAPTION_FONTS, CaptionPresetPicker,
 } from "@/components/SubtitleOverlay";
 import type { CaptionPresetId } from "@shared/captions.mjs";
-import { AI_VIDEO_STYLES, type VideoLayout } from "@shared/video-styles.mjs";
+import { AI_VIDEO_STYLES, VIDEO_STYLES, montageCaptionStyle, type VideoLayout, type VideoStyleId } from "@shared/video-styles.mjs";
 import VideoStylePicker from "@/components/VideoStylePicker";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { trpc } from "@/lib/trpc";
@@ -18,23 +18,19 @@ import {
   Upload, Link2, Sparkles, Type, Download, CheckCircle2,
   Loader2, Play, Clock, FileVideo, Youtube,
   X, Palette, Save, Film, ArrowRight, ChevronRight, Zap,
-  Brain, AlertCircle, RefreshCw, Wand2, Key, ExternalLink,
-  Mic, Captions, Globe2, ChevronDown, Scissors, Move, ScanFace,
+  AlertCircle, RefreshCw, Wand2,
+  Mic, Captions, Globe2, ChevronDown,
 } from "lucide-react";
-import ClipTimeline, { type TimelineWord, type Keyframe } from "@/components/ClipTimeline";
-import {
-  materialiseSegments, setSegmentKeyframe, isAnimated, segmentTarget,
-  framingAt, segmentAt, type FramingSegment,
-} from "@shared/framing";
+import type { TimelineWord } from "@/components/ClipTimeline";
+import { framingAt, segmentAt, type FramingSegment } from "@shared/framing";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type Step = 1 | 2 | 3 | 4 | 5;
+type Step = 1 | 2 | 3 | 4;
 const STEPS = [
   { id: 1, label: "Input",      icon: Upload   },
   { id: 2, label: "Highlights", icon: Sparkles },
-  { id: 3, label: "Subtitles",  icon: Type     },
-  { id: 4, label: "Edit",       icon: Scissors },
-  { id: 5, label: "Export",     icon: Download },
+  { id: 3, label: "Captions",   icon: Type     },
+  { id: 4, label: "Export",     icon: Download },
 ] as const;
 
 type Highlight = {
@@ -123,8 +119,11 @@ function StepBar({ current, onGo }: { current: Step; onGo: (s: Step) => void }) 
 }
 
 // ─── Step 1: Input with auto-extraction ──────────────────────────────────────
-function StepInput({ apiKey, onNext }: {
+function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   apiKey: string;
+  /** Video style for every clip of this video; null lets the AI pick per clip. */
+  layout: VideoLayout | null;
+  onLayoutChange: (layout: VideoLayout | null) => void;
   onNext: (v: {
     videoId: number; title: string; url: string;
     transcript: string; duration: number; subtitlesOn: boolean;
@@ -304,6 +303,13 @@ function StepInput({ apiKey, onNext }: {
       </div>
 
       {!apiKey && <NoKeyWarning />}
+
+      {/* Video style, chosen once for every clip made from this video */}
+      <div className="glass rounded-2xl p-4 mb-5">
+        <p className="text-sm font-bold text-foreground">Video style</p>
+        <p className="text-xs text-muted-foreground mb-3">How your clips will look. Applies to every clip from this video.</p>
+        <VideoStylePicker value={layout} onChange={onLayoutChange} allowAuto />
+      </div>
 
       {/* Subtitles on/off — decided before anything is transcribed */}
       <button
@@ -823,7 +829,7 @@ function StepHighlights({
                       </div>
                       <div className="flex items-center gap-3 text-xs text-muted-foreground mb-2">
                         <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{fmt(h.startTime)}–{fmt(h.endTime)}</span>
-                        <span>{h.endTime - h.startTime}s</span>
+                        <span>{Math.round(h.endTime - h.startTime)}s</span>
                       </div>
                       <p dir="auto" className="text-xs text-muted-foreground italic">{h.reason}</p>
                       <div className="mt-2 h-1 rounded-full bg-secondary overflow-hidden">
@@ -892,10 +898,12 @@ function useClipPreviewImport(
 
 // ─── Step 3: Subtitles ────────────────────────────────────────────────────────
 function StepSubtitles({
-  clips, videoId, captionsOn, onCaptionsChange, onNext,
+  clips, videoId, layout, captionsOn, onCaptionsChange, onNext,
 }: {
   clips: Highlight[];
   videoId: number | null;
+  /** Video style chosen in the first step; null uses the AI's pick per clip. */
+  layout: VideoLayout | null;
   /** Whether captions get burned into the exports. */
   captionsOn: boolean;
   onCaptionsChange: (on: boolean) => void;
@@ -954,10 +962,54 @@ function StepSubtitles({
 
   const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
 
+  /* Fetch every selected clip's part of the video in the background, once, so
+   * switching the preview to clip 2, 3, 4… and the export that follows find
+   * them already downloaded instead of starting from zero. */
+  const prefetch = trpc.videos.prefetch.useMutation();
+  const prefetched = useRef("");
+  useEffect(() => {
+    if (videoId == null || clips.length === 0) return;
+    const key = `${videoId}:${clips.map(c => `${c.startTime}-${c.endTime}`).join(",")}`;
+    if (prefetched.current === key) return;
+    prefetched.current = key;
+    const ranges = clips.slice(0, 12).map(c => ({ startTime: c.startTime, endTime: c.endTime }));
+    /* Best effort, with one more try: nothing breaks if it fails, the clips
+     * are simply fetched when they are needed. */
+    prefetch.mutateAsync({ id: videoId, ranges })
+      .catch(() => new Promise(resolve => setTimeout(resolve, 4000)).then(() => prefetch.mutateAsync({ id: videoId, ranges })))
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoId, clips]);
+
   const previewWords = useMemo(
     () => clip ? wordsInClip(video?.transcriptWords, clip).slice(0, 4).map(word => word.word) : [],
     [video?.transcriptWords, clip]
   );
+
+  /* The video style this clip will be exported in, imitated by the preview. */
+  const clipStyle = layout?.style
+    ?? (clip?.montage && (AI_VIDEO_STYLES as string[]).includes(clip.montage) ? clip.montage : "normal");
+  const { data: library } = trpc.videos.list.useQuery(undefined, { enabled: layout?.backgroundVideoId != null });
+  const backgroundUrl = layout?.backgroundVideoId != null
+    ? ((library as { id: number; hostedUrl?: string | null }[] | undefined)?.find(v => v.id === layout.backgroundVideoId)?.hostedUrl ?? null)
+    : null;
+  const shownStyle = montageCaptionStyle(clipStyle, style) as SubStyle;
+
+  /* The framing the export will use: the server follows the speaker's face.
+   * Asked for once the clip's part of the video is imported, so the preview
+   * shows the same crop as the finished clip rather than the plain centre. */
+  const { data: autoFraming } = trpc.videos.previewFraming.useQuery(
+    { id: videoId ?? 0, startTime: clip?.startTime ?? 0, endTime: clip?.endTime ?? 0 },
+    { enabled: videoId != null && !!clip && hostedStatus === "ready", staleTime: Infinity },
+  );
+  /** Playback position in the clip, in steps coarse enough not to re-render every frame. */
+  const [previewTime, setPreviewTime] = useState(0);
+  useEffect(() => { setPreviewTime(0); }, [clip?.id]);
+  const previewFraming = useMemo(() => {
+    const segments = ((autoFraming as { segments?: FramingSegment[] } | undefined)?.segments ?? []);
+    const index = segments.length ? segmentAt(segments, previewTime) : undefined;
+    return index != null ? framingAt(segments[index], previewTime) : DEFAULT_FRAMING;
+  }, [autoFraming, previewTime]);
 
   // Keep the highlighted word inside the current slice.
   useEffect(() => {
@@ -1050,7 +1102,7 @@ function StepSubtitles({
         <div className="glass rounded-2xl overflow-hidden self-start">
           <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-2">
             <span className="text-sm font-semibold">Live Preview</span>
-            <span className="text-[10px] text-muted-foreground">Styling only</span>
+            <span className="text-[10px] text-muted-foreground">{VIDEO_STYLES[clipStyle as VideoStyleId]?.label ?? "Normal"} style</span>
           </div>
           <div className="p-4 flex flex-col items-center gap-3">
             {/* Clip switcher, when more than one is selected. */}
@@ -1068,23 +1120,25 @@ function StepSubtitles({
 
             {hostedStatus === "ready" && hostedUrl ? (
               /*
-               * No `onChange`, so the frame cannot be panned here — reframing is
-               * a per-clip decision made in Edit. The caption IS draggable,
+               * No `onChange`, so the frame cannot be panned here: the export
+               * follows the speaker by itself. The caption IS draggable,
                * because where it sits is part of the look being styled.
                */
               <CropView
                 src={hostedUrl}
-                framing={DEFAULT_FRAMING}
+                framing={previewFraming}
                 startTime={(clip?.startTime ?? 0) - hostedOffset}
                 endTime={(clip?.endTime ?? 0) - hostedOffset}
                 className="w-full shadow-2xl"
                 style={{ maxWidth: "300px" }}
+                look={{ style: clipStyle, backgroundUrl }}
+                onTime={t => setPreviewTime(Math.max(0, Math.round((t + hostedOffset - (clip?.startTime ?? 0)) * 20) / 20))}
               >
                 {captionsOn && previewWords.length > 0 && (
                   <SubtitleOverlay
                     words={previewWords}
                     activeIndex={activeWord}
-                    style={style}
+                    style={shownStyle}
                     onWordClick={setActiveWord}
                     onPositionChange={setFreePos}
                   />
@@ -1133,21 +1187,13 @@ function StepSubtitles({
         </div>
       </div>
       <button onClick={() => onNext(style)} className="mt-6 w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm transition-all hover:opacity-90 glow-green" style={{ background: "linear-gradient(135deg, var(--mint), oklch(0.65 0.20 165))", color: "black" }}>
-        <Save className="w-4 h-4" /> Save Style & Edit Clips <ArrowRight className="w-4 h-4" />
+        <Save className="w-4 h-4" /> Save & Export Clips <ArrowRight className="w-4 h-4" />
       </button>
     </div>
   );
 }
 
-// ─── Step 4: Edit ─────────────────────────────────────────────────────────────
-
-/** Everything the editor tracks for one clip. */
-type ClipEdit = {
-  clipId: number;
-  framing: Framing;
-  segments: FramingSegment[];
-};
-
+/** The words spoken inside a clip, in clip-relative seconds. */
 function wordsInClip(words: TimelineWord[] | null | undefined, clip: Highlight): TimelineWord[] {
   if (!Array.isArray(words)) return [];
   return words
@@ -1160,639 +1206,140 @@ function wordsInClip(words: TimelineWord[] | null | undefined, clip: Highlight):
     .filter(word => word.end > word.start);
 }
 
+// ─── Step 4: Export ───────────────────────────────────────────────────────────
 /**
- * Timeline editing for every selected clip, on one page.
- *
- * Clip rows are created here rather than at export, because framing sections and
- * subtitle timings are per-clip data and cannot be saved without a row to attach
- * them to. Export then just renders what this step has already saved.
+ * Creates a clip row for every selected highlight, saves the caption design
+ * and video style on it, then renders them all, one after another, without
+ * waiting to be asked. The server imports each clip's part of the video,
+ * follows the speaker and transcribes as part of the render, so there is
+ * nothing to prepare by hand in between.
  */
-function StepEdit({
-  clips, videoId, style, captionsOn, onCaptionsChange, onNext,
-}: {
-  clips: Highlight[];
-  videoId: number | null;
-  style: SubStyle;
-  captionsOn: boolean;
-  onCaptionsChange: (on: boolean) => void;
-  onNext: (clipIds: Record<number, number>) => void;
-}) {
-  const utils = trpc.useUtils();
-  const [active, setActive] = useState(0);
-  const [edits, setEdits] = useState<Record<number, ClipEdit>>({});
-  const [selectedSegment, setSelectedSegment] = useState<number | null>(null);
-  const [editingKeyframe, setEditingKeyframe] = useState<Keyframe>("from");
-  const [playhead, setPlayhead] = useState(0);
-  const [previewTime, setPreviewTime] = useState<number | null>(null);
-  /*
-   * One transport for both players. `seek` is a nonce-carrying request so that
-   * reporting playback position back up cannot trigger another seek, and
-   * `playing` lets the full-frame view mirror the main preview.
-   */
-  const [seek, setSeek] = useState<{ time: number; nonce: number } | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const seekNonce = useRef(0);
-  const [saving, setSaving] = useState(false);
-  const [rendering, setRendering] = useState<Set<number>>(new Set());
-  const [rendered, setRendered] = useState<Set<number>>(new Set());
-
-  const clip = clips[active];
-
-  const { data: video } = trpc.videos.get.useQuery(
-    { id: videoId ?? 0 },
-    { enabled: videoId != null, refetchInterval: 3000, retry: false }
-  );
-  const hostedOffset = video?.hostedOffset ?? 0;
-
-  /*
-   * Rows already on this video. Re-entering the step must reuse them rather than
-   * creating a second row per clip, which is what would happen if the user went
-   * back to Subtitles and forward again.
-   */
-  const { data: existingClips } = trpc.clips.listByVideo.useQuery(
-    { videoId: videoId ?? 0 },
-    { enabled: videoId != null, retry: false }
-  );
-
-  const createClip = trpc.clips.create.useMutation();
-  const updateClip = trpc.clips.update.useMutation();
-  const saveSubtitles = trpc.subtitles.save.useMutation();
-  const startRender = trpc.clips.render.useMutation();
-  const transcribeClip = trpc.clips.transcribe.useMutation();
-  const host = trpc.videos.host.useMutation({
-    onSuccess: async () => { await utils.videos.get.invalidate(); },
-    onError: err => toast.error(`Import failed: ${err.message}`),
-  });
-
-  const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
-
-  /* Fetch every selected clip's range in the background, once, so moving to
-   * another clip does not start its import from zero. */
-  const prefetch = trpc.videos.prefetch.useMutation();
-  const prefetched = useRef("");
-  useEffect(() => {
-    if (videoId == null || clips.length === 0) return;
-    const key = `${videoId}:${clips.map(c => `${c.startTime}-${c.endTime}`).join(",")}`;
-    if (prefetched.current === key) return;
-    prefetched.current = key;
-    prefetch.mutate({ id: videoId, ranges: clips.slice(0, 12).map(c => ({ startTime: c.startTime, endTime: c.endTime })) });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoId, clips]);
-
-  /*
-   * Create a row per selected clip, once. The ref guard matters: this effect can
-   * run twice in development and duplicate rows would be created otherwise.
-   */
-  const creating = useRef(false);
-  useEffect(() => {
-    if (videoId == null || clips.length === 0 || creating.current) return;
-    // Wait for the existing rows, so a reusable one is never missed.
-    if (!existingClips) return;
-    if (clips.every(h => edits[h.id])) return;
-    creating.current = true;
-
-    (async () => {
-      const next: Record<number, ClipEdit> = {};
-      for (const h of clips) {
-        if (edits[h.id]) { next[h.id] = edits[h.id]; continue; }
-
-        // Same range on the same video is the same clip.
-        const found = existingClips.find(c =>
-          Math.abs((c.startTime ?? -1) - h.startTime) < 0.5 &&
-          Math.abs((c.endTime ?? -1) - h.endTime) < 0.5
-        );
-
-        if (found) {
-          next[h.id] = {
-            clipId: found.id,
-            framing: {
-              zoom: found.zoom ?? DEFAULT_FRAMING.zoom,
-              offsetX: found.offsetX ?? DEFAULT_FRAMING.offsetX,
-              offsetY: found.offsetY ?? DEFAULT_FRAMING.offsetY,
-            },
-            segments: (found.framingSegments as FramingSegment[] | null) ?? [],
-          };
-          continue;
-        }
-
-        try {
-          const { id } = await createClip.mutateAsync({
-            videoId,
-            title: h.title,
-            startTime: h.startTime,
-            endTime: h.endTime,
-            engagementScore: h.engagementScore,
-            // Start from the style the AI suggested; the picker can change it.
-            ...(h.montage && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage } : {}),
-          });
-          next[h.id] = {
-            clipId: id,
-            framing: DEFAULT_FRAMING,
-            segments: [],
-          };
-        } catch (err) {
-          toast.error(err instanceof Error ? err.message : `Could not prepare "${h.title}"`);
-        }
-      }
-      setEdits(prev => ({ ...next, ...prev }));
-      await utils.clips.list.invalidate();
-      await utils.clips.listByVideo.invalidate();
-      creating.current = false;
-    })();
-    // Deliberately keyed on the clip set, the video, and the existing rows.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoId, clips, existingClips]);
-
-  const current = clip ? edits[clip.id] : undefined;
-  const clipId = current?.clipId;
-  const { data: savedCaptions } = trpc.subtitles.get.useQuery(
-    { clipId: clipId ?? 0 },
-    { enabled: captionsOn && clipId != null },
-  );
-  const previewWords = useMemo(() => {
-    if (!clip) return [];
-    const saved = wordsInClip(savedCaptions?.words, clip);
-    return saved.length ? saved : wordsInClip(video?.transcriptWords, clip);
-  }, [clip, savedCaptions?.words, video?.transcriptWords]);
-  const transcribing = useRef(new Map<number, Promise<unknown>>());
-  useEffect(() => {
-    if (!captionsOn || hostedStatus !== "ready" || clipId == null || savedCaptions === undefined
-        || previewWords.length || transcribing.current.has(clipId)) return;
-    const request = transcribeClip.mutateAsync({ id: clipId, force: true }).then(() =>
-      utils.subtitles.get.invalidate({ clipId }),
-    ).catch(() => {});
-    transcribing.current.set(clipId, request);
-  }, [captionsOn, hostedStatus, clipId, savedCaptions, previewWords.length, transcribeClip.mutateAsync, utils]);
-  const duration = clip ? Math.max(1, (clip.endTime ?? 0) - (clip.startTime ?? 0)) : 1;
-
-  const patch = (next: Partial<ClipEdit>) => {
-    if (!clip || !current) return;
-    setEdits(prev => ({ ...prev, [clip.id]: { ...prev[clip.id], ...next } }));
-  };
-
-  /* Video style per clip: what was chosen here, else what is saved on the
-   * clip (which starts as the AI's suggestion). */
-  const [layouts, setLayouts] = useState<Record<number, VideoLayout>>({});
-  const savedLayout = (existingClips as { id: number; layout?: unknown }[] | undefined)
-    ?.find(c => c.id === current?.clipId)?.layout as VideoLayout | null | undefined;
-  const activeLayout = clip ? layouts[clip.id] ?? savedLayout ?? null : null;
-  const chooseLayout = (layout: VideoLayout) => {
-    if (!clip || !current) return;
-    setLayouts(prev => ({ ...prev, [clip.id]: layout }));
-    updateClip.mutate({ id: current.clipId, layout });
-  };
-
-  /** Jump cuts: the server finds pauses and filler sounds from the word timings. */
-  const tightenClip = trpc.clips.tighten.useMutation();
-  const [cutsByClip, setCutsByClip] = useState<Record<number, { start: number; end: number }[]>>({});
-  /* What the export will leave out for the clip being edited: cuts made in
-   * this session, else the ones already saved on the clip. */
-  const activeCuts: { start: number; end: number }[] = clip
-    ? cutsByClip[clip.id]
-      ?? ((existingClips as { id: number; cuts?: unknown }[] | undefined)?.find(c => c.id === current?.clipId)?.cuts as { start: number; end: number }[] | null | undefined)
-      ?? []
-    : [];
-  const playerCuts = clip
-    ? activeCuts.map(c => ({ start: clip.startTime + c.start - hostedOffset, end: clip.startTime + c.end - hostedOffset }))
-    : [];
-  const tighten = async () => {
-    if (!clip || !current) return;
-    const key = clip.id;
-    const enabled = activeCuts.length === 0;
-    try {
-      const data = await tightenClip.mutateAsync({ id: current.clipId, enabled });
-      setCutsByClip(prev => ({ ...prev, [key]: data.cuts }));
-      if (!enabled) toast.success("Cuts removed. The export is the full clip again.");
-      else if (data.cuts.length === 0) toast.info("No pauses long enough to cut in this clip.");
-      else toast.success(`Removed ${data.removedSeconds}s of pauses in ${data.cuts.length} cut${data.cuts.length === 1 ? "" : "s"}. The export will be ${(data.duration - data.removedSeconds).toFixed(1)}s.`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not tighten this clip.");
-    }
-  };
-
-  /** AI reframing: the server follows the speaker's face and returns a framing timeline. */
-  const autoFrame = trpc.clips.autoFrame.useMutation();
-  const [reframing, setReframing] = useState<Set<number>>(new Set());
-  const reframe = async (silent = false) => {
-    if (!clip || !current) return;
-    // Edits are keyed by the highlight; the server knows the saved clip row.
-    const key = clip.id;
-    setReframing(prev => new Set(prev).add(key));
-    try {
-      const data = await autoFrame.mutateAsync({ id: current.clipId });
-      if (!data.found) {
-        if (!silent) toast.info(data.reason ? `Nothing to reframe: ${data.reason}.` : "No face was found in this clip, so the framing was left as it is.");
-        return;
-      }
-      setEdits(prev => prev[key] ? { ...prev, [key]: { ...prev[key], framing: DEFAULT_FRAMING, segments: data.segments } } : prev);
-      toast.success(`Framing now follows the speaker across ${data.shots} shot${data.shots === 1 ? "" : "s"}.`);
-    } catch (err) {
-      if (!silent) toast.error(err instanceof Error ? err.message : "AI reframing failed.");
-    } finally {
-      setReframing(prev => { const next = new Set(prev); next.delete(key); return next; });
-    }
-  };
-  /* Reframe automatically, once per clip, as soon as its video is imported
-   * and it still has the default framing. The button stays for redoing it. */
-  const autoReframed = useRef(new Set<number>());
-  useEffect(() => {
-    if (!clip || !current || hostedStatus !== "ready") return;
-    if (autoReframed.current.has(clip.id) || current.segments.length > 0) return;
-    autoReframed.current.add(clip.id);
-    void reframe(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip?.id, current?.clipId, hostedStatus]);
-
-  /** Writes one clip's edits to the server. */
-  const persist = async (e: ClipEdit) => {
-    await updateClip.mutateAsync({
-      id: e.clipId,
-      ...e.framing,
-      framingSegments: e.segments,
-      captionsEnabled: captionsOn,
-    });
-    if (captionsOn) {
-      await transcribing.current.get(e.clipId);
-      await saveSubtitles.mutateAsync({
-        clipId: e.clipId,
-        style,
-      });
-    }
-  };
-
-  const saveAll = async () => {
-    setSaving(true);
-    try {
-      for (const h of clips) {
-        const e = edits[h.id];
-        if (e) await persist(e);
-      }
-      toast.success("Edits saved.");
-      return true;
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not save the edits");
-      return false;
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  /** Saves then renders one clip. */
-  const renderOne = async (h: Highlight) => {
-    const e = edits[h.id];
-    if (!e) return;
-    setRendering(prev => new Set(Array.from(prev).concat(h.id)));
-    try {
-      await persist(e);
-      await startRender.mutateAsync({ id: e.clipId, ...e.framing, captionsEnabled: captionsOn });
-      setRendered(prev => new Set(Array.from(prev).concat(h.id)));
-      toast.success(`"${h.title}" is rendering.`);
-    } catch (err) {
-      toast.error(`${h.title}: ${err instanceof Error ? err.message : "render failed"}`);
-    } finally {
-      setRendering(prev => { const s = new Set(prev); s.delete(h.id); return s; });
-    }
-  };
-
-  /** Renders every clip, reporting each failure separately. */
-  const renderAll = async () => {
-    for (const h of clips) {
-      if (rendered.has(h.id) || rendering.has(h.id)) continue;
-      await renderOne(h);
-    }
-    await utils.clips.list.invalidate();
-  };
-
-  // ── Framing, honouring the animation while the preview plays ───────────────
-
-  const activeFraming: Framing = useMemo(() => {
-    if (!current) return DEFAULT_FRAMING;
-    const list = materialiseSegments(current.segments, duration, current.framing);
-
-    if (previewTime != null && clip) {
-      const inClip = previewTime + hostedOffset - clip.startTime;
-      const idx = segmentAt(list, inClip);
-      if (idx != null) return framingAt(list[idx], inClip);
-    }
-    if (selectedSegment != null && list[selectedSegment]) {
-      const seg = list[selectedSegment];
-      return isAnimated(seg) && editingKeyframe === "to"
-        ? segmentTarget(seg)
-        : framingAt(seg, seg.start);
-    }
-    return current.framing;
-  }, [current, duration, previewTime, clip, hostedOffset, selectedSegment, editingKeyframe]);
-
-  const applyFraming = (next: Framing) => {
-    if (!current) return;
-    const list = materialiseSegments(current.segments, duration, current.framing);
-    if (selectedSegment != null && list[selectedSegment]) {
-      const moving = isAnimated(list[selectedSegment]);
-      patch({ segments: setSegmentKeyframe(list, selectedSegment, moving ? editingKeyframe : "from", next) });
-    } else {
-      patch({ framing: next });
-    }
-  };
-
-  /** Plays just the selected section, so its movement can be watched alone. */
-  const previewSpan = useMemo(() => {
-    if (!clip) return { start: 0, end: 1 };
-    if (current && selectedSegment != null) {
-      const list = materialiseSegments(current.segments, duration, current.framing);
-      const seg = list[selectedSegment];
-      if (seg) return { start: clip.startTime + seg.start, end: clip.startTime + seg.end };
-    }
-    return { start: clip.startTime ?? 0, end: clip.endTime ?? 1 };
-  }, [clip, current, selectedSegment, duration]);
-
-  const visibleCaption = captionsOn ? captionFrame(previewWords, style, playhead) : null;
-
-  /** Moves the playhead and takes both players with it. */
-  const scrubTo = (t: number) => {
-    setPlayhead(t);
-    setPreviewTime(null);
-    if (!clip) return;
-    seekNonce.current += 1;
-    setSeek({ time: Math.max(0, clip.startTime + t - hostedOffset), nonce: seekNonce.current });
-  };
-
-  if (clips.length === 0) {
-    return (
-      <div className="max-w-2xl mx-auto animate-slide-up glass rounded-2xl p-8 text-center">
-        <AlertCircle className="w-8 h-8 mx-auto mb-3 text-muted-foreground" />
-        <p className="text-sm text-muted-foreground">No clips selected — go back and pick a moment first.</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="animate-slide-up">
-      <div className="mb-4 flex items-end justify-between gap-3 flex-wrap">
-        <div>
-          <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>
-            Edit
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Move the frame and add zooms for each clip.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={captionsOn}
-            aria-label="Captions"
-            onClick={() => { onCaptionsChange(!captionsOn); setRendered(new Set()); }}
-            disabled={saving || rendering.size > 0}
-            className="flex items-center gap-2 px-3 py-2 rounded-xl border border-border text-sm font-semibold disabled:opacity-50"
-          >
-            <Captions className="w-4 h-4" /> Captions {captionsOn ? "on" : "off"}
-          </button>
-          <button
-            onClick={saveAll}
-            disabled={saving}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-colors disabled:opacity-50"
-            style={{ background: "oklch(1 0 0 / 0.07)", color: "var(--foreground)" }}
-          >
-            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
-          </button>
-          <button
-            onClick={renderAll}
-            disabled={rendering.size > 0}
-            className="flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-bold text-white transition-all hover:opacity-90 disabled:opacity-50"
-            style={{ background: "linear-gradient(135deg, var(--coral), oklch(0.65 0.20 300))" }}
-          >
-            {rendering.size > 0
-              ? <><Loader2 className="w-4 h-4 animate-spin" /> Rendering {rendering.size}…</>
-              : <><Zap className="w-4 h-4" /> Render all {clips.length}</>}
-          </button>
-        </div>
-      </div>
-
-      {/* ── Clip tabs ─────────────────────────────────────────────────────── */}
-      <div className="flex items-center gap-1.5 mb-4 overflow-x-auto pb-1">
-        {clips.map((h, i) => {
-          const e = edits[h.id];
-          const isActive = i === active;
-          return (
-            <button
-              key={h.id}
-              onClick={() => {
-                setActive(i);
-                setSelectedSegment(null);
-                setPlayhead(0);
-                setPreviewTime(null);
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors shrink-0"
-              style={isActive
-                ? { background: "var(--cobalt)", color: "white" }
-                : { background: "oklch(1 0 0 / 0.06)", color: "var(--muted-foreground)" }}
-              title={`${h.title} · ${fmt(h.startTime)}–${fmt(h.endTime)}`}
-            >
-              #{i + 1}
-              {rendered.has(h.id) && <CheckCircle2 className="w-3 h-3" style={{ color: isActive ? "white" : "var(--mint)" }} />}
-              {rendering.has(h.id) && <Loader2 className="w-3 h-3 animate-spin" />}
-              {!e && <span className="text-[9px] opacity-70">…</span>}
-            </button>
-          );
-        })}
-        <span className="text-[11px] text-muted-foreground ml-2 shrink-0">
-          {clip ? `${fmt(clip.startTime)}–${fmt(clip.endTime)} · ${Math.round(duration)}s` : ""}
-        </span>
-      </div>
-
-      <div className="grid lg:grid-cols-[300px_1fr] gap-5 items-start">
-        {/* ── Preview ───────────────────────────────────────────────────── */}
-        <div className="space-y-3">
-          {hostedStatus === "ready" && hostedUrl && clip ? (
-            <>
-              <CropView
-                src={hostedUrl}
-                framing={activeFraming}
-                onChange={applyFraming}
-                startTime={previewSpan.start - hostedOffset}
-                endTime={previewSpan.end - hostedOffset}
-                className="w-full shadow-2xl"
-                skip={playerCuts}
-                onTime={t => {
-                  setPreviewTime(t);
-                  setPlayhead(Math.max(0, t + hostedOffset - clip.startTime));
-                }}
-                seekTo={seek}
-                onPlayingChange={setPlaying}
-              >
-                {visibleCaption && (
-                  <SubtitleOverlay
-                    words={visibleCaption.words}
-                    activeIndex={visibleCaption.activeIndex}
-                    style={style}
-                  />
-                )}
-              </CropView>
-
-              <div>
-                <p className="text-[11px] font-semibold text-muted-foreground mb-1.5 flex items-center gap-1.5">
-                  <Move className="w-3 h-3" />
-                  {selectedSegment != null
-                    ? `Full frame — where section ${selectedSegment + 1} ${editingKeyframe === "to" ? "ends" : "starts"}`
-                    : "Full frame — drag the box to reframe"}
-                </p>
-                <VideoFramer
-                  src={hostedUrl}
-                  framing={activeFraming}
-                  onChange={applyFraming}
-                  startTime={previewSpan.start - hostedOffset}
-                  endTime={previewSpan.end - hostedOffset}
-                  // Follows the main preview so both show the same frame.
-                  followTime={clip.startTime + playhead - hostedOffset}
-                  followPlaying={playing}
-                />
-              </div>
-
-              <p className="text-[10px] text-muted-foreground/70 leading-relaxed">
-                Drag inside either player to move the frame.
-              </p>
-            </>
-          ) : (
-            <ClipPreview
-              url={video?.sourceUrl ?? null}
-              hostingStatus={hostedStatus}
-              hostingProgress={video?.hostProgress ?? 0}
-              onHost={importClip}
-              className="rounded-2xl w-full"
-              style={{ aspectRatio: "9/16" }}
-            />
-          )}
-
-          {hostedStatus === "error" && video?.hostError && (
-            <p className="text-[11px] leading-relaxed" style={{ color: "oklch(0.72 0.19 45)" }}>
-              {video.hostError}
-            </p>
-          )}
-        </div>
-
-        {/* ── Timeline ──────────────────────────────────────────────────── */}
-        <div className="space-y-3 min-w-0">
-          {current ? (
-            <>
-              <ClipTimeline
-                duration={duration}
-                segments={current.segments}
-                onSegmentsChange={next => patch({ segments: next })}
-                selectedSegment={selectedSegment}
-                onSelectSegment={setSelectedSegment}
-                playheadSeconds={playhead}
-                cuts={activeCuts}
-                onScrub={scrubTo}
-                baseFraming={current.framing}
-                editingKeyframe={editingKeyframe}
-                onEditingKeyframeChange={setEditingKeyframe}
-              />
-
-              <div className="glass rounded-2xl p-4">
-                <p className="text-sm font-semibold text-foreground mb-2">Video style</p>
-                <VideoStylePicker value={activeLayout} onChange={chooseLayout} excludeVideoId={videoId} />
-              </div>
-
-              <div className="flex items-center justify-end gap-2">
-                <button
-                  onClick={() => void reframe(false)}
-                  disabled={!clip || !current || hostedStatus !== "ready" || reframing.has(clip.id)}
-                  title={hostedStatus === "ready" ? "Follow the speaker's face automatically" : "Available once the video is imported"}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
-                  style={{ background: "rgba(49, 94, 245, 0.08)", color: "var(--cobalt)" }}
-                >
-                  {clip && reframing.has(clip.id)
-                    ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Finding the speaker…</>
-                    : <><ScanFace className="w-3.5 h-3.5" /> AI reframe</>}
-                </button>
-                <button
-                  onClick={() => void tighten()}
-                  disabled={!clip || !current || tightenClip.isPending}
-                  title="Cut pauses and filler sounds out of the export"
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
-                  style={{ background: "rgba(49, 94, 245, 0.08)", color: "var(--cobalt)" }}
-                >
-                  {tightenClip.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Scissors className="w-3.5 h-3.5" />}
-                  {activeCuts.length ? `Undo ${activeCuts.length} cut${activeCuts.length === 1 ? "" : "s"}` : "Tighten"}
-                </button>
-                <button
-                  onClick={() => renderOne(clips[active])}
-                  disabled={rendering.has(clips[active]?.id)}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-colors disabled:opacity-50"
-                  style={{ background: "rgba(49, 94, 245, 0.08)", color: "var(--cobalt)" }}
-                >
-                  {rendering.has(clips[active]?.id)
-                    ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Rendering…</>
-                    : <><Zap className="w-3.5 h-3.5" /> Render this clip</>}
-                </button>
-              </div>
-            </>
-          ) : (
-            <div className="glass rounded-2xl p-8 text-center">
-              <Loader2 className="w-6 h-6 mx-auto mb-3 animate-spin text-muted-foreground" />
-              <p className="text-sm text-muted-foreground">Preparing this clip…</p>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <button
-        onClick={async () => {
-          if (!await saveAll()) return;
-          const ids: Record<number, number> = {};
-          for (const h of clips) if (edits[h.id]) ids[h.id] = edits[h.id].clipId;
-          onNext(ids);
-        }}
-        disabled={saving || Object.keys(edits).length === 0}
-        className="mt-6 w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm transition-all hover:opacity-90 disabled:opacity-50 glow-green"
-        style={{ background: "linear-gradient(135deg, var(--mint), oklch(0.65 0.20 165))", color: "black" }}
-      >
-        <Save className="w-4 h-4" /> Save & Continue to Export <ArrowRight className="w-4 h-4" />
-      </button>
-    </div>
-  );
-}
-
-// ─── Step 5: Export ───────────────────────────────────────────────────────────
-function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, captionsOn, apiKey, model, titleLanguage }: {
+function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, videoUrl, captionsOn, renderLog, apiKey, model, titleLanguage }: {
   clips: Highlight[]; style: SubStyle; videoTitle: string; reelTitle: string;
+  /** Video style chosen in the first step; null uses the AI's pick per clip. */
+  layout: VideoLayout | null;
+  videoId: number | null;
   videoUrl: string;
-  /** Row ids created by the Edit step, keyed by highlight id. */
-  clipIds: Record<number, number>;
   /** Burn captions into the exports. */
   captionsOn: boolean;
+  /**
+   * What each clip was last rendered with, kept by the page so it survives
+   * leaving this step. A clip is rendered again only when that has changed.
+   */
+  renderLog: { current: Record<number, string> };
   apiKey: string; model: string; titleLanguage: string;
 }) {
-  const [rendering, setRendering] = useState<Set<number>>(new Set());
   const utils = trpc.useUtils();
   const { data: exports = [] } = trpc.clips.list.useQuery(undefined, { refetchInterval: 2500 });
   const exportById = new Map<number, { status: string; downloadUrl?: string | null; errorMessage?: string | null }>(
     exports.map(clip => [clip.id, clip]),
   );
+  /* Always fetched afresh on entering this step: a cached list from an earlier
+   * visit would not include the rows made then, and they would be duplicated. */
+  const { data: existingClips, isFetchedAfterMount, error: listError, refetch: reloadClips } = trpc.clips.listByVideo.useQuery(
+    { videoId: videoId ?? 0 },
+    { enabled: videoId != null, refetchOnMount: "always" },
+  );
+  const createClip = trpc.clips.create.useMutation();
+  const updateClip = trpc.clips.update.useMutation();
+  const saveSubtitles = trpc.subtitles.save.useMutation();
   const startRender = trpc.clips.render.useMutation({ onSuccess: () => utils.clips.list.invalidate() });
   const generateTitle = trpc.gemini.generateTitle.useMutation();
   const [hookTitles, setHookTitles] = useState<Record<number, { title: string; hook: string; hashtags: string[] }>>({});
 
-  /**
-   * Renders the row the Edit step already created and saved. Nothing is created
-   * here, so the saved framing and caption settings apply to the render.
-   */
-  const renderClip = async (h: Highlight) => {
-    const clipId = clipIds[h.id];
-    if (clipId == null) {
-      toast.error("This clip was not prepared — go back to the Edit step.");
-      return;
-    }
-    setRendering(prev => new Set(Array.from(prev).concat(h.id)));
+  /** Row ids, keyed by highlight id, filled in as each clip is saved. */
+  const [clipIds, setClipIds] = useState<Record<number, number>>({});
+  /** Highlights waiting their turn, and the one whose render is being started. */
+  const [queued, setQueued] = useState<Set<number>>(new Set());
+  const [rendering, setRendering] = useState<Set<number>>(new Set());
+  const [failed, setFailed] = useState<Record<number, string>>({});
+
+  /** Everything that changes how a clip looks, to tell when a re-render is due. */
+  const signature = JSON.stringify([captionsOn, captionsOn ? style : null, layout]);
+
+  const renderClip = async (h: Highlight, clipId: number) => {
+    setRendering(prev => new Set(prev).add(h.id));
+    setFailed(prev => { const next = { ...prev }; delete next[h.id]; return next; });
     try {
+      /* Resolves once this clip's part of the video is on the server and the
+       * render is under way; the card then follows the clip's status. */
       await startRender.mutateAsync({ id: clipId, captionsEnabled: captionsOn });
+      renderLog.current[clipId] = signature;
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not start the render");
+      const message = err instanceof Error ? err.message : "Could not start the render";
+      setFailed(prev => ({ ...prev, [h.id]: message }));
+      toast.error(`${h.title}: ${message}`);
     } finally {
-      setRendering(prev => { const s = new Set(prev); s.delete(h.id); return s; });
+      setRendering(prev => { const next = new Set(prev); next.delete(h.id); return next; });
     }
   };
+
+  /* One at a time: each render first imports its own part of the video, and
+   * starting them together only makes them compete for the same download. */
+  const line = useRef<Promise<void>>(Promise.resolve());
+  const enqueue = (h: Highlight, clipId: number) => {
+    setQueued(prev => new Set(prev).add(h.id));
+    line.current = line.current.then(async () => {
+      setQueued(prev => { const next = new Set(prev); next.delete(h.id); return next; });
+      await renderClip(h, clipId);
+    });
+  };
+
+  /*
+   * Save every clip, then render. Runs once per visit to this step, after the
+   * video's existing rows are known so a clip made earlier is reused rather
+   * than duplicated. The ref guard matters: effects can run twice in
+   * development.
+   */
+  const started = useRef(false);
+  const [saving, setSaving] = useState(true);
+  useEffect(() => {
+    if (videoId == null || !existingClips || !isFetchedAfterMount || started.current) return;
+    started.current = true;
+    (async () => {
+      for (const h of clips) {
+        try {
+          // Same range on the same video is the same clip.
+          const found = existingClips.find(c =>
+            Math.abs((c.startTime ?? -1) - h.startTime) < 0.5 &&
+            Math.abs((c.endTime ?? -1) - h.endTime) < 0.5
+          );
+          // The style chosen in the first step, else the one the AI suggested.
+          const wanted: VideoLayout | null = layout
+            ?? (h.montage && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage as VideoStyleId } : null);
+          let id = found?.id;
+          if (id == null) {
+            ({ id } = await createClip.mutateAsync({
+              videoId,
+              title: h.title,
+              startTime: h.startTime,
+              endTime: h.endTime,
+              engagementScore: h.engagementScore,
+              ...(wanted ? { style: wanted.style } : {}),
+            }));
+          }
+          const saved = (found as { layout?: VideoLayout | null } | undefined)?.layout ?? null;
+          const styleChanged = wanted != null && (found
+            ? saved?.style !== wanted.style || (saved?.backgroundVideoId ?? null) !== (wanted.backgroundVideoId ?? null)
+            : wanted.backgroundVideoId != null);
+          await updateClip.mutateAsync({ id, captionsEnabled: captionsOn, ...(styleChanged ? { layout: wanted } : {}) });
+          if (captionsOn) await saveSubtitles.mutateAsync({ clipId: id, style });
+          setClipIds(prev => ({ ...prev, [h.id]: id }));
+
+          const status = found?.status;
+          const upToDate = status === "done" && (renderLog.current[id] ?? signature) === signature && !styleChanged;
+          if (!upToDate && status !== "rendering") enqueue(h, id);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Could not save this clip";
+          setFailed(prev => ({ ...prev, [h.id]: message }));
+          toast.error(`${h.title}: ${message}`);
+        }
+      }
+      setSaving(false);
+      await utils.clips.list.invalidate();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoId, existingClips, isFetchedAfterMount]);
 
   const genHook = async (h: Highlight) => {
     try {
@@ -1802,10 +1349,13 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
     } catch { toast.error("Failed to generate hook"); }
   };
 
+  const busy = (h: Highlight) => queued.has(h.id) || rendering.has(h.id) || exportById.get(clipIds[h.id])?.status === "rendering";
   const renderAll = () => clips.forEach(h => {
-    const status = exportById.get(clipIds[h.id])?.status;
-    if (status !== "done" && status !== "rendering" && !rendering.has(h.id)) void renderClip(h);
+    const id = clipIds[h.id];
+    if (id != null && !busy(h) && exportById.get(id)?.status !== "done") enqueue(h, id);
   });
+  const finished = clips.filter(h => exportById.get(clipIds[h.id])?.status === "done" && !busy(h)).length;
+  const working = saving || clips.some(busy);
 
   return (
     <div className="animate-slide-up">
@@ -1813,17 +1363,36 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
         <div>
           <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Export Your Clips</h2>
           <p className="text-sm text-muted-foreground">{clips.length} clip{clips.length !== 1 ? "s" : ""} from <span className="text-foreground font-medium">{videoTitle}</span></p>
+          {listError && !existingClips && (
+            <p className="text-xs text-destructive mt-0.5" role="alert">
+              Could not load this video's clips ({listError.message}).{" "}
+              <button type="button" className="underline font-semibold" onClick={() => void reloadClips()}>Try again</button>
+            </p>
+          )}
+          <p className="text-xs text-muted-foreground mt-0.5" role="status">
+            {working
+              ? `Making your clips, one after another: ${finished} of ${clips.length} ready. You can leave this page; they keep rendering.`
+              : `${finished} of ${clips.length} ready.`}
+          </p>
           {reelTitle && <p className="text-xs text-muted-foreground mt-0.5">Reel title: <span style={{ color: "var(--mint)" }}>{reelTitle}</span></p>}
         </div>
-        <button onClick={renderAll} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, var(--coral), oklch(0.65 0.20 300))" }}>
-          <Zap className="w-4 h-4" /> Render All
-        </button>
+        {!working && finished < clips.length && (
+          <button onClick={renderAll} className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold text-white transition-all hover:opacity-90" style={{ background: "linear-gradient(135deg, var(--coral), oklch(0.65 0.20 300))" }}>
+            <Zap className="w-4 h-4" /> Render the rest
+          </button>
+        )}
       </div>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {clips.map(h => {
-          const result = exportById.get(clipIds[h.id]);
-          const isRendering = rendering.has(h.id) || result?.status === "rendering";
-          const file = result?.status === "done" ? result.downloadUrl : null;
+          const clipId = clipIds[h.id];
+          const result = exportById.get(clipId);
+          const isRendering = busy(h);
+          const file = result?.status === "done" && !isRendering ? result.downloadUrl : null;
+          const progressLabel = clipId == null ? "Saving…"
+            : queued.has(h.id) ? "Waiting its turn…"
+            : rendering.has(h.id) ? "Importing this part of the video…"
+            : "Rendering…";
+          const problem = failed[h.id] ?? (result?.status === "error" ? result.errorMessage ?? "Rendering failed." : null);
           const scoreColor = h.engagementScore >= 90 ? "var(--mint)" : "var(--cobalt)";
           const hook = hookTitles[h.id];
           const ytId = parseYouTubeId(videoUrl);
@@ -1846,7 +1415,7 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
               </div>
               <div className="p-4">
                 <h3 className="text-sm font-bold text-foreground mb-1 truncate" style={{ fontFamily: "Montserrat, sans-serif" }}>{h.title}</h3>
-                <p className="text-xs text-muted-foreground mb-1">{fmt(h.startTime)} – {fmt(h.endTime)} · {h.endTime - h.startTime}s</p>
+                <p className="text-xs text-muted-foreground mb-1">{fmt(h.startTime)} – {fmt(h.endTime)} · {Math.round(h.endTime - h.startTime)}s</p>
                 {hook && (
                   <div className="mb-2 p-2 rounded-lg bg-secondary/40">
                     <p className="text-xs font-semibold text-foreground mb-1">{hook.hook}</p>
@@ -1857,13 +1426,13 @@ function StepExport({ clips, style, videoTitle, reelTitle, videoUrl, clipIds, ca
                   {!hook && <button onClick={() => genHook(h)} disabled={generateTitle.isPending} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all hover:opacity-80" style={{ background:"rgba(221, 125, 113, 0.1)", color:"var(--coral)" }}><Wand2 className="w-3 h-3" /> AI Hook</button>}
                   {file ? (
                     <a href={downloadUrl(file)} download className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Download className="w-3.5 h-3.5" /> Download MP4</a>
-                  ) : isRendering ? (
-                    <div className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground bg-secondary/60"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Rendering…</div>
+                  ) : isRendering || clipId == null ? (
+                    <div className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground bg-secondary/60"><Loader2 className="w-3.5 h-3.5 animate-spin" /> {progressLabel}</div>
                   ) : (
-                    <button onClick={() => renderClip(h)} className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80" style={{ background:"var(--cobalt)" }}><Zap className="w-3.5 h-3.5" /> {result?.status === "error" ? "Retry Render" : "Render"}</button>
+                    <button onClick={() => enqueue(h, clipId)} className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80" style={{ background:"var(--cobalt)" }}><Zap className="w-3.5 h-3.5" /> {problem ? "Try again" : "Render"}</button>
                   )}
                 </div>
-                {result?.status === "error" && <p role="alert" className="mt-2 text-xs text-destructive">{result.errorMessage ?? "Rendering failed."}</p>}
+                {problem && !isRendering && <p role="alert" className="mt-2 text-xs text-destructive">{problem}</p>}
               </div>
             </div>
           );
@@ -1909,20 +1478,18 @@ export default function CreatePage() {
   const [reelTitle, setReelTitle] = useState("");
   const [titleLanguage, setTitleLanguage] = useState("auto");
   const [subStyle, setSubStyle] = useState<SubStyle|null>(null);
-  /**
-   * Clip rows created by the Edit step, keyed by highlight id. Export renders
-   * these rather than creating its own, so the per-clip edits survive.
-   */
-  const [clipIds, setClipIds] = useState<Record<number, number>>({});
-  // Framing is per-clip now and lives in the Edit step.
+  /** What each clip was last rendered with; see StepExport. */
+  const renderLog = useRef<Record<number, string>>({});
   // Whether captions get burned into the exported clips.
   const [captionsOn, setCaptionsOn] = useState(true);
+  /* Video style for the whole video, chosen up front. Null: AI picks per clip. */
+  const [videoLayout, setVideoLayout] = useState<VideoLayout | null>(null);
   return (
     <AppLayout title="Create">
       <div className="max-w-4xl mx-auto">
         <StepBar current={step} onGo={s => setStep(s)} />
         {step === 1 && (
-          <StepInput apiKey={apiKey} onNext={v => {
+          <StepInput apiKey={apiKey} layout={videoLayout} onLayoutChange={setVideoLayout} onNext={v => {
             setVideoId(v.videoId); setVideoUrl(v.url);
             setVideoTitle(v.title); setTranscript(v.transcript); setVideoDuration(v.duration);
             setTranscriptWords(v.words);
@@ -1947,18 +1514,14 @@ export default function CreatePage() {
             }} />
         )}
         {step === 3 && (
-          <StepSubtitles clips={selectedClips} videoId={videoId}
+          <StepSubtitles clips={selectedClips} videoId={videoId} layout={videoLayout}
             captionsOn={captionsOn} onCaptionsChange={setCaptionsOn}
             onNext={style => { setSubStyle(style); setStep(4); }} />
         )}
         {step === 4 && subStyle && (
-          <StepEdit clips={selectedClips} videoId={videoId} style={subStyle}
-            captionsOn={captionsOn} onCaptionsChange={setCaptionsOn}
-            onNext={ids => { setClipIds(ids); setStep(5); }} />
-        )}
-        {step === 5 && subStyle && (
-          <StepExport clips={selectedClips} style={subStyle} videoTitle={videoTitle} reelTitle={reelTitle}
-            videoUrl={videoUrl} clipIds={clipIds} captionsOn={captionsOn}
+          <StepExport clips={selectedClips} style={subStyle} layout={videoLayout} videoId={videoId}
+            videoTitle={videoTitle} reelTitle={reelTitle} videoUrl={videoUrl}
+            captionsOn={captionsOn} renderLog={renderLog}
             apiKey={apiKey} model={model} titleLanguage={titleLanguage} />
         )}
       </div>

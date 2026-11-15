@@ -10,7 +10,7 @@ import { registerMediaUpload } from "../server/media-upload.mjs";
 import { montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
 import { VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
-import { buildHighlightPrompts, clipCountFor, countOnPeaks, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
+import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
@@ -145,7 +145,12 @@ var _db = null;
 async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      /* CLIP_MAKER_DB_POOL_MAX caps the connection pool. Only needed for a
+       * local test database that accepts one connection at a time. */
+      const poolMax = Number(process.env.CLIP_MAKER_DB_POOL_MAX);
+      _db = Number.isInteger(poolMax) && poolMax > 0
+        ? drizzle({ connection: { connectionString: process.env.DATABASE_URL, max: poolMax } })
+        : drizzle(process.env.DATABASE_URL);
       /* Additive and idempotent, the same statement as migration 0002. Run
        * here so a deploy that has not run migrations yet keeps serving clips. */
       await _db.execute(sql`ALTER TABLE "clips" ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
@@ -1492,7 +1497,8 @@ import { z as z2 } from "zod";
 import { TRPCError as TRPCError3 } from "@trpc/server";
 
 // server/inworld.ts
-var INWORLD_BASE_URL = "https://api.inworld.ai";
+/* Overridable so the AI steps can be tested against a local stand-in. */
+var INWORLD_BASE_URL = process.env.INWORLD_BASE_URL || "https://api.inworld.ai";
 async function inworldChat(opts) {
   const res = await fetch(`${INWORLD_BASE_URL}/v1/chat/completions`, {
     method: "POST",
@@ -1696,11 +1702,11 @@ const titleLanguages = {
   ko: "Korean"
 };
 const titleLanguageInput = z2.enum(["auto", ...Object.keys(titleLanguages)]).default("auto");
-function titleLanguageInstruction(language) {
-  const choice = titleLanguages[language];
+function titleLanguageInstruction(language, sourceText = "") {
+  const choice = titleLanguages[language] || detectTextLanguage(sourceText);
   return choice
-    ? `Write all generated text in ${choice}. Keep the JSON keys in English.`
-    : "Write all generated text in the language and dialect of the source text. For Moroccan Darija, use natural Moroccan expressions and Arabic script. Keep the JSON keys in English.";
+    ? `LANGUAGE: write every title, reelTitle, reason and any other generated text in ${choice}.${choice === "English" ? "" : " This is required even though these instructions are in English. Do not translate into English."} Keep the JSON keys and the "kind" and "montage" values in English.`
+    : "LANGUAGE: write every title, reelTitle, reason and any other generated text in the same language and dialect as the transcript, NOT in English unless the transcript is English. For Moroccan Darija, use natural Moroccan expressions and Arabic script. Keep the JSON keys and the \"kind\" and \"montage\" values in English.";
 }
 var geminiRouter = router({
   /**
@@ -1791,8 +1797,8 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         model: input.model,
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
-          { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage)}` },
-          { role: "user", content: userPrompt }
+          { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` },
+          { role: "user", content: `${userPrompt}\n\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` }
         ],
         // Low enough to keep timestamps faithful to the transcript lines.
         temperature: 0.4,
@@ -1817,7 +1823,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       /* Land every clip on real speech boundaries and drop overlapping picks. */
       const ordered = snapHighlights(highlights, timedWords, {
         videoDuration: input.videoDuration,
-        ...(rankingMode ? { minSeconds: 5, maxSeconds: 15, reach: 2 } : {})
+        ...(rankingMode ? { minSeconds: 5, maxSeconds: 15, reach: 2, growTo: 0 } : {})
       });
       if (ordered.length === 0) {
         throw new TRPCError3({
@@ -1859,7 +1865,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         messages: [
           {
             role: "system",
-            content: `You are a viral content strategist writing irresistible hooks for ${input.style} short-form videos. Titles are bold, capitalized, and maximize CTR and shares. Return ONLY JSON, no markdown. ${titleLanguageInstruction(input.titleLanguage)}`
+            content: `You are a viral content strategist writing irresistible hooks for ${input.style} short-form videos. Titles are bold, capitalized, and maximize CTR and shares. Return ONLY JSON, no markdown. ${titleLanguageInstruction(input.titleLanguage, input.clipContent)}`
           },
           {
             role: "user",
@@ -2524,6 +2530,9 @@ var youtubeBlockedUntil = 0;
 /* Imports in flight, by video and range, so the editor and the background
  * prefetch never download the same clip twice at once. */
 var hostJobs = new Map();
+/* Framing worked out for previews, by file and range. Small and in memory:
+ * losing it only means working it out again. */
+const previewFramings = new Map();
 function hostVideoShared(opts) {
   const key = `${opts.videoId}:${opts.range ? `${opts.range.start}-${opts.range.end}` : "full"}`;
   const running = hostJobs.get(key);
@@ -3914,6 +3923,47 @@ var appRouter = router({
      * without changing which range the editor is showing. Opening one of
      * those clips afterwards is then instant.
      */
+    /**
+     * GET /api/trpc/videos.previewFraming
+     * The speaker-following framing a clip of this range will be exported
+     * with, so a preview can show it before any clip row exists. Needs the
+     * range to be imported already; answers `found: false` otherwise.
+     */
+    previewFraming: protectedProcedure.input(z4.object({
+      id: z4.number(),
+      startTime: z4.number().min(0),
+      endTime: z4.number().min(0)
+    })).query(async ({ input, ctx }) => {
+      const none = { found: false, segments: [] };
+      const duration = input.endTime - input.startTime;
+      if (!(duration > 0) || duration > 600 || process.env.CLIP_MAKER_AUTO_REFRAME === "0") return none;
+      const video = await getVideoById(input.id, ctx.user.id);
+      if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
+      let filePath = video.hostedStatus === "ready" ? localPathFromUrl(video.hostedUrl) : null;
+      let offset = video.hostedOffset ?? 0;
+      if (video.sourceType === "url" && /^https?:\/\//i.test(video.sourceUrl ?? "")) {
+        /* The exact section for this range, when it is on disk: the row's
+         * hosted file may be another clip's section by now. */
+        const cached = await hostVideo({ videoId: video.id, sourceUrl: video.sourceUrl, range: { start: input.startTime, end: input.endTime }, cacheOnly: true }).catch(() => null);
+        if (cached) { filePath = path5.join(VIDEOS_DIR, cached.fileName); offset = cached.offset ?? 0; }
+      }
+      if (!filePath) return none;
+      const key = `${filePath}:${input.startTime}:${input.endTime}`;
+      const known = previewFramings.get(key);
+      if (known) return known;
+      const meta = await probeMedia(filePath).catch(() => null);
+      if (!meta || input.startTime < offset - 0.15 || input.endTime > offset + meta.duration + 0.15) return none;
+      try {
+        const result = await detectFraming(filePath, input.startTime - offset, duration);
+        const answer = { found: result.found, segments: result.segments };
+        if (previewFramings.size >= 200) previewFramings.delete(previewFramings.keys().next().value);
+        previewFramings.set(key, answer);
+        return answer;
+      } catch (error) {
+        console.warn("[AutoFrame] preview failed:", String(error.stderr || error.message).slice(0, 300));
+        return none;
+      }
+    }),
     prefetch: protectedProcedure.input(z4.object({
       id: z4.number(),
       ranges: z4.array(z4.object({ startTime: z4.number().min(0), endTime: z4.number().min(0) })).max(12)
@@ -4113,12 +4163,10 @@ var appRouter = router({
          * Auto-import just this clip's range at full quality.
          * Much faster than downloading the entire video.
          */
-        if (video.hostedStatus === "downloading") {
-          throw new TRPCError5({
-            code: "PRECONDITION_FAILED",
-            message: "The video is still being imported. Wait for it to finish, then render."
-          });
-        }
+        /* Another part of this video may be importing right now (the editor
+         * preview, the background prefetch, another clip's render). That is
+         * fine: every clip fetches its own range, and a range already being
+         * fetched is shared rather than downloaded twice. */
         const sourceUrl = video.sourceUrl;
         if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl)) {
           throw new TRPCError5({ code: "BAD_REQUEST", message: "No downloadable source URL for this video." });
@@ -4126,7 +4174,7 @@ var appRouter = router({
         console.log(`[Render] Auto-importing clip range ${clip.startTime}-${clip.endTime}s for clip ${clip.id}...`);
         await updateVideo(video.id, { hostedStatus: "downloading", hostError: null, hostProgress: 0 });
         try {
-          const result = await hostVideo({
+          const result = await hostVideoShared({
             videoId: video.id,
             sourceUrl,
             range: { start: clip.startTime, end: clip.endTime },

@@ -8,7 +8,7 @@
  * frame are converted to keep the same point of the source centred.
  */
 import { VIDEO_STYLES } from "../shared/video-styles.mjs";
-import { transcriptLines } from "./highlights.mjs";
+import { montageCaptionStyle, punchIns } from "../shared/video-styles.mjs";
 
 export const PANEL_W = 1080;
 export const PANEL_H = 960;
@@ -19,38 +19,7 @@ export function splitKind(styleId) {
   return VIDEO_STYLES[styleId]?.split ?? null;
 }
 
-/** Caption style for a video style. The user's colours and font are kept. */
-export function montageCaptionStyle(styleId, style) {
-  const s = { ...style };
-  const centre = () => { if (s.posX == null && s.posY == null) s.position = "center"; };
-  switch (styleId) {
-    case "podcast":
-      return { ...s, preset: "clean", uppercase: false, fontSize: Math.min(s.fontSize ?? 72, 54) };
-    case "cinematic":
-      return { ...s, preset: "karaoke", uppercase: false, fontSize: Math.min(s.fontSize ?? 72, 56), color: "#F4EFE6", highlightColor: "#E8C98A" };
-    case "viral":
-      return { ...s, preset: "impact", uppercase: true, fontSize: Math.max(s.fontSize ?? 72, 96), outline: true };
-    case "gameplay": case "satisfying": case "dual": case "reaction":
-      centre();
-      return s.preset && s.preset !== "pop" ? s : { ...s, preset: "karaoke" };
-    default:
-      return s;
-  }
-}
-
-/** Seconds ranges to punch in on: every other spoken line. */
-export function punchIns(words, duration) {
-  const usable = (words ?? []).filter((w) => Number.isFinite(w.start) && w.start < duration);
-  const ranges = [];
-  if (usable.length >= 4) {
-    transcriptLines(usable, { maxWords: 12, maxSeconds: 5 }).forEach((line, i) => {
-      if (i % 2 === 1 && line.end - line.start >= 0.8) ranges.push([Math.max(0, line.start - 0.05), Math.min(duration, line.end + 0.15)]);
-    });
-  } else {
-    for (let t = 3; t < duration - 1; t += 6) ranges.push([t, Math.min(duration, t + 3)]);
-  }
-  return ranges.slice(0, 16);
-}
+export { montageCaptionStyle, punchIns };
 
 const zoomPan = (z, fps, anchorY) =>
   `zoompan=z='${z}':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)*${anchorY}':d=1:s=${PANEL_W}x1920:fps=${fps}`;
