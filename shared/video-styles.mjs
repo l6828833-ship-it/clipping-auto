@@ -20,8 +20,30 @@ export const VIDEO_STYLE_IDS = Object.keys(VIDEO_STYLES);
 /** Styles the AI may suggest: the ones that need nothing but the clip itself. */
 export const AI_VIDEO_STYLES = ["normal", "dynamic", "podcast", "cinematic", "viral"];
 
-/** Caption style for a video style. The user's colours and font are kept. */
+/**
+ * Caption settings a person can choose. The video styles below change some of
+ * them; a setting listed in the caption style's `own` was chosen by hand and
+ * is kept as chosen.
+ */
+export const OWNABLE_CAPTION_FIELDS = ["preset", "fontSize", "color", "highlightColor", "position", "outline"];
+
+/**
+ * Caption style for a video style. The user's font is always kept, and so is
+ * every setting they changed themselves (`style.own`).
+ */
 export function montageCaptionStyle(styleId, style) {
+  const styled = styleDefaults(styleId, style);
+  const own = Array.isArray(style?.own) ? style.own : [];
+  for (const key of own) {
+    if (!OWNABLE_CAPTION_FIELDS.includes(key)) continue;
+    styled[key] = style[key];
+    /* Casing belongs to the design: a chosen design brings its own. */
+    if (key === "preset") styled.uppercase = style.uppercase;
+  }
+  return styled;
+}
+
+function styleDefaults(styleId, style) {
   const s = { ...style };
   const centre = () => { if (s.posX == null && s.posY == null) s.position = "center"; };
   switch (styleId) {

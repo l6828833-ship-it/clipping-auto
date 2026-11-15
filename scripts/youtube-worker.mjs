@@ -20,6 +20,15 @@ if (origin.protocol !== "https:" && !(origin.protocol === "http:" && origin.host
 }
 if (!token) throw new Error("Set CLIP_MAKER_YOUTUBE_WORKER_TOKEN before starting the worker.");
 
+/** Why the server refused a delivery, in words that point at the fix. */
+function rejection(what, status) {
+  if (status === 404) {
+    return `The server no longer has this job, so it refused the ${what} (HTTP 404). It restarted after handing the job out, `
+      + "or a second instance answered. Set the app to exactly one instance (minimum 1, maximum 1).";
+  }
+  return `Rundploy rejected the ${what} (HTTP ${status}).`;
+}
+
 async function request(endpoint, options = {}) {
   return fetch(new URL(`/api/internal/youtube-worker/${endpoint}`, origin), {
     method: "POST", ...options,
@@ -88,7 +97,7 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ metadata: info, transcript: JSON.parse(words) }),
       });
-      if (!response.ok) throw new Error(`Rundploy rejected the transcript (HTTP ${response.status}).`);
+      if (!response.ok) throw new Error(rejection("transcript", response.status));
       console.log(`Sent timed Whisper transcript for ${videoId}.`);
       return;
     }
@@ -122,7 +131,7 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
       method: "PUT", body: media,
       headers: { "Content-Type": mime, "Content-Length": String(media.size), "X-Clip-Maker-Video": metadata },
     });
-    if (!response.ok) throw new Error(`Rundploy rejected the media upload (HTTP ${response.status}).`);
+    if (!response.ok) throw new Error(rejection("media upload", response.status));
     console.log(`Sent ${kind} for ${videoId}.`);
   } catch (error) {
     /* Say how a child process ended, not only what it printed: a process

@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import {
-  CAPTION_PRESETS, CAPTION_PRESET_IDS, ARABIC_FONTS, captionAt, captionFitScale, captionFontFor,
+  CAPTION_PRESETS, CAPTION_PRESET_IDS, ARABIC_FONTS, captionAt, captionDirection, captionFitScale, captionFontFor,
   contrastOn, displayWord, groupCaptionWords, resolveCaptionStyle,
   type CaptionPresetId, type CaptionStyle, type CaptionWord,
 } from "@shared/captions.mjs";
@@ -197,7 +197,9 @@ export function SubtitleOverlay({
         />
       )}
 
-      <div dir="auto" className="inline-flex flex-nowrap whitespace-nowrap justify-center items-baseline gap-x-[0.25em]"
+      {/* Same reading direction as the burned-in line: right to left as soon
+          as the line has Arabic in it. */}
+      <div dir={captionDirection(lineText)} className="inline-flex flex-nowrap whitespace-nowrap justify-center items-baseline gap-x-[0.25em]"
         style={preset === "clean" ? { background: "rgba(0,0,0,0.65)", padding: pad } : undefined}>
         {shown.map((word, i) => {
           const active = i === activeShown;

@@ -54,6 +54,42 @@ export function hasArabic(text) {
 }
 
 /**
+ * Reading direction of a caption line. A line with any Arabic in it reads
+ * right to left, even when it opens on a French or English word ("donc واش
+ * نتا"). Left to the first letter, such a line was laid out left to right and
+ * its words came out in the wrong order for someone reading Arabic.
+ */
+export function captionDirection(text) {
+  return hasArabic(text) ? "rtl" : "ltr";
+}
+
+/* Right-to-left mark: a strong RTL character that draws nothing. Put first in
+ * a subtitle event, it makes libass lay the whole line out right to left. */
+const RLM = "\u200F";
+
+/**
+ * Short Arabic and Darija words that belong with the word after them
+ * ("ف الدار", "ما كاين", "ديال الناس"). Speech-to-text writes them apart, so
+ * the word count alone used to end a line on one, or show one on its own,
+ * cut off from the word it goes with.
+ */
+const ARABIC_LEAD_WORDS = new Set([
+  "غا", "كا", "ما", "واش", "باش", "ديال", "هاد", "هادي", "هادا", "داك", "ديك", "شي", "غير", "راه", "لي", "اللي",
+  "في", "فى", "من", "مع", "على", "عل", "الى", "إلى", "عن", "حتى", "بلا", "يا", "قد", "لم", "لن", "أن", "ان", "إن",
+]);
+
+function leadsIntoNext(text) {
+  const letters = String(text ?? "").replace(/[^\p{L}]/gu, "");
+  if (!hasArabic(letters)) return false;
+  return letters.length === 1 || ARABIC_LEAD_WORDS.has(letters);
+}
+
+/** True for a token that is only punctuation ("؟", "!", "…"). */
+function punctuationOnly(text) {
+  return /^[\p{P}\p{S}]+$/u.test(text);
+}
+
+/**
  * The family actually used for `text`. Latin display fonts have no Arabic
  * glyphs, so libass would silently substitute a system font (or draw boxes on
  * a server that has none). Arabic text is routed to a bundled Arabic family.
@@ -137,13 +173,28 @@ export function groupCaptionWords(words, style, clipDuration = Infinity) {
     const w = list[index];
     const text = displayWord(w.word, s);
     if (!text) continue;
+    /* A stray "؟" or "!" from the transcriber joins the word before it
+     * instead of being shown on its own. */
+    if (punctuationOnly(text)) {
+      if (prev && current) {
+        prev.text += text;
+        prev.end = Math.max(prev.end, w.end);
+        current.end = Math.max(current.end, prev.end);
+        if (SENTENCE_END_RE.test(text)) prev.endsSentence = true;
+      }
+      continue;
+    }
     const item = { text, start: Math.max(0, w.start), end: w.end, index, posX: w.posX, posY: w.posY };
     const joined = current ? `${current.words.map((x) => x.text).join(" ")} ${text}` : text;
+    /* A line never ends on a short Arabic word such as "ف" or "ما": it takes
+     * the next word too, at most two words past the design's count. */
+    const held = !!current && current.words.length < maxWords + 2
+      && leadsIntoNext(current.words[current.words.length - 1].text);
     const breakHere = !current
-      || current.words.length >= maxWords
+      || (current.words.length >= maxWords && !held)
       || (current.words.length > 0 && estimateWidth(joined, s.fontSize, s.uppercase) > USABLE_W)
       || (prev && item.start - prev.end > PAUSE)
-      || (prev && SENTENCE_END_RE.test(cleanWord(list[prev.index].word)))
+      || (prev && (prev.endsSentence || SENTENCE_END_RE.test(cleanWord(list[prev.index].word))))
       || item.posX != null || item.posY != null;
     if (breakHere) {
       current = { start: item.start, end: item.end, words: [] };
@@ -270,8 +321,9 @@ export function buildAssFile(words, style, clipDuration, synced = true, overlays
   const allText = (words ?? []).map((w) => w.word).join(" ");
   const font = captionFontFor(s, allText);
   const boxPad = Math.max(6, Math.round(fontSize * 0.14));
-  /* Encoding -1 lets libass pick each line's base direction from its text, so
-   * Arabic lines run right-to-left and mixed Arabic/Latin lines order correctly. */
+  /* Encoding -1 lets libass pick each line's base direction from its first
+   * strong letter. Lines with Arabic start with a right-to-left mark, so a
+   * mixed line that opens on a Latin word still reads right to left. */
   const styleLine = (name, overrides = {}) => {
     const o = { borderStyle: 1, outline, outlineColour: "&H00000000", back: "&H00000000", shadow: 0, ...overrides };
     return `Style: ${name},${font},${fontSize},${colours.primary},${colours.primary},${o.outlineColour},${o.back},-1,0,0,0,100,100,0,0,${o.borderStyle},${o.outline},${o.shadow},${alignment},60,60,${marginV},-1`;
@@ -301,7 +353,10 @@ export function buildAssFile(words, style, clipDuration, synced = true, overlays
   ];
   const events = [];
   const push = (layer, start, end, styleName, tags, text) => {
-    if (end > start) events.push(`Dialogue: ${layer},${toAssTime(start)},${toAssTime(end)},${styleName},,0,0,0,,${tags ? `{${tags}}` : ""}${text}`);
+    /* A line with Arabic in it is laid out right to left, whatever word it
+     * opens on (see captionDirection). */
+    const mark = hasArabic(text) ? RLM : "";
+    if (end > start) events.push(`Dialogue: ${layer},${toAssTime(start)},${toAssTime(end)},${styleName},,0,0,0,,${tags ? `{${tags}}` : ""}${mark}${text}`);
   };
   const groups = groupCaptionWords(words, s, clipDuration);
   for (const group of groups) {

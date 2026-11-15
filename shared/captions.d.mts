@@ -15,6 +15,8 @@ export type CaptionStyle = {
   /** Free position as a percentage of the frame (0-100), to the text centre. */
   posX?: number;
   posY?: number;
+  /** Settings chosen by hand, which the clip's video style leaves alone. */
+  own?: string[];
 };
 
 export type CaptionWord = { word: string; start: number; end: number; posX?: number; posY?: number };
@@ -30,6 +32,8 @@ export const DEFAULT_CAPTION_STYLE: CaptionStyle & { preset: CaptionPresetId };
 export const ARABIC_FONTS: string[];
 export const DEFAULT_ARABIC_FONT: string;
 export function hasArabic(text: string): boolean;
+/** "rtl" for a line with any Arabic in it, else "ltr". */
+export function captionDirection(text: string): "rtl" | "ltr";
 export function captionFontFor(style: Partial<CaptionStyle>, text: string): string;
 export function resolveCaptionStyle(style: Partial<CaptionStyle>): CaptionStyle & { preset: CaptionPresetId; uppercase: boolean };
 export function cleanWord(raw: string): string;

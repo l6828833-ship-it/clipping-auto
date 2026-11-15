@@ -1,3 +1,6 @@
 .data/
 .env
 .venv/
+
+# Python bytecode written by the build check
+__pycache__/

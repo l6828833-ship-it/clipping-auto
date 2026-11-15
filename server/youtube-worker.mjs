@@ -50,6 +50,25 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
   });
 }
 
+/**
+ * Answers a worker that reports on a job this server does not have. Jobs live
+ * in this process's memory, so this means the server restarted after the job
+ * was handed out, or the host ran a second instance and sent the request
+ * there. The log line says so, because a bare 404 hid both.
+ */
+const reportedUnknown = new Set();
+function unknownJob(req, res) {
+  const id = String(req.params.id).slice(0, 36);
+  /* Once per job: progress reports would otherwise repeat the line. */
+  if (!reportedUnknown.has(id)) {
+    if (reportedUnknown.size >= 200) reportedUnknown.clear();
+    reportedUnknown.add(id);
+    console.warn(`[YouTubeWorker] The worker reported on job ${id}, which this instance does not have `
+      + "(the server restarted, or a second instance answered; run exactly one instance).");
+  }
+  return res.sendStatus(404);
+}
+
 export function registerYouTubeWorker(app) {
   app.use(prefix, (req, res, next) => {
     const token = workerToken();
@@ -66,6 +85,11 @@ export function registerYouTubeWorker(app) {
     for (const [id, job] of jobs) {
       if (job.state !== "waiting") continue;
       job.state = "claimed";
+      /* The 15 minutes count from the claim, not from when the job was
+       * queued. The worker takes one job at a time, so a job that waited
+       * behind others used to expire while it was still being downloaded,
+       * and its upload then got a 404. */
+      job.touch();
       /* With hosted transcription the worker only fetches the audio; the
        * server transcribes it. Otherwise the worker may run Whisper itself. */
       return res.json({ id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: !hostedSttAvailable() });
@@ -75,14 +99,15 @@ export function registerYouTubeWorker(app) {
 
   app.post(`${prefix}/:id/failed`, (req, res) => {
     const job = jobs.get(req.params.id);
-    if (job?.state !== "claimed") return res.sendStatus(404);
+    if (job?.state !== "claimed") return unknownJob(req, res);
     job.finish(new Error("The YouTube download worker couldn’t fetch this video."));
     return res.sendStatus(204);
   });
 
   app.post(`${prefix}/:id/transcribing`, (req, res) => {
     const job = jobs.get(req.params.id);
-    if (job?.state !== "claimed" || job.kind !== "audio") return res.sendStatus(404);
+    if (job?.state !== "claimed") return unknownJob(req, res);
+    if (job.kind !== "audio") return res.sendStatus(404);
     job.touch();
     job.onTranscribing?.();
     return res.sendStatus(204);
@@ -90,7 +115,8 @@ export function registerYouTubeWorker(app) {
 
   app.post(`${prefix}/:id/transcript`, express.json({ limit: "4mb" }), (req, res) => {
     const job = jobs.get(req.params.id);
-    if (job?.state !== "claimed" || job.kind !== "audio") return res.sendStatus(404);
+    if (job?.state !== "claimed") return unknownJob(req, res);
+    if (job.kind !== "audio") return res.sendStatus(404);
     const { metadata, transcript } = req.body ?? {};
     if (!metadata || typeof transcript?.text !== "string" || !Array.isArray(transcript.words)
       || transcript.words.some(word => typeof word?.word !== "string" || !Number.isFinite(word.start)
@@ -101,13 +127,15 @@ export function registerYouTubeWorker(app) {
 
   app.put(`${prefix}/:id/media`, async (req, res) => {
     const job = jobs.get(req.params.id);
-    if (job?.state !== "claimed") return res.sendStatus(404);
+    if (job?.state !== "claimed") return unknownJob(req, res);
     const expectedBytes = Number(req.get("content-length"));
     const mime = job.kind === "audio" ? "audio/mpeg" : "video/mp4";
     if (!req.is(mime) || !Number.isSafeInteger(expectedBytes) || expectedBytes < 1 || expectedBytes > maxBytes) {
       return res.sendStatus(400);
     }
     job.state = "receiving";
+    /* A slow upload gets its own 15 minutes. */
+    job.touch();
     const partial = `${job.destination}.partial`;
     let bytes = 0;
     try {

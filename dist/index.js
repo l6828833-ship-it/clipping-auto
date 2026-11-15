@@ -8,7 +8,7 @@ import { totalmem, tmpdir as systemTmpdir } from "os";
 import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { facePanelCrop, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
-import { VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
+import { OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
@@ -822,7 +822,21 @@ function registerMediaRoutes(app) {
     try {
       const [owned] = await db.select({ id: table.id }).from(table)
         .where(and(eq(table.userId, user.id), eq(urlColumn, mediaUrl))).limit(1);
-      if (!owned) return res.status(404).json({ error: "Media not found." });
+      let allowed = !!owned;
+      /* Every file imported for a video is named after that video's id: a
+       * whole import and each clip's part alike (videoFileName). The row only
+       * remembers the file opened last, so a clip's part fetched in the
+       * background was refused here and its preview never played. Such a file
+       * is served to the owner of the video it belongs to. */
+      if (!allowed && kind === "video") {
+        const id = Number(/^video-(\d+)-/.exec(req.params.name)?.[1]);
+        if (Number.isSafeInteger(id)) {
+          const [mine] = await db.select({ id: videos.id }).from(videos)
+            .where(and(eq(videos.id, id), eq(videos.userId, user.id))).limit(1);
+          allowed = !!mine;
+        }
+      }
+      if (!allowed) return res.status(404).json({ error: "Media not found." });
     } catch (error) {
       console.error("[Media] Could not verify file ownership:", error);
       return res.status(503).json({ error: "Media storage is unavailable." });
@@ -4172,7 +4186,12 @@ var appRouter = router({
     }),
     prefetch: protectedProcedure.input(z4.object({
       id: z4.number(),
-      ranges: z4.array(z4.object({ startTime: z4.number().min(0), endTime: z4.number().min(0) })).max(12)
+      ranges: z4.array(z4.object({
+        startTime: z4.number().min(0),
+        endTime: z4.number().min(0),
+        /** The clip's video style, so the framing it will be exported with is worked out too. */
+        style: z4.enum(VIDEO_STYLE_IDS).optional()
+      })).max(12)
     })).mutation(async ({ input, ctx }) => {
       const video = await getVideoById(input.id, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
@@ -4180,12 +4199,29 @@ var appRouter = router({
       if (video.sourceType !== "url" || !sourceUrl || !/^https?:\/\//i.test(sourceUrl)) return { queued: 0 };
       const ranges = input.ranges.filter((r) => r.endTime > r.startTime && r.endTime - r.startTime <= 600);
       void (async () => {
+        /* Every clip's part of the video first, so each preview is ready as
+         * soon as it can be. */
+        const imported = [];
         for (const r of ranges) {
           try {
-            await hostVideoShared({ videoId: video.id, sourceUrl, range: { start: r.startTime, end: r.endTime } });
+            const result = await hostVideoShared({ videoId: video.id, sourceUrl, range: { start: r.startTime, end: r.endTime } });
+            imported.push({ r, result });
           } catch (error) {
             console.warn(`[Host] Prefetch of ${r.startTime}-${r.endTime}s for video ${video.id} failed: ${String(error?.message ?? error).slice(0, 160)}`);
           }
+        }
+        /* Then the speaker-following framing the render would work out, with
+         * the same file and range so the render finds it already done and only
+         * has to encode. The footage and reaction styles find faces their own
+         * way when they render, so they are left to that. */
+        if (process.env.CLIP_MAKER_AUTO_REFRAME === "0") return;
+        for (const { r, result } of imported) {
+          const kind = r.style ? splitKind(r.style) : null;
+          if (kind && kind !== "dual") continue;
+          const file = localPathFromUrl(result.url);
+          if (!file) continue;
+          await detectFraming(file, r.startTime - (result.offset ?? 0), r.endTime - r.startTime, kind === "dual" ? "dual" : void 0)
+            .catch((error) => console.warn(`[AutoFrame] Prefetch framing of ${r.startTime}-${r.endTime}s for video ${video.id} failed: ${String(error?.stderr || error?.message || error).slice(0, 160)}`));
         }
       })();
       return { queued: ranges.length };
@@ -4795,7 +4831,9 @@ var appRouter = router({
          * so it renders identically at any output size or aspect ratio.
          */
         posX: z4.number().min(0).max(100).optional(),
-        posY: z4.number().min(0).max(100).optional()
+        posY: z4.number().min(0).max(100).optional(),
+        /** Settings chosen by hand, which the clip's video style leaves alone. */
+        own: z4.array(z4.enum(OWNABLE_CAPTION_FIELDS)).max(OWNABLE_CAPTION_FIELDS.length).optional()
       }).optional()
     })).mutation(async ({ input, ctx }) => {
       if (!await getClipById(input.clipId, ctx.user.id)) {
@@ -5051,23 +5089,11 @@ async function findAvailablePort(startPort, host) {
   throw new Error(`No available port found starting from ${startPort}`);
 }
 async function startServer() {
-  try {
-    const { videos: videos2, clips: clips2 } = await resetOrphanedJobs();
-    if (videos2 > 0 || clips2 > 0) {
-      console.log(`[Startup] Reset ${videos2} interrupted import(s) and ${clips2} interrupted render(s)`);
-    }
-  } catch (err) {
-    console.warn("[Startup] Could not reset interrupted jobs:", err);
-  }
-  /* Keep checking: a job that dies later has to be released too. */
-  setInterval(() => {
-    resetOrphanedJobs().then(({ videos: videos2, clips: clips2 }) => {
-      if (videos2 > 0 || clips2 > 0) console.log(`[Jobs] Released ${videos2} abandoned import(s) and ${clips2} abandoned render(s)`);
-    }).catch(() => {});
-  }, 12e4).unref();
   const app = express2();
   const server = createServer(app);
-  app.get("/healthz", (_req, res) => res.json({ status: "ok" }));
+  /* Cloud Run keeps /healthz for itself on the public URL (it answers 404
+   * there), so /health is the path to give the host's health check. */
+  app.get(["/health", "/healthz"], (_req, res) => res.json({ status: "ok" }));
   registerYouTubeWorker(app);
   app.use("/api/native/youtube", express2.json({ limit: "2kb" }));
   registerNativeYouTube(app, { findYtDlp, findFfmpeg });
@@ -5109,6 +5135,23 @@ async function startServer() {
   }
   server.listen(port, host, () => {
     console.log(`Server running on http://localhost:${port}/`);
+    /* Database housekeeping starts once the port is open. The host gives a
+     * new container only a short time to open its port, so a slow or stalled
+     * database must not delay it. Starting jobs after this is safe: only rows
+     * untouched for three minutes are released. */
+    resetOrphanedJobs().then(({ videos: videos2, clips: clips2 }) => {
+      if (videos2 > 0 || clips2 > 0) {
+        console.log(`[Startup] Reset ${videos2} interrupted import(s) and ${clips2} interrupted render(s)`);
+      }
+    }).catch((err) => {
+      console.warn("[Startup] Could not reset interrupted jobs:", err);
+    });
+    /* Keep checking: a job that dies later has to be released too. */
+    setInterval(() => {
+      resetOrphanedJobs().then(({ videos: videos2, clips: clips2 }) => {
+        if (videos2 > 0 || clips2 > 0) console.log(`[Jobs] Released ${videos2} abandoned import(s) and ${clips2} abandoned render(s)`);
+      }).catch(() => {});
+    }, 12e4).unref();
   });
 }
 startServer().catch(console.error);
