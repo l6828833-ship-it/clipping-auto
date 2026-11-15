@@ -16,7 +16,19 @@ The project root contains a Dockerfile that builds the Vite website and starts t
 5. For a fresh database, run `npm run db:migrate` once with `DATABASE_URL` set before creating web accounts. For an existing deployment, check its Drizzle migration history before running migrations.
 6. Open the assigned HTTPS URL and test web sign-in, video import, and clip export. Then set the Xcode target’s `CLIP_MAKER_SERVICE_URL` to that HTTPS origin. The iOS YouTube flow does not require a Clip Maker account.
 
-Rundploy advertises GitHub and folder uploads. Docker builds and persistent volumes need to be confirmed in the app dashboard before publishing the full project.
+### Cloudflare R2 media storage
+
+Create a private R2 bucket and an **Object Read & Write** token scoped to that bucket. Set these runtime variables in the app's deployment settings. Keep the access key and secret on the server.
+
+| Variable | Value |
+| --- | --- |
+| `CLIP_MAKER_S3_ENDPOINT` | The S3 endpoint from the R2 dashboard, such as `https://<account-id>.r2.cloudflarestorage.com` |
+| `CLIP_MAKER_S3_BUCKET` | The bucket name |
+| `CLIP_MAKER_S3_REGION` | `auto` |
+| `CLIP_MAKER_S3_ACCESS_KEY_ID` | The R2 token's access key ID |
+| `CLIP_MAKER_S3_SECRET_ACCESS_KEY` | The R2 token's secret access key |
+
+Clip Maker saves new imports and exports to the bucket. After checking ownership, it gives the browser a temporary link for playback or download. Re-render an older export if its server copy was lost before R2 was connected. See the [Cloudflare R2 token instructions](https://developers.cloudflare.com/r2/api/tokens/).
 
 The image includes OpenAI Whisper and its multilingual `base` model. When a source has no usable captions, the server downloads its audio and transcribes it on the CPU. Selecting Moroccan Darija uses a [Darija-trained Whisper model](https://huggingface.co/Anass-Srk/fine-tuned-whisper-small-darija) and timed words from the source audio. Allocate 4 GiB for server-side Darija transcription and allow background analysis to finish before stopping the instance. The Inworld key is used for AI highlights.
 

@@ -25,6 +25,7 @@ import {
   downloadUrl,
   formatTime,
 } from "@/lib/videoSource";
+import { downloadMedia } from "@/lib/download";
 import {
   Film, Download, Clock, TrendingUp, Loader2, Play, CheckCircle2,
   AlertCircle, Zap, X, Maximize2, Scissors, Save, ExternalLink, CloudDownload, Trash2, Mic, Captions,
@@ -997,6 +998,7 @@ function ClipEditorModal({
               <a
                 href={downloadUrl(clip.downloadUrl)}
                 download
+                onClick={downloadMedia(clip.downloadUrl)}
                 className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-bold transition-all hover:opacity-90"
                 style={{ background: "rgba(89, 164, 133, 0.1)", color: "var(--mint)" }}
               >
@@ -1320,7 +1322,7 @@ export default function ClipsPage() {
                     )}
                     {hostedStatus === "ready" && clip.status !== "rendering" && (
                       clip.downloadUrl && clip.downloadUrl !== "#" ? (
-                        <a href={downloadUrl(clip.downloadUrl)} download
+                        <a href={downloadUrl(clip.downloadUrl)} download onClick={downloadMedia(clip.downloadUrl)}
                           className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition-all hover:opacity-80"
                           style={{ background: "rgba(89, 164, 133, 0.1)", color: "var(--mint)" }}>
                           <Download className="w-3.5 h-3.5" /> Download

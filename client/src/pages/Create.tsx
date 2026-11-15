@@ -14,6 +14,7 @@ import {
 } from "@shared/video-styles.mjs";
 import VideoStylePicker from "@/components/VideoStylePicker";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
+import { downloadMedia } from "@/lib/download";
 import { trpc } from "@/lib/trpc";
 import { useSourceTranscription, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
 import { toast } from "sonner";
@@ -1710,7 +1711,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
                 <div className="flex gap-2 flex-wrap">
                   {!hook && <button onClick={() => genHook(h)} disabled={generateTitle.isPending} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all hover:opacity-80" style={{ background:"rgba(221, 125, 113, 0.1)", color:"var(--coral)" }}><Wand2 className="w-3 h-3" /> AI Hook</button>}
                   {file ? (
-                    <a href={downloadUrl(file)} download className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Download className="w-3.5 h-3.5" /> Download</a>
+                    <a href={downloadUrl(file)} download onClick={downloadMedia(file)} className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Download className="w-3.5 h-3.5" /> Download</a>
                   ) : isRendering || clipId == null ? (
                     <div className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground bg-secondary/60"><Loader2 className="w-3.5 h-3.5 animate-spin" /> {progressLabel}</div>
                   ) : (
@@ -1756,7 +1757,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
             </div>
           )}
           {shownFile && (
-            <a href={downloadUrl(shownFile)} download
+            <a href={downloadUrl(shownFile)} download onClick={downloadMedia(shownFile)}
               className="mt-3 flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-bold transition-all hover:opacity-80"
               style={{ background: "rgba(89, 164, 133, 0.1)", color: "var(--mint)" }}>
               <Download className="w-3.5 h-3.5" /> Download MP4

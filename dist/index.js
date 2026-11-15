@@ -15,6 +15,8 @@ import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } fr
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
+import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile } from "../server/object-storage.mjs";
+import { pipeline as nodePipeline } from "node:stream/promises";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -787,6 +789,37 @@ function localPathFromUrl(url) {
   if (!match) return null;
   return resolveMediaPath(match[1], match[2]);
 }
+/** The kind and file name of one of our media URLs, or null. */
+function mediaRef(url) {
+  const match = /^\/api\/media\/(video|clip)\/([^/?#]+)$/.exec(url ?? "");
+  return match && MEDIA_NAME[match[1]].test(match[2]) ? { kind: match[1], name: match[2] } : null;
+}
+/**
+ * The local path of one of our media files, fetched back from the storage
+ * bucket first when this instance does not have it (after a restart, or when
+ * another instance made it). Null when it is in neither place.
+ */
+async function ensureLocalMedia(url) {
+  const ref = mediaRef(url);
+  const filePath = ref ? resolveMediaPath(ref.kind, ref.name) : null;
+  if (!filePath) return null;
+  if (await fs.stat(filePath).then((s) => s.size > 0, () => false)) return filePath;
+  await ensureDirs();
+  return await fetchToFile(ref.kind, ref.name, filePath) ? filePath : null;
+}
+/**
+ * Copies a finished file into the storage bucket (when one is configured) so
+ * every instance can serve and use it. Never throws.
+ */
+async function storeMedia(url, metadata = {}) {
+  const ref = mediaRef(url);
+  const filePath = ref ? resolveMediaPath(ref.kind, ref.name) : null;
+  if (!filePath || !storageEnabled()) return false;
+  if (await storedInfo(ref.kind, ref.name)) return true;
+  const stored = await storeFile(ref.kind, ref.name, filePath, metadata);
+  if (stored) console.log(`[Storage] Stored ${ref.kind} ${ref.name}.`);
+  return stored;
+}
 
 // server/_core/mediaRoutes.ts
 var KINDS = /* @__PURE__ */ new Set(["video", "clip"]);
@@ -829,7 +862,9 @@ function registerMediaRoutes(app) {
        * background was refused here and its preview never played. Such a file
        * is served to the owner of the video it belongs to. */
       if (!allowed && kind === "video") {
-        const id = Number(/^video-(\d+)-/.exec(req.params.name)?.[1]);
+        /* Imports only (a 10-character hash). An uploaded file is named after
+         * its user, not a video, and its row always points at it. */
+        const id = Number(/^video-(\d+)-[a-f0-9]{10}\.mp4$/.exec(req.params.name)?.[1]);
         if (Number.isSafeInteger(id)) {
           const [mine] = await db.select({ id: videos.id }).from(videos)
             .where(and(eq(videos.id, id), eq(videos.userId, user.id))).limit(1);
@@ -841,6 +876,25 @@ function registerMediaRoutes(app) {
       console.error("[Media] Could not verify file ownership:", error);
       return res.status(503).json({ error: "Media storage is unavailable." });
     }
+    const download = req.query.download === "1";
+    /* "?check=1" answers where the file can be fetched from and how big it
+     * is, so the browser can download a large file in pieces (see below). */
+    const checking = req.query.check === "1";
+    /* With a storage bucket, the browser fetches the file from there through
+     * a signed link: that works on any instance, after a restart, and for
+     * files over the host's 32 MiB limit on one response. */
+    if (storageEnabled()) {
+      let stored = await storedInfo(kind, req.params.name);
+      if (!stored && kind === "clip" && await fs2.stat(filePath).then(s => s.size > 0, () => false)) {
+        if (await storeMedia(mediaUrl)) stored = await storedInfo(kind, req.params.name);
+      }
+      const link = stored ? await signedLink(kind, req.params.name).catch(() => null) : null;
+      if (link) {
+        res.setHeader("Cache-Control", "private, no-store, max-age=0");
+        if (checking) return res.json({ size: stored.size, url: link });
+        return res.redirect(302, link);
+      }
+    }
     let stat;
     try {
       stat = await fs2.stat(filePath);
@@ -849,19 +903,24 @@ function registerMediaRoutes(app) {
       return;
     }
     const total = stat.size;
+    if (checking) {
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      return res.json({ size: total });
+    }
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
     /* Render URLs can be reused after a retry. Never let a browser retain a
      * cached partial MP4 under the same URL. */
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.setHeader("X-Content-Type-Options", "nosniff");
-    if (req.query.download === "1") {
+    if (download) {
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.name}"`);
     }
     const range = req.headers.range;
     if (!range) {
-      res.setHeader("Content-Length", String(total));
-      createReadStream(filePath).pipe(res);
+      // Let Cloud Run stream large legacy files without a fixed response size.
+      if (total <= MEDIA_PIECE) res.setHeader("Content-Length", String(total));
+      await nodePipeline(createReadStream(filePath), res).catch(() => {});
       return;
     }
     const match = /^bytes=(\d*)-(\d*)$/.exec(range);
@@ -880,13 +939,18 @@ function registerMediaRoutes(app) {
       res.status(416).setHeader("Content-Range", `bytes */${total}`).end();
       return;
     }
-    end = Math.min(end, total - 1);
+    /* At most 8 MiB per answer. The host refuses any response over 32 MiB,
+     * and a player's first request ("bytes=0-") asks for the whole file, so a
+     * long clip used to fail to play ("Response size was too large"). A
+     * shorter answer is allowed by HTTP; the player asks for the rest. */
+    end = Math.min(end, total - 1, start + MEDIA_PIECE - 1);
     res.status(206);
     res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
     res.setHeader("Content-Length", String(end - start + 1));
-    createReadStream(filePath, { start, end }).pipe(res);
+    await nodePipeline(createReadStream(filePath, { start, end }), res).catch(() => {});
   });
 }
+var MEDIA_PIECE = 8 * 1024 * 1024;
 
 // server/routers/extract.ts
 import { z } from "zod";
@@ -2650,7 +2714,7 @@ async function sectionFor(video, range) {
   };
   /* The file the video row points at: an upload, a whole import, or the
    * section of whichever clip was opened last. */
-  const rowPath = video.hostedStatus === "ready" ? localPathFromUrl(video.hostedUrl) : null;
+  const rowPath = video.hostedStatus === "ready" ? await ensureLocalMedia(video.hostedUrl) : null;
   if (rowPath) {
     const meta = await probeMedia(rowPath).catch(() => null);
     const offset = video.hostedOffset ?? 0;
@@ -2697,9 +2761,15 @@ async function hostVideo(opts) {
   const sectionFileName = range ? videoFileName(opts.videoId, `${sourceUrl}:${range.start}-${range.end}:h${maxHeight}:c${cap}`) : fullFileName;
   const describe = async (name, hostedOffset) => {
     const p = path5.join(VIDEOS_DIR, name);
-    const stat = await fs6.stat(p).catch(() => null);
+    let stat = await fs6.stat(p).catch(() => null);
+    /* Imported before, by another instance or before a restart: fetch it
+     * back from the storage bucket rather than download it again. */
+    if ((!stat || stat.size === 0) && await fetchToFile("video", name, p)) stat = await fs6.stat(p).catch(() => null);
     if (!stat || stat.size === 0) return null;
     const meta = await probeMedia(p).catch(() => ({ duration: 0, width: 0, height: 0 }));
+    /* Also kept in the bucket when it was imported before storage was set
+     * up. A no-op once it is there. */
+    void storeMedia(urlFor("video", name), { duration: meta.duration, width: meta.width, height: meta.height });
     return { fileName: name, url: urlFor("video", name), bytes: stat.size, offset: hostedOffset, ...meta };
   };
   const cachedFull = opts.sectionOnly ? null : await describe(fullFileName, 0);
@@ -3021,6 +3091,9 @@ async function hostVideo(opts) {
       const selectedTier = [1080, 720, 480, 360].find((height) => meta.height >= height) ?? meta.height;
       console.log(`[Host] Video ${opts.videoId}: using ${selectedTier}p source (${meta.width}x${meta.height} ${meta.fps?.toFixed(0) ?? "?"}fps) — sufficient for sharp 1080x1920 export`);
     }
+    /* A copy in the storage bucket, in the background: the import can be used
+     * straight away from this instance's disk meanwhile. */
+    await storeMedia(urlFor("video", fileName), { duration: meta.duration, width: meta.width, height: meta.height });
     return { fileName, url: urlFor("video", fileName), bytes: stat.size, offset: effectiveOffset, ...meta, isLowRes };
   } catch (err) {
     await fs6.rm(outPath, { force: true }).catch(() => {
@@ -3694,7 +3767,8 @@ async function resolveLayout(clip, userId, hostedPath, hostedOffset) {
   const duration = clip.endTime - clip.startTime;
   if (kind === "background") {
     const background = clip.layout.backgroundVideoId != null ? await getVideoById(clip.layout.backgroundVideoId, userId) : null;
-    const backgroundPath = background?.hostedStatus === "ready" ? localPathFromUrl(background.hostedUrl) : null;
+    const backgroundPath = background?.hostedStatus === "ready"
+      ? await ensureLocalMedia(background.hostedUrl) ?? localPathFromUrl(background.hostedUrl) : null;
     const meta = backgroundPath ? await probeMedia(backgroundPath).catch(() => null) : null;
     if (!meta) {
       throw new MediaError(`Choose a background video for the "${VIDEO_STYLES[style].label}" style. Upload your gameplay or satisfying footage as a video first, then pick it in the style menu.`);
@@ -3792,7 +3866,8 @@ async function renderTop5Countdown(entries) {
     let elapsed = 0;
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
-      const sourcePath = localPathFromUrl(entry.downloadUrl);
+      /* From the storage bucket when this instance does not have it. */
+      const sourcePath = await ensureLocalMedia(entry.downloadUrl) ?? localPathFromUrl(entry.downloadUrl);
       if (!sourcePath) throw new MediaError(`Rank ${entry.rank} has no rendered clip file. Render it first.`);
       await fs6.access(sourcePath);
       const meta = await probeMedia(sourcePath);
@@ -3988,6 +4063,14 @@ var appRouter = router({
         return { ...video, hostedDuration: await previewDuration(mediaPath, media) };
       }
       if (video.hostedStatus !== "ready") return video;
+      /* Not on this instance but in the storage bucket: still ready, and
+       * the player gets it from there. */
+      const ref = mediaRef(video.hostedUrl);
+      const stored = ref ? await storedInfo(ref.kind, ref.name) : null;
+      if (stored) {
+        const duration = Number(stored.metadata?.duration);
+        return { ...video, hostedDuration: Number.isFinite(duration) && duration > 0 ? duration : null };
+      }
       if (video.sourceType === "url") {
         return { ...video, hostedStatus: "none", hostedUrl: null, hostProgress: 0 };
       }
@@ -4409,7 +4492,8 @@ var appRouter = router({
       const renderProfile = input.renderProfile === "top5" ? "top5" : "standard";
       const video = await getVideoById(clip.videoId, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "This clip's video no longer exists." });
-      const hostedPath = localPathFromUrl(video.hostedUrl);
+      /* Fetched back from the storage bucket when this instance lacks it. */
+      const hostedPath = (video.hostedStatus === "ready" && await ensureLocalMedia(video.hostedUrl)) || localPathFromUrl(video.hostedUrl);
       const hostedFile = video.hostedStatus === "ready" && hostedPath && await fs2.stat(hostedPath).catch(() => null);
       const hostedDuration = hostedFile?.size ? await previewDuration(hostedPath, hostedFile) : null;
       const hostedStart = video.hostedOffset ?? 0;
@@ -4543,6 +4627,9 @@ var appRouter = router({
             captions: finalCaptions,
             renderProfile
           });
+          /* Into the bucket before it counts as done, so whichever instance
+           * the player reaches can hand it out. */
+          await storeMedia(result.url);
           await updateClip(clip.id, {
             status: "done",
             downloadUrl: result.url,
@@ -4600,6 +4687,7 @@ var appRouter = router({
                   captions: finalCaptions,
                   renderProfile
                 });
+                await storeMedia(reResult2.url);
                 await updateClip(clip.id, {
                   status: "done",
                   downloadUrl: reResult2.url,
@@ -4647,7 +4735,7 @@ var appRouter = router({
         throw new TRPCError5({ code: "BAD_REQUEST", message: "Set a valid start and end time first." });
       }
       const video = await getVideoById(clip.videoId, ctx.user.id);
-      const hostedPath = localPathFromUrl(video?.hostedUrl);
+      const hostedPath = video?.hostedStatus === "ready" ? await ensureLocalMedia(video.hostedUrl) : null;
       if (!video || video.hostedStatus !== "ready" || !hostedPath) {
         throw new TRPCError5({
           code: "PRECONDITION_FAILED",
@@ -4727,7 +4815,7 @@ var appRouter = router({
       const clip = await getClipById(input.id, ctx.user.id);
       if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
       const video = await getVideoById(clip.videoId, ctx.user.id);
-      const hostedPath = video && video.hostedStatus === "ready" ? localPathFromUrl(video.hostedUrl) : null;
+      const hostedPath = video?.hostedStatus === "ready" ? await ensureLocalMedia(video.hostedUrl) : null;
       const meta = hostedPath ? await probeMedia(hostedPath).catch(() => null) : null;
       const offset = video?.hostedOffset ?? 0;
       const duration = (clip.endTime ?? 0) - (clip.startTime ?? 0);
@@ -4750,11 +4838,13 @@ var appRouter = router({
     delete: protectedProcedure.input(z4.object({ id: z4.number() })).mutation(async ({ input, ctx }) => {
       const clip = await getClipById(input.id, ctx.user.id);
       if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
-      const renderedPath = localPathFromUrl(clip.downloadUrl);
-      if (renderedPath) {
+      const rendered = mediaRef(clip.downloadUrl);
+      if (rendered?.kind === "clip" && rendered.name.startsWith(`clip-${clip.id}-`)) {
+        const renderedPath = resolveMediaPath(rendered.kind, rendered.name);
         await fsp.rm(renderedPath, { force: true }).catch((err) => {
           console.warn(`[Clips] Could not delete ${renderedPath}: ${String(err)}`);
         });
+        await removeStored(rendered.kind, rendered.name);
       }
       await deleteClip(clip.id);
       return { success: true };
@@ -4769,6 +4859,12 @@ var appRouter = router({
       downloadUrl: z4.string().optional(),
       thumbnailUrl: z4.string().optional()
     })).mutation(async ({ input, ctx }) => {
+      const clip = await getClipById(input.id, ctx.user.id);
+      if (!clip) throw new TRPCError5({ code: "NOT_FOUND", message: "Clip not found" });
+      const media = mediaRef(input.downloadUrl);
+      if (media && (media.kind !== "clip" || !media.name.startsWith(`clip-${clip.id}-`))) {
+        throw new TRPCError5({ code: "BAD_REQUEST", message: "This media belongs to a different clip." });
+      }
       await updateClip(input.id, { status: input.status, downloadUrl: input.downloadUrl, thumbnailUrl: input.thumbnailUrl });
       return { success: true };
     })
@@ -4802,6 +4898,7 @@ var appRouter = router({
         return { ...entry, downloadUrl: clip.downloadUrl };
       }).sort((a, b) => b.rank - a.rank);
       const result = await renderTop5Countdown(entries);
+      await storeMedia(result.url);
       console.log(`[Top5] Rendered ${entries.length} ranked clips (${Math.round(result.bytes / 1024 / 1024)} MB) → ${result.url}`);
       return { success: true, ...result };
     })
@@ -5120,14 +5217,21 @@ async function startServer() {
   registerMediaUpload(app, {
     authenticate: req => sdk.authenticateRequest(req),
     ensureDirs, findFfmpeg, probeMedia, transcribe: transcribeWords,
-    storeVideo: createVideo, videoDirectory: VIDEOS_DIR, workDirectory: RENDER_TMP_DIR
+    /* An uploaded file is the only copy of that video: keep one in the
+     * storage bucket too. */
+    storeVideo: async (data) => {
+      const id = await createVideo(data);
+      await storeMedia(data.hostedUrl, { duration: data.duration, width: data.width, height: data.height });
+      return id;
+    },
+    videoDirectory: VIDEOS_DIR, workDirectory: RENDER_TMP_DIR
   });
   registerReelRoutes(app, {
     authenticate: req => sdk.authenticateRequest(req),
     findFfmpeg, probeMedia, fontsDirectory: FONTS_DIR,
     getClipPath: async (id, userId) => {
       const clip = await getClipById(id, userId);
-      return clip?.status === "done" ? localPathFromUrl(clip.downloadUrl) : null;
+      return clip?.status === "done" ? await ensureLocalMedia(clip.downloadUrl) ?? localPathFromUrl(clip.downloadUrl) : null;
     }
   });
   app.use(
