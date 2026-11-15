@@ -26,6 +26,12 @@ When `INWORLD_API_KEY` is set, transcription uses the hosted Inworld speech API 
 
 Video styles (Normal, four single-speaker looks and four split-screen layouts) are stored per clip in a new nullable `clips.layout` column (migration `0003_clip_layout`, also added on start-up). The style is applied at render time (`server/montage.mjs`). The two footage styles use one of the user's own uploaded videos as the lower half; no footage ships with the app.
 
+The Create wizard has four steps: Input (where the video style is chosen, or left to the AI), Highlights, Captions and Export. Export saves a clip for every selected highlight and renders them one after another without being asked; each render imports its own part of the video, follows the speaker and transcribes if needed. The Captions step fetches every selected range in the background (`videos.prefetch`), and a range that is already being fetched is shared rather than downloaded twice. Framing, cuts and per-clip styles can still be changed afterwards from the Clips page.
+
+Speaker framing (`scripts/auto_frame.py`) cuts to whoever is talking when two people share a shot and are too far apart for one crop. It judges this from mouth movement, so it needs faces large enough to see; set `CLIP_MAKER_AUTO_REFRAME=0` to switch automatic framing off.
+
+Two settings exist only for local testing: `INWORLD_BASE_URL` points the AI calls at a stand-in server, and `CLIP_MAKER_DB_POOL_MAX` caps the database pool for a test database that accepts one connection at a time. Leave both unset in production.
+
 Jump cuts ("Tighten") are stored in a new nullable `clips.cuts` column (migration `0002_clip_cuts`). The server also adds it on start-up with `ADD COLUMN IF NOT EXISTS`, so a deploy works before `npm run db:migrate` has been run. AI reframing needs `onnxruntime` (in `scripts/requirements-whisper.txt`) and `assets/models/face-rfb-320.onnx`.
 
 Rendered clips fetch their own source range at up to 1440p (`CLIP_MAKER_MAX_SECTION_HEIGHT`, set `2160` for 4K or `CLIP_MAKER_HQ_SECTIONS=0` to render from the 1080p import only). A 9:16 crop keeps a third of a 16:9 frame, so the extra resolution is what keeps exports sharp.
