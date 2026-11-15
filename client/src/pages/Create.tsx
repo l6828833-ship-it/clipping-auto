@@ -2,7 +2,7 @@ import { useState, useRef, useMemo, useEffect } from "react";
 // (useRef/useEffect drive the one-shot import trigger in StepSubtitles)
 import AppLayout from "@/components/AppLayout";
 import ClipPreview from "@/components/ClipPreview";
-import { CropView, DEFAULT_FRAMING } from "@/components/VideoFramer";
+import { CropView, DEFAULT_FRAMING, type Framing } from "@/components/VideoFramer";
 import SubtitleOverlay, {
   DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE,
   CAPTION_FONTS, CaptionPresetPicker,
@@ -945,13 +945,6 @@ function StepSubtitles({
     { id: videoId ?? 0 },
     { enabled: videoId != null, refetchInterval: 3000, retry: false }
   );
-  /**
-   * A partial import starts partway into the source, so the hosted file's t=0
-   * is `hostedOffset` seconds into the original. Clip times are absolute and
-   * must be rebased before being handed to a player.
-   */
-  const hostedOffset = video?.hostedOffset ?? 0;
-
   const host = trpc.videos.host.useMutation({
     onSuccess: async () => {
       await utils.videos.get.invalidate();
@@ -960,7 +953,34 @@ function StepSubtitles({
     onError: err => toast.error(`Import failed: ${err.message}`),
   });
 
-  const { hostedUrl, hostedStatus, importClip } = useClipPreviewImport(videoId, clip, video, host.mutate);
+  /*
+   * Which selected clips are already imported, and where each plays from.
+   * A clip that is on the server is shown straight from its own file, so
+   * going to another clip and back never starts its import again. Polled
+   * until every clip is in.
+   */
+  const ranges = useMemo(
+    () => clips.slice(0, 12).map(c => ({ startTime: c.startTime, endTime: c.endTime })),
+    [clips],
+  );
+  const [allImported, setAllImported] = useState(false);
+  const { data: sectionData } = trpc.videos.sections.useQuery(
+    { id: videoId ?? 0, ranges },
+    { enabled: videoId != null && ranges.length > 0, refetchInterval: allImported ? false : 4000 },
+  );
+  const sections = (sectionData as { sections?: ({ url: string; offset: number; duration: number } | null)[] } | undefined)?.sections;
+  useEffect(() => {
+    setAllImported(!!sections && sections.length === ranges.length && sections.every(Boolean));
+  }, [sections, ranges.length]);
+  const section = sections?.[previewIdx] ?? null;
+
+  /* Only a clip that is not on the server yet asks for its import. */
+  const imported = useClipPreviewImport(videoId, section ? undefined : clip, video, host.mutate);
+  const importClip = imported.importClip;
+  const hostedUrl = section?.url ?? imported.hostedUrl;
+  const hostedStatus = section ? "ready" as const : imported.hostedStatus;
+  /* The playing file's t=0 is `hostedOffset` seconds into the original. */
+  const hostedOffset = section?.offset ?? video?.hostedOffset ?? 0;
 
   /* Fetch every selected clip's part of the video in the background, once, so
    * switching the preview to clip 2, 3, 4… and the export that follows find
@@ -972,7 +992,6 @@ function StepSubtitles({
     const key = `${videoId}:${clips.map(c => `${c.startTime}-${c.endTime}`).join(",")}`;
     if (prefetched.current === key) return;
     prefetched.current = key;
-    const ranges = clips.slice(0, 12).map(c => ({ startTime: c.startTime, endTime: c.endTime }));
     /* Best effort, with one more try: nothing breaks if it fails, the clips
      * are simply fetched when they are needed. */
     prefetch.mutateAsync({ id: videoId, ranges })
@@ -995,21 +1014,33 @@ function StepSubtitles({
     : null;
   const shownStyle = montageCaptionStyle(clipStyle, style) as SubStyle;
 
-  /* The framing the export will use: the server follows the speaker's face.
+  /* The framing the export will use: the server follows the speaker's face,
+   * and for Dual Speaker also says which shots have two people in them.
    * Asked for once the clip's part of the video is imported, so the preview
-   * shows the same crop as the finished clip rather than the plain centre. */
+   * shows the same picture as the finished clip rather than the plain centre. */
   const { data: autoFraming } = trpc.videos.previewFraming.useQuery(
-    { id: videoId ?? 0, startTime: clip?.startTime ?? 0, endTime: clip?.endTime ?? 0 },
+    {
+      id: videoId ?? 0, startTime: clip?.startTime ?? 0, endTime: clip?.endTime ?? 0,
+      ...(clipStyle === "dual" ? { style: "dual" as const } : {}),
+    },
     { enabled: videoId != null && !!clip && hostedStatus === "ready", staleTime: Infinity },
   );
   /** Playback position in the clip, in steps coarse enough not to re-render every frame. */
   const [previewTime, setPreviewTime] = useState(0);
   useEffect(() => { setPreviewTime(0); }, [clip?.id]);
-  const previewFraming = useMemo(() => {
-    const segments = ((autoFraming as { segments?: FramingSegment[] } | undefined)?.segments ?? []);
-    const index = segments.length ? segmentAt(segments, previewTime) : undefined;
-    return index != null ? framingAt(segments[index], previewTime) : DEFAULT_FRAMING;
-  }, [autoFraming, previewTime]);
+  const plan = useMemo(
+    () => ((autoFraming as { segments?: PlanSegment[] } | undefined)?.segments ?? []),
+    [autoFraming],
+  );
+  const planIndex = plan.length ? segmentAt(plan, previewTime) : undefined;
+  const planSegment = planIndex != null ? plan[planIndex] : undefined;
+  /* Two people on screen right now: one per half. */
+  const pair = clipStyle === "dual" && planSegment?.dual?.length === 2
+    ? { top: planSegment.dual[0], bottom: planSegment.dual[1] } : null;
+  const previewFraming = planSegment && !planSegment.dual ? framingAt(planSegment, previewTime) : DEFAULT_FRAMING;
+  /* Captions sit across the join while the picture is split. */
+  const captionStyle = pair && shownStyle.posX == null && shownStyle.posY == null
+    ? { ...shownStyle, position: "center" as const } : shownStyle;
 
   // Keep the highlighted word inside the current slice.
   useEffect(() => {
@@ -1108,13 +1139,19 @@ function StepSubtitles({
             {/* Clip switcher, when more than one is selected. */}
             {clips.length > 1 && (
               <div className="flex flex-wrap justify-center gap-1.5">
-                {clips.map((c, i) => (
-                  <button key={c.id} onClick={() => setPreviewIdx(i)}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all ${i === previewIdx ? "text-white" : "text-muted-foreground bg-secondary/60 hover:text-foreground"}`}
-                    style={i === previewIdx ? { background: "var(--cobalt)" } : {}}>
-                    #{i + 1}
-                  </button>
-                ))}
+                {clips.map((c, i) => {
+                  const ready = !!sections?.[i];
+                  return (
+                    <button key={c.id} onClick={() => setPreviewIdx(i)}
+                      title={ready ? "Ready to preview" : "Still importing this part of the video"}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all ${i === previewIdx ? "text-white" : "text-muted-foreground bg-secondary/60 hover:text-foreground"}`}
+                      style={i === previewIdx ? { background: "var(--cobalt)" } : {}}>
+                      #{i + 1}
+                      <span aria-hidden="true" className={`w-1.5 h-1.5 rounded-full ${ready ? "" : "animate-pulse"}`}
+                        style={{ background: ready ? "var(--mint)" : "var(--amber)" }} />
+                    </button>
+                  );
+                })}
               </div>
             )}
 
@@ -1131,14 +1168,14 @@ function StepSubtitles({
                 endTime={(clip?.endTime ?? 0) - hostedOffset}
                 className="w-full shadow-2xl"
                 style={{ maxWidth: "300px" }}
-                look={{ style: clipStyle, backgroundUrl }}
+                look={{ style: clipStyle, backgroundUrl, dual: pair, hasDual: plan.some(seg => seg.dual) }}
                 onTime={t => setPreviewTime(Math.max(0, Math.round((t + hostedOffset - (clip?.startTime ?? 0)) * 20) / 20))}
               >
                 {captionsOn && previewWords.length > 0 && (
                   <SubtitleOverlay
                     words={previewWords}
                     activeIndex={activeWord}
-                    style={shownStyle}
+                    style={captionStyle}
                     onWordClick={setActiveWord}
                     onPositionChange={setFreePos}
                   />
@@ -1192,6 +1229,9 @@ function StepSubtitles({
     </div>
   );
 }
+
+/** A framing segment from the server; a two-person shot carries the crop for each half. */
+type PlanSegment = FramingSegment & { dual?: Framing[] };
 
 /** The words spoken inside a clip, in clip-relative seconds. */
 function wordsInClip(words: TimelineWord[] | null | undefined, clip: Highlight): TimelineWord[] {

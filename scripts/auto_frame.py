@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Choose 9:16 framing for a clip by following the speaker's face.
 
-usage: auto_frame.py <video> <start> <duration> <src-width> <src-height> [people]
+usage: auto_frame.py <video> <start> <duration> <src-width> <src-height> [people|dual]
 
 With "people" as the last argument it prints {"people": [...]} instead: one
 entry per person's face position, for the split-screen layouts.
+
+With "dual" it prints the usual framing segments, except that a camera shot
+with two people in it becomes one segment carrying "dual": the two face
+positions, left person first. The renderer stacks those two; shots with one
+person keep the normal full-height framing.
 
 Samples the clip a few times a second, finds faces, splits the clip at camera
 cuts, and prints JSON framing segments (clip-relative seconds, the same shape
@@ -145,15 +150,9 @@ def mouth_motion(luma, previous, face):
     return max(0.0, float(change[middle:bottom, x1:x2].mean()) - float(change[top:middle, x1:x2].mean()))
 
 
-def follow_speaker(frames, kept):
-    """For one shot, picks who the crop follows in each frame.
-
-    `frames` is a list of face lists, each face (cx, cy, area, w, h, motion).
-    Returns (centres, switches): the followed face's centre-x per frame (None
-    where it was not found) and the frame indexes where the crop should cut to
-    another person. One person, or people close enough to share a crop, gives
-    the plain "largest face" behaviour and no switches."""
-    count = len(frames)
+def group_faces(frames):
+    """Sorts the faces of one shot into people by horizontal position.
+    Each person is {"x": [...], "area": [...], "at": {frame index: face}}."""
     groups = []
     for index, faces in enumerate(frames):
         for face in faces:
@@ -165,6 +164,67 @@ def follow_speaker(frames, kept):
                 group["x"].append(face[0])
                 group["area"].append(face[2])
                 group["at"][index] = face
+    return groups
+
+
+def two_people(frames):
+    """The two people a shot is about, left one first, as face boxes
+    {"cx", "cy", "w", "h"} (fractions of the frame). None unless two people
+    are on screen for a good part of the shot."""
+    count = len(frames)
+    # People are told apart by where their face is in both directions. By
+    # sideways position alone, a false hit below a face (a hand, a microphone)
+    # joins that person and drags the box down off the face.
+    groups = []
+    for index, faces in enumerate(frames):
+        for face in faces:
+            group = next((g for g in groups
+                          if abs(float(np.median(g["x"])) - face[0]) < 0.12
+                          and abs(float(np.median(g["y"])) - face[1]) < 0.14), None)
+            if group is None:
+                group = {"x": [], "y": [], "area": [], "at": {}}
+                groups.append(group)
+            if index not in group["at"]:
+                group["x"].append(face[0])
+                group["y"].append(face[1])
+                group["area"].append(face[2])
+                group["at"][index] = face
+    present = [g for g in groups if len(g["at"]) >= max(3, 0.4 * count)]
+    # Two "faces" one above the other are one person and something that only
+    # looks like a face. Keep the upper one, unless the lower is seen far more.
+    people = []
+    for group in sorted(present, key=lambda g: float(np.median(g["y"]))):
+        above = next((p for p in people if abs(float(np.median(p["x"])) - float(np.median(group["x"]))) < 0.12), None)
+        if above is None:
+            people.append(group)
+        elif len(group["at"]) >= 3 * len(above["at"]):
+            people[people.index(above)] = group
+    if len(people) < 2:
+        return None
+    biggest = max(float(np.median(g["area"])) for g in people)
+    # A small face far behind is audience, not the second speaker.
+    people = [g for g in people if float(np.median(g["area"])) >= 0.25 * biggest]
+    if len(people) < 2:
+        return None
+    pair = sorted(people, key=lambda g: (-len(g["at"]), -float(np.median(g["area"]))))[:2]
+    boxes = []
+    for group in pair:
+        faces = list(group["at"].values())
+        boxes.append({key: round(float(np.median([f[i] for f in faces])), 4)
+                      for key, i in (("cx", 0), ("cy", 1), ("w", 3), ("h", 4))})
+    return sorted(boxes, key=lambda person: person["cx"])
+
+
+def follow_speaker(frames, kept):
+    """For one shot, picks who the crop follows in each frame.
+
+    `frames` is a list of face lists, each face (cx, cy, area, w, h, motion).
+    Returns (centres, switches): the followed face's centre-x per frame (None
+    where it was not found) and the frame indexes where the crop should cut to
+    another person. One person, or people close enough to share a crop, gives
+    the plain "largest face" behaviour and no switches."""
+    count = len(frames)
+    groups = group_faces(frames)
     present = [g for g in groups if len(g["at"]) >= max(3, 0.3 * count)]
     if present:
         biggest = max(float(np.median(g["area"])) for g in present)
@@ -317,6 +377,7 @@ def main():
         return
     if len(sys.argv) < 6:
         raise ValueError("usage: auto_frame.py <video> <start> <duration> <src-width> <src-height>")
+    dual_mode = len(sys.argv) > 6 and sys.argv[6] == "dual"
     video = sys.argv[1]
     start, duration = float(sys.argv[2]), float(sys.argv[3])
     width, height = int(float(sys.argv[4])), int(float(sys.argv[5]))
@@ -328,7 +389,7 @@ def main():
     # Fraction of the source width a 9:16 crop keeps. 1 or more means the
     # source is already as narrow as the output, so there is nothing to pan.
     kept = (9 / 16) / (width / height)
-    if kept >= 0.98:
+    if kept >= 0.98 and not dual_mode:
         json.dump({"segments": [], "faceCoverage": 0, "shots": 0, "reason": "source is already vertical"}, sys.stdout)
         return
 
@@ -351,8 +412,14 @@ def main():
 
     # Who to follow in each camera shot. A change of speaker inside a shot is
     # treated as a cut of its own: the crop jumps rather than sweeping across.
-    centres, speaker_cuts = [], []
+    centres, speaker_cuts, pairs = [], [], {}
     for a, b in zip(cuts, cuts[1:] + [total]):
+        pair = two_people(found[a:b]) if dual_mode else None
+        if pair:
+            # Both people are shown, so there is no speaker to follow.
+            pairs[a] = pair
+            centres.extend([None] * (b - a))
+            continue
         shot, switches = follow_speaker(found[a:b], kept)
         centres.extend(shot)
         speaker_cuts.extend(a + k for k in switches)
@@ -377,6 +444,13 @@ def main():
         seen = [c for c in centres[a:b] if c is not None]
         base = {"start": t(a), "end": duration if b == total else t(b), "zoom": 1, "offsetY": 0}
         if base["end"] - base["start"] < 0.05:
+            continue
+        if a in pairs:
+            segments.append({**base, "offsetX": 0, "dual": pairs[a]})
+            continue
+        if kept >= 0.98:
+            # Already as narrow as the output: nothing to pan.
+            segments.append({**base, "offsetX": 0})
             continue
         path = fill(smooth(centres[a:b])) if len(seen) >= max(2, 0.25 * (b - a)) else None
         if path is None:
@@ -412,7 +486,7 @@ def main():
             i = j
         segments.extend(calm(pieces))
 
-    coverage = sum(c is not None for c in centres) / total
+    coverage = sum(1 for faces in found if faces) / total
     json.dump({"segments": segments, "faceCoverage": round(coverage, 3), "shots": len(bounds),
                "speakerChanges": len(speaker_cuts)}, sys.stdout)
 

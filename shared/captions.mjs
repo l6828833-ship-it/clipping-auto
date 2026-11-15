@@ -255,7 +255,7 @@ function lineText(group, active, s, scale, colours) {
  * then shown without lighting individual words, since the guess would be
  * visibly wrong.
  */
-export function buildAssFile(words, style, clipDuration, synced = true, overlays = []) {
+export function buildAssFile(words, style, clipDuration, synced = true, overlays = [], centreSpans = []) {
   const s = resolveCaptionStyle(style);
   const fontSize = Math.max(16, Math.round(s.fontSize));
   const alignment = s.position === "top" ? 8 : s.position === "center" ? 5 : 2;
@@ -308,7 +308,11 @@ export function buildAssFile(words, style, clipDuration, synced = true, overlays
     const plain = group.words.map((w) => w.text).join(" ");
     const scale = captionFitScale(plain, s);
     const pct = Math.round(scale * 100);
-    const anchor = resolveCaptionAnchor(s, group.words[0]);
+    /* A line with no position of its own that falls inside a centre span (a
+     * split-screen stretch of the clip) sits across the join of the two halves. */
+    const centred = centreSpans.some(([a, b]) => group.start >= a - 0.01 && group.start < b);
+    const anchor = resolveCaptionAnchor(s, group.words[0])
+      ?? (centred ? { x: Math.round(CAPTION_CANVAS_W / 2), y: Math.round(CAPTION_CANVAS_H / 2) } : null);
     const pos = anchor ? `\\an5\\pos(${anchor.x},${anchor.y})` : "";
     const base = `${pos}${pct !== 100 ? `\\fscx${pct}\\fscy${pct}` : ""}`;
     /* A short scale-up when the line appears: reads as a "pop" without moving

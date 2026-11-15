@@ -43,7 +43,11 @@
   --chart-4: #f1cb67;
   --chart-5: #9b8afb;
 
-  --radius: 0.75rem;
+  --radius: 1rem;
+
+  /* Tells the browser which palette its own controls (menus, scrollbars,
+   * date pickers, autofill) should use. */
+  color-scheme: light;
 
   /* Custom brand tokens */
   --cobalt: #315ef5;
@@ -60,6 +64,7 @@
 
 /* ─── Dark mode ──────────────────────────────────────────────────────────── */
 .dark {
+  color-scheme: dark;
   --background: #0f0f0e;
   --foreground: #f2f1ed;
 
@@ -102,6 +107,42 @@
   --sidebar-border: #2e2e2b;
 }
 
+/* The landing page is designed in the light palette only. When the app is
+ * switched to dark it stays fully light, rather than a mix of the two. */
+.dark .shorts-site {
+  color-scheme: light;
+  --background: #fbfaf6;
+  --foreground: #242422;
+  --card: #ffffff;
+  --card-foreground: #242422;
+  --popover: #ffffff;
+  --popover-foreground: #242422;
+  --primary: #315ef5;
+  --primary-foreground: #ffffff;
+  --secondary: #f4f3ef;
+  --secondary-foreground: #504d47;
+  --muted: #f7f6f3;
+  --muted-foreground: #77756f;
+  --accent: #dd7d71;
+  --accent-foreground: #ffffff;
+  --destructive: #e5484d;
+  --destructive-foreground: #ffffff;
+  --border: #e8e6e1;
+  --input: #f7f6f3;
+  --ring: #315ef5;
+  --chart-1: #315ef5;
+  --chart-2: #59a485;
+  --chart-3: #dd7d71;
+  --chart-4: #f1cb67;
+  --chart-5: #9b8afb;
+  --cobalt: #315ef5;
+  --coral: #dd7d71;
+  --mint: #59a485;
+  --amber: #f1cb67;
+  --sidebar-bg: #fcfbf9;
+  --sidebar-border: #efede8;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -136,9 +177,19 @@
   --font-mono: "IBM Plex Mono", monospace;
 }
 
-* {
-  border-color: var(--border);
-  outline-color: color-mix(in oklch, var(--ring) 50%, transparent);
+/* Defaults that Tailwind classes must be able to override live in the base
+ * layer. Written outside a layer they beat every utility class: border colour
+ * classes (border-transparent, hover:border-…) did nothing, and min-h-screen
+ * was cancelled on flex boxes, so the sign-in pages were not centred. */
+@layer base {
+  * {
+    border-color: var(--border);
+    outline-color: color-mix(in oklch, var(--ring) 50%, transparent);
+  }
+
+  /* Lets flex children shrink below their content size (text truncation,
+   * scroll areas) unless a class sets a minimum. */
+  .flex { min-width: 0; min-height: 0; }
 }
 
 body {
@@ -157,8 +208,6 @@ body {
   padding-inline: 1.5rem;
 }
 
-/* Flex min-size fix */
-.flex { min-width: 0; min-height: 0; }
 
 /* Button active scale */
 button:active:not(:disabled) {
@@ -291,7 +340,6 @@ button:active:not(:disabled) {
 
 @custom-variant dark (&:is(.dark *));
 @theme inline { --radius-sm:calc(var(--radius) - 4px); --radius-md:calc(var(--radius) - 2px); --radius-lg:var(--radius); --radius-xl:calc(var(--radius) + 4px); --color-background:var(--background); --color-foreground:var(--foreground); --color-card:var(--card); --color-card-foreground:var(--card-foreground); --color-primary:var(--primary); --color-primary-foreground:var(--primary-foreground); --color-border:var(--border); --color-ring:var(--ring); }
-:root { --radius:1rem; --background:#fbfaf6; --foreground:#252525; --card:#fff; --card-foreground:#252525; --primary:#315ef5; --primary-foreground:#fff; --border:#e8e6e1; --ring:#315ef5; }
 @layer base { *{@apply border-border outline-ring/50} html{scroll-behavior:smooth} body{@apply bg-background text-foreground; font-family:"DM Sans",Arial,sans-serif; -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility} button:not(:disabled),a[href]{@apply cursor-pointer} }
 @layer components {
   .shorts-site{overflow:hidden;background:#fbfaf6;color:#252525}.sp-header{position:sticky;top:0;z-index:50;border-bottom:1px solid rgba(232,230,225,.92);background:rgba(251,250,246,.94);backdrop-filter:blur(18px)}.sp-header-inner{width:min(1090px,calc(100% - 40px));height:66px;margin:auto;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:25px}.sp-brand{display:grid;grid-template-columns:28px auto;grid-template-rows:16px 10px;align-items:center;column-gap:8px;color:#292928;text-decoration:none}.sp-brand img{grid-row:span 2;width:27px;height:27px;object-fit:contain}.sp-brand span{font-size:15px;font-weight:750;letter-spacing:-.055em;line-height:1}.sp-brand span b{color:#315ef5;font-weight:750}.sp-brand small{color:#9a978f;font-size:8px;letter-spacing:.01em}.sp-nav{display:flex;align-items:center;gap:25px}.sp-nav a,.sp-account{display:inline-flex;align-items:center;gap:3px;border:0;background:transparent;color:#77746e;font-size:12px;font-weight:500;text-decoration:none;transition:color .18s ease}.sp-nav a:hover,.sp-account:hover{color:#252525}.sp-header-actions{display:flex;justify-content:flex-end;align-items:center;gap:16px}.sp-dark-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:999px;padding:10px 15px;background:#262625;color:#fff;box-shadow:0 7px 15px rgba(28,28,27,.12);font-size:11px;font-weight:750;line-height:1;transition:transform .18s cubic-bezier(.23,1,.32,1),box-shadow .18s ease,background .18s ease}.sp-dark-button:hover{background:#363635;box-shadow:0 10px 18px rgba(28,28,27,.18);transform:translateY(-1px)}.sp-dark-button:active{transform:scale(.97)}.sp-dark-button-wide{padding:15px 20px;font-size:13px}.sp-menu,.sp-mobile-nav{display:none}

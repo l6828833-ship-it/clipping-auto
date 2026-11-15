@@ -9,7 +9,7 @@
  * clip starts on the first word of a thought and ends after the last word of
  * its payoff.
  */
-import { transcriptLines } from "../shared/lines.mjs";
+import { SENTENCE_END, transcriptLines } from "../shared/lines.mjs";
 
 export { transcriptLines };
 
@@ -66,7 +66,7 @@ export function buildHighlightPrompts({ transcript, timed, videoDuration, peaks 
 
 A clip is worth making only if a stranger who has never seen the full video would stop scrolling for it and understand it completely. Judge every candidate on:
 1. HOOK - the first sentence must create curiosity, tension or a bold claim on its own. Never open on a greeting, an intro, "so", "and", a reply to something unseen, or a pronoun whose subject was named earlier.
-2. PAYOFF - the clip must end right after the point lands (the punchline, the answer, the lesson, the reveal). Never end mid-thought and never trail into the next topic.
+2. PAYOFF - the clip must end right after the point lands (the punchline, the answer, the lesson, the reveal). Never end mid-thought and never trail into the next topic. The last line of the clip must finish its sentence: if the speaker is still completing the idea, the answer or the joke in the next line, include that line too. A clip that stops in the middle is worthless.
 3. SELF-CONTAINED - one complete idea or story. No dependence on earlier context.
 4. DENSITY - cut the wind-up. Start as late as possible and end as early as possible.
 Skip intros, outros, sponsor reads, housekeeping ("like and subscribe") and rambling.
@@ -138,11 +138,12 @@ const wordEnd = (w) => (Number.isFinite(w.end) && w.end > w.start ? w.end : w.st
 /**
  * Moves each highlight onto real speech boundaries.
  *
- * Start: the nearest line start within `reach` seconds, skipping lines that
- * open on a connective ("and", "so", "و") when a clean one is close.
- * End: the nearest line end. A little air is left before the first word and
- * after the last so the cut is not clipped. Overlapping picks are dropped,
- * weakest first.
+ * Start: the nearest line start within `reach` seconds, preferring a line
+ * that begins a sentence and does not open on a connective ("and", "so", "و").
+ * End: the nearest line end that finishes a thought (a sentence end or a
+ * pause); if the pick stops mid-sentence it is carried on to where the
+ * sentence ends. A little air is left before the first word and after the
+ * last so the cut is not clipped. Overlapping picks are dropped, weakest first.
  */
 export function snapHighlights(highlights, words, { videoDuration, minSeconds = 8, maxSeconds = 95, reach = 3, growTo = 18 } = {}) {
   const usable = (words ?? []).filter((w) => Number.isFinite(w.start));
@@ -151,12 +152,22 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
   if (usable.length >= 5) {
     const lines = transcriptLines(usable);
     const LEAD = 0.12, TAIL = 0.3;
+    /* Lines also break at a word or time limit, which is not the end of
+     * anything. A line really closes a thought when its last word ends a
+     * sentence or the speaker pauses after it. Transcripts without
+     * punctuation (common for Arabic) still have the pauses. */
+    const closes = (i) => i >= lines.length - 1
+      || SENTENCE_END.test(String(usable[lines[i].last].word).trim())
+      || lines[i + 1].start - lines[i].end >= 0.6;
+    const opens = (i) => i === 0 || closes(i - 1);
     out = out.map((h) => {
       const opener = (l) => String(usable[l.first].word).toLowerCase().replace(/[^\p{L}]/gu, "");
       const starts = lines.filter((l) => Math.abs(l.start - h.startTime) <= reach);
       const clean = starts.filter((l) => !WEAK_OPENERS.has(opener(l)));
       const nearest = (list, key, target) => list.reduce((best, l) => (Math.abs(l[key] - target) < Math.abs(best[key] - target) ? l : best));
-      const pool = clean.length ? clean : starts;
+      /* Best first: starts a sentence and has no weak opener, then either. */
+      const fresh = (list) => list.filter((l) => opens(lines.indexOf(l)));
+      const pool = [fresh(clean), clean, fresh(starts), starts].find((list) => list.length) ?? [];
       let start = h.startTime;
       if (pool.length) {
         start = nearest(pool, "start", h.startTime).start;
@@ -168,7 +179,8 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
       const ends = lines.filter((l) => Math.abs(l.end - h.endTime) <= reach && l.end > start + minSeconds * 0.6);
       let end = h.endTime;
       if (ends.length) {
-        end = nearest(ends, "end", h.endTime).end;
+        const closing = ends.filter((l) => closes(lines.indexOf(l)));
+        end = nearest(closing.length ? closing : ends, "end", h.endTime).end;
       } else {
         const prev = [...usable].reverse().find((w) => wordEnd(w) <= h.endTime + 0.05);
         if (prev && h.endTime - wordEnd(prev) <= reach && wordEnd(prev) > start) end = wordEnd(prev);
@@ -192,6 +204,24 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
           }
           start = lines[first].start;
           end = lines[last].end;
+        }
+      }
+      /* Never stop in the middle of a sentence. If the last line does not
+       * close a thought, carry on to the line that does (up to 12 seconds
+       * more); failing that, step back to the last line that did. */
+      let last = -1;
+      for (let i = lines.length - 1; i >= 0; i--) if (lines[i].end <= end + 0.05) { last = i; break; }
+      if (last >= 0 && Math.abs(lines[last].end - end) < 0.06 && !closes(last)) {
+        let finished = false;
+        for (let j = last + 1; j < lines.length; j++) {
+          if (lines[j].start - lines[j - 1].end >= 4 || lines[j].end - end > 12 || lines[j].end - start > maxSeconds) break;
+          if (closes(j)) { end = lines[j].end; finished = true; break; }
+        }
+        if (!finished) {
+          const floor = start + Math.max(minSeconds, 0.6 * (end - start));
+          for (let k = last - 1; k >= 0 && lines[k].end > floor; k--) {
+            if (closes(k)) { end = lines[k].end; break; }
+          }
         }
       }
       /* Leave air only where there is silence to leave it in. */

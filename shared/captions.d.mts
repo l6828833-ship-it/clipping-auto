@@ -38,4 +38,4 @@ export function captionFitScale(text: string, style: Partial<CaptionStyle>): num
 export function groupCaptionWords(words: CaptionWord[], style: Partial<CaptionStyle>, clipDuration?: number): CaptionGroup[];
 export function captionAt(groups: CaptionGroup[], t: number): { group: CaptionGroup; activeIndex: number } | null;
 export function contrastOn(hex: string): string;
-export function buildAssFile(words: CaptionWord[], style: Partial<CaptionStyle>, clipDuration: number, synced?: boolean, overlays?: unknown[]): string;
+export function buildAssFile(words: CaptionWord[], style: Partial<CaptionStyle>, clipDuration: number, synced?: boolean, overlays?: unknown[], centreSpans?: [number, number][]): string;

@@ -82,7 +82,7 @@ export default function DashboardPage() {
     <AppLayout title="Dashboard">
       {/* Welcome banner */}
       <div className="relative rounded-2xl overflow-hidden mb-8 p-6 border border-border"
-        style={{ background: "#ffffff" }}>
+        style={{ background: "var(--card)" }}>
         <div className="absolute right-0 top-0 w-64 h-full opacity-5 pointer-events-none"
           style={{ background: "radial-gradient(circle at 80% 50%, var(--cobalt), transparent 60%)" }} />
         <div className="relative z-10">

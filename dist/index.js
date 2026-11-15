@@ -7,7 +7,7 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { totalmem, tmpdir as systemTmpdir } from "os";
 import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
 import { registerMediaUpload } from "../server/media-upload.mjs";
-import { montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
+import { facePanelCrop, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
 import { VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
@@ -1499,6 +1499,14 @@ import { TRPCError as TRPCError3 } from "@trpc/server";
 // server/inworld.ts
 /* Overridable so the AI steps can be tested against a local stand-in. */
 var INWORLD_BASE_URL = process.env.INWORLD_BASE_URL || "https://api.inworld.ai";
+/**
+ * The model the AI steps use. The app asks for a default; setting
+ * CLIP_MAKER_AI_MODEL on the server (an Inworld router id such as
+ * "provider/model") overrides it without a code change.
+ */
+function aiModel(requested) {
+  return process.env.CLIP_MAKER_AI_MODEL?.trim() || requested;
+}
 async function inworldChat(opts) {
   const res = await fetch(`${INWORLD_BASE_URL}/v1/chat/completions`, {
     method: "POST",
@@ -1794,7 +1802,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       : prompts.user;
     try {
       const { response, modelUsed, substituted } = await inworldChatResilient({
-        model: input.model,
+        model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
           { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` },
@@ -1806,8 +1814,9 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         max_tokens: 4096
       });
       if (substituted) {
-        console.warn(`[Inworld] "${input.model}" is unavailable \u2014 used "${modelUsed}" instead.`);
+        console.warn(`[Inworld] "${aiModel(input.model)}" is unavailable \u2014 used "${modelUsed}" instead.`);
       }
+      console.log(`[Inworld] Highlights analysed by ${modelUsed}.`);
       const parsed = inworldParseJSON(response);
       const highlights = [];
       for (const item of parsed.highlights ?? []) {
@@ -1860,7 +1869,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
   })).mutation(async ({ input }) => {
     try {
       const { response, modelUsed } = await inworldChatResilient({
-        model: input.model,
+        model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
           {
@@ -1903,7 +1912,7 @@ Return: { "title": "HOOK TITLE IN CAPS", "hook": "First sentence hook max 15 wor
   })).mutation(async ({ input }) => {
     try {
       const { response, modelUsed } = await inworldChatResilient({
-        model: input.model,
+        model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
           { role: "system", content: "You are a content analyst. Return ONLY JSON, no markdown." },
@@ -2533,6 +2542,41 @@ var hostJobs = new Map();
 /* Framing worked out for previews, by file and range. Small and in memory:
  * losing it only means working it out again. */
 const previewFramings = new Map();
+/* Where each clip range of a video can be played from, once known. Files do
+ * not change after they are written, so only their existence is re-checked. */
+const knownSections = new Map();
+/**
+ * The hosted file that covers `range` of a video, as `{ url, offset, duration,
+ * path }`, or null when that part has not been imported yet. Never downloads.
+ */
+async function sectionFor(video, range) {
+  if (!(range.end > range.start)) return null;
+  const key = `${video.id}:${range.start}-${range.end}`;
+  const known = knownSections.get(key);
+  if (known) {
+    if (await fs6.stat(known.path).then((st) => st.size > 0, () => false)) return known;
+    knownSections.delete(key);
+  }
+  const remember = (section) => {
+    if (knownSections.size >= 500) knownSections.delete(knownSections.keys().next().value);
+    knownSections.set(key, section);
+    return section;
+  };
+  /* The file the video row points at: an upload, a whole import, or the
+   * section of whichever clip was opened last. */
+  const rowPath = video.hostedStatus === "ready" ? localPathFromUrl(video.hostedUrl) : null;
+  if (rowPath) {
+    const meta = await probeMedia(rowPath).catch(() => null);
+    const offset = video.hostedOffset ?? 0;
+    if (meta && range.start >= offset - 0.15 && range.end <= offset + meta.duration + 0.15) {
+      return remember({ url: video.hostedUrl, offset, duration: meta.duration, path: rowPath });
+    }
+  }
+  if (video.sourceType !== "url" || !/^https?:\/\//i.test(video.sourceUrl ?? "")) return null;
+  const cached = await hostVideo({ videoId: video.id, sourceUrl: video.sourceUrl, range, cacheOnly: true }).catch(() => null);
+  if (!cached || !(cached.duration > 0)) return null;
+  return remember({ url: cached.url, offset: cached.offset ?? 0, duration: cached.duration, path: path5.join(VIDEOS_DIR, cached.fileName) });
+}
 function hostVideoShared(opts) {
   const key = `${opts.videoId}:${opts.range ? `${opts.range.start}-${opts.range.end}` : "full"}`;
   const running = hostJobs.get(key);
@@ -2915,6 +2959,8 @@ function normaliseSegments(segments, duration, base) {
       ease: s.ease ?? "inOut",
       easeFrom: s.easeFrom,
       easeTo: s.easeTo,
+      /* A two-person shot: the faces to stack instead of one framing. */
+      ...(Array.isArray(s.dual) && s.dual.length === 2 ? { dual: s.dual } : {}),
       start: Math.max(0, Math.min(duration, s.start)),
       end: Math.max(0, Math.min(duration, s.end)),
       // Kept so a clamped segment can be re-parameterised onto its own curve.
@@ -2946,7 +2992,7 @@ function normaliseSegments(segments, duration, base) {
     if (seg.to && span > 0.01 && (start > seg.rawStart + 1e-3 || seg.end < seg.rawEnd - 1e-3)) {
       out.push(sliceSegment(full2, start, seg.end));
     } else {
-      out.push({ ...full2, start, end: seg.end });
+      out.push({ ...full2, ...(seg.dual ? { dual: seg.dual } : {}), start, end: seg.end });
     }
     cursor = seg.end;
   }
@@ -3140,7 +3186,9 @@ function renderClipFromHosted(opts) {
      * helpers read the frame height from TARGET_H; renders run one at a time,
      * so it can be switched for the length of this one. */
     const fullHeight = TARGET_H;
-    if (splitKind(opts.layout?.style)) TARGET_H = fullHeight / 2;
+    /* Dual Speaker switches between split and full-height shots within one
+     * clip, so it halves the height itself, only for its two-person panels. */
+    if (splitKind(opts.layout?.style) && !Array.isArray(opts.layout?.segments)) TARGET_H = fullHeight / 2;
     try {
       return await renderClipFromHostedNow(opts);
     } finally {
@@ -3153,7 +3201,7 @@ function renderClipFromHosted(opts) {
  * `{ found, segments, faceCoverage, shots, reason }`; `found` is false when
  * too few faces were seen to trust the result.
  */
-async function detectFraming(hostedPath, startInFile, duration) {
+async function detectFraming(hostedPath, startInFile, duration, mode) {
   const ffmpeg = await findFfmpeg();
   if (!ffmpeg) throw new Error(FFMPEG_MISSING);
   const meta = await probeMedia(hostedPath);
@@ -3161,14 +3209,16 @@ async function detectFraming(hostedPath, startInFile, duration) {
     process.env.AUTO_FRAME_PYTHON ?? WHISPER_PYTHON,
     [
       path3.join(process.cwd(), "scripts", "auto_frame.py"), hostedPath,
-      String(Math.max(0, startInFile)), String(duration), String(meta.width), String(meta.height)
+      String(Math.max(0, startInFile)), String(duration), String(meta.width), String(meta.height),
+      /* "dual" marks the shots with two people in them. */
+      ...(mode ? [mode] : [])
     ],
     { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
   ));
   const result = JSON.parse(stdout);
   const segments = Array.isArray(result.segments) ? result.segments : [];
   const found = segments.length > 0 && (result.faceCoverage ?? 0) >= 0.15;
-  return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null };
+  return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null, width: meta.width, height: meta.height };
 }
 async function renderClipFromHostedNow(opts) {
   const offset = opts.hostedOffset ?? 0;
@@ -3220,18 +3270,26 @@ async function renderClipFromHostedNow(opts) {
   const captionKey = captions ? crypto2.createHash("sha1").update(JSON.stringify({ w: captions.words, s: captions.style })).digest("hex").slice(0, 8) : "nocap";
   /* Video style: split-screen geometry for the top panel and what goes below. */
   const styleId = VIDEO_STYLES[opts.layout?.style] ? opts.layout.style : "normal";
-  const split = splitKind(styleId) && hostedMeta?.width > 0
+  /* Dual Speaker brings its own shot-by-shot framing: full-height shots that
+   * follow one person, and two-person shots marked `dual`. */
+  const smartDual = styleId === "dual" && Array.isArray(opts.layout?.segments) && hostedMeta?.width > 0;
+  const split = !smartDual && splitKind(styleId) && hostedMeta?.width > 0
     ? planSplit({ kind: splitKind(styleId), people: opts.layout.people, srcW: hostedMeta.width, srcH: hostedMeta.height, crop, segments: cutSegments })
     : null;
-  if (splitKind(styleId) && !split) throw new MediaError("This video style could not be built for this clip.");
+  if (splitKind(styleId) && !split && !smartDual) throw new MediaError("This video style could not be built for this clip.");
   const bottom = split?.bottom ?? null;
-  const normalised = normaliseSegments(split ? split.segments : cutSegments, duration, split ? split.crop : crop);
+  const normalised = smartDual
+    ? normaliseSegments(shiftTimed(opts.layout.segments, cuts), duration, { ...crop, zoom: 1, offsetX: 0, offsetY: 0 })
+    : normaliseSegments(split ? split.segments : cutSegments, duration, split ? split.crop : crop);
   const segments = hostedMeta && hostedMeta.width > 0 && hostedMeta.height > 0 ? normalised.flatMap(
     (s) => isAnimated(s) ? splitForZoomCap(s, hostedMeta.width, hostedMeta.height) : [s]
   ) : normalised;
   const moving = segments.some(isAnimated);
   const segmentKey = segments.length > 1 || moving ? crypto2.createHash("sha1").update(JSON.stringify(segments)).digest("hex").slice(0, 8) : "static";
-  const styleKey = styleId === "normal" ? null : { style: styleId, bg: opts.layout.backgroundPath ? path5.basename(opts.layout.backgroundPath) : null, people: opts.layout.people ?? null };
+  const styleKey = styleId === "normal" ? null : {
+    style: styleId, bg: opts.layout.backgroundPath ? path5.basename(opts.layout.backgroundPath) : null, people: opts.layout.people ?? null,
+    ...(smartDual ? { pairs: segments.filter((seg) => seg.dual).map((seg) => [seg.start, seg.end, seg.dual]) } : {})
+  };
   const effectsKey = scale !== 1 || overlays.length || cuts.length || styleKey
     ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays, ...(cuts.length ? { cuts } : {}), ...(styleKey ? { styleKey } : {}) })).digest("hex").slice(0, 8)
     : "";
@@ -3272,7 +3330,11 @@ async function renderClipFromHostedNow(opts) {
     if (captions || overlays.length) {
       await fs6.writeFile(
         path5.join(tmpDir, CAPTION_FILE),
-        buildAssFile(cutCaptions?.words ?? [], montageCaptionStyle(styleId, captions?.style ?? DEFAULT_CAPTION_STYLE), duration, captions?.synced ?? true, cutOverlays),
+        buildAssFile(
+          cutCaptions?.words ?? [], montageCaptionStyle(styleId, captions?.style ?? DEFAULT_CAPTION_STYLE), duration, captions?.synced ?? true, cutOverlays,
+          /* Captions sit across the join while the picture is split. */
+          segments.filter((seg) => seg.dual).map((seg) => [seg.start, seg.end])
+        ),
         "utf8"
       );
       const fontsRel = filterRelativePath(tmpDir, FONTS_DIR);
@@ -3283,6 +3345,16 @@ async function renderClipFromHostedNow(opts) {
      * the remaining pieces sit back to back. */
     const keep = cuts.length ? keepExpression(cuts, sourceDuration) : null;
     const cutVideo = keep ? [`select='${keep}'`, "setpts=N/FRAME_RATE/TB"] : [];
+    /* One half of a two-person shot: the same crop maths at half the height. */
+    const panelFor = (person) => {
+      const fullHeight = TARGET_H;
+      TARGET_H = fullHeight / 2;
+      try {
+        return buildCropFilter({ ...facePanelCrop(person, hostedMeta.width, hostedMeta.height), barColor: crop.barColor }, hostedMeta.width, hostedMeta.height);
+      } finally {
+        TARGET_H = fullHeight;
+      }
+    };
     const framingFor = (seg) => {
       if (!isAnimated(seg)) return buildCropFilter(seg, hostedMeta?.width ?? 0, hostedMeta?.height ?? 0);
       const animated = buildAnimatedCropFilter({
@@ -3314,7 +3386,7 @@ async function renderClipFromHostedNow(opts) {
     if (bottom && segments.length <= 1 && !moving) {
       const main = [...cutVideo, buildCropFilter(segments[0], hostedMeta?.width ?? 0, hostedMeta?.height ?? 0), "format=yuv420p"].join(",");
       videoArgs.push("-filter_complex", stacked([`[0:v]${main}[vmain]`]), "-map", "[vout]", "-map", "0:a?");
-    } else if (segments.length <= 1 && !moving) {
+    } else if (segments.length <= 1 && !moving && !segments[0]?.dual) {
       videoArgs.push(
         "-vf",
         [
@@ -3325,9 +3397,17 @@ async function renderClipFromHostedNow(opts) {
       );
     } else {
       const source = (i) => keep ? `[cut${i}]` : "[0:v]";
-      const parts = segments.map(
-        (seg, i) => `${source(i)}trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},setpts=PTS-STARTPTS,${framingFor(seg)}[v${i}]`
-      );
+      const parts = segments.map((seg, i) => {
+        const piece = `${source(i)}trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},setpts=PTS-STARTPTS`;
+        if (!seg.dual) return `${piece},${framingFor(seg)}[v${i}]`;
+        /* Two people: each gets a half, left person on top. */
+        return [
+          `${piece},split=2[d${i}a][d${i}b]`,
+          `[d${i}a]${panelFor(seg.dual[0])}[d${i}t]`,
+          `[d${i}b]${panelFor(seg.dual[1])}[d${i}l]`,
+          `[d${i}t][d${i}l]vstack=inputs=2[v${i}]`
+        ].join(";");
+      });
       const concatInputs = segments.map((_, i) => `[v${i}]`).join("");
       const pieces = [
         ...(keep ? [`[0:v]${cutVideo.join(",")},split=${segments.length}${segments.map((_, i) => `[cut${i}]`).join("")}`] : []),
@@ -3504,6 +3584,22 @@ async function resolveLayout(clip, userId, hostedPath, hostedOffset) {
     const room = Math.max(0, meta.duration - duration - 1);
     return { style, backgroundPath, backgroundStart: room > 0 ? Math.round((clip.id * 37.7) % room) : 0 };
   }
+  if (kind === "dual") {
+    /* Shot by shot: two people on screen are stacked one per half, a shot
+     * with one person keeps the whole frame and follows them. */
+    try {
+      const plan = await detectFraming(hostedPath, clip.startTime - hostedOffset, duration, "dual");
+      if (plan.found) {
+        const pairs = plan.segments.filter((seg) => seg.dual).length;
+        console.log(`[Render] Clip ${clip.id}: Dual Speaker found ${pairs} two-person shot(s) in ${plan.shots} shot(s).`);
+        return { style, segments: plan.segments };
+      }
+    } catch (error) {
+      console.warn(`[Render] Clip ${clip.id}: could not find faces for the ${style} style (${String(error.stderr || error.message).slice(0, 160)}).`);
+    }
+    console.warn(`[Render] Clip ${clip.id}: no faces found for "${style}". Rendering as Normal.`);
+    return null;
+  }
   let people = [];
   try {
     const ffmpeg = await findFfmpeg();
@@ -3520,8 +3616,8 @@ async function resolveLayout(clip, userId, hostedPath, hostedOffset) {
   } catch (error) {
     console.warn(`[Render] Clip ${clip.id}: could not find faces for the ${style} style (${String(error.stderr || error.message).slice(0, 160)}).`);
   }
-  if (people.length < (kind === "dual" ? 2 : 1)) {
-    console.warn(`[Render] Clip ${clip.id}: ${people.length} face(s) found, "${style}" needs ${kind === "dual" ? 2 : 1}. Rendering as Normal.`);
+  if (people.length < 1) {
+    console.warn(`[Render] Clip ${clip.id}: no face found, "${style}" needs one. Rendering as Normal.`);
     return null;
   }
   return { style, people: people.slice(0, 2) };
@@ -3924,6 +4020,25 @@ var appRouter = router({
      * those clips afterwards is then instant.
      */
     /**
+     * GET /api/trpc/videos.sections
+     * For each clip range: where it can be played from right now, or null if
+     * that part of the video is not imported yet. Lets a preview switch
+     * between clips at once, without asking for an import it already has.
+     */
+    sections: protectedProcedure.input(z4.object({
+      id: z4.number(),
+      ranges: z4.array(z4.object({ startTime: z4.number().min(0), endTime: z4.number().min(0) })).max(12)
+    })).query(async ({ input, ctx }) => {
+      const video = await getVideoById(input.id, ctx.user.id);
+      if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
+      const sections = [];
+      for (const r of input.ranges) {
+        const section = await sectionFor(video, { start: r.startTime, end: r.endTime });
+        sections.push(section ? { url: section.url, offset: section.offset, duration: section.duration } : null);
+      }
+      return { sections };
+    }),
+    /**
      * GET /api/trpc/videos.previewFraming
      * The speaker-following framing a clip of this range will be exported
      * with, so a preview can show it before any clip row exists. Needs the
@@ -3932,30 +4047,30 @@ var appRouter = router({
     previewFraming: protectedProcedure.input(z4.object({
       id: z4.number(),
       startTime: z4.number().min(0),
-      endTime: z4.number().min(0)
+      endTime: z4.number().min(0),
+      /* "dual" also marks the two-person shots, each with the crop for its
+       * top and bottom half, as the Dual Speaker style renders them. */
+      style: z4.enum(VIDEO_STYLE_IDS).optional()
     })).query(async ({ input, ctx }) => {
       const none = { found: false, segments: [] };
       const duration = input.endTime - input.startTime;
       if (!(duration > 0) || duration > 600 || process.env.CLIP_MAKER_AUTO_REFRAME === "0") return none;
       const video = await getVideoById(input.id, ctx.user.id);
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
-      let filePath = video.hostedStatus === "ready" ? localPathFromUrl(video.hostedUrl) : null;
-      let offset = video.hostedOffset ?? 0;
-      if (video.sourceType === "url" && /^https?:\/\//i.test(video.sourceUrl ?? "")) {
-        /* The exact section for this range, when it is on disk: the row's
-         * hosted file may be another clip's section by now. */
-        const cached = await hostVideo({ videoId: video.id, sourceUrl: video.sourceUrl, range: { start: input.startTime, end: input.endTime }, cacheOnly: true }).catch(() => null);
-        if (cached) { filePath = path5.join(VIDEOS_DIR, cached.fileName); offset = cached.offset ?? 0; }
-      }
-      if (!filePath) return none;
-      const key = `${filePath}:${input.startTime}:${input.endTime}`;
+      const section = await sectionFor(video, { start: input.startTime, end: input.endTime });
+      if (!section) return none;
+      const mode = input.style === "dual" ? "dual" : void 0;
+      const key = `${section.path}:${input.startTime}:${input.endTime}:${mode ?? ""}`;
       const known = previewFramings.get(key);
       if (known) return known;
-      const meta = await probeMedia(filePath).catch(() => null);
-      if (!meta || input.startTime < offset - 0.15 || input.endTime > offset + meta.duration + 0.15) return none;
       try {
-        const result = await detectFraming(filePath, input.startTime - offset, duration);
-        const answer = { found: result.found, segments: result.segments };
+        const result = await detectFraming(section.path, input.startTime - section.offset, duration, mode);
+        const answer = {
+          found: result.found,
+          segments: result.segments.map((seg) => seg.dual
+            ? { ...seg, dual: seg.dual.map((person) => facePanelCrop(person, result.width, result.height)) }
+            : seg)
+        };
         if (previewFramings.size >= 200) previewFramings.delete(previewFramings.keys().next().value);
         previewFramings.set(key, answer);
         return answer;
@@ -4253,7 +4368,8 @@ var appRouter = router({
           let framingSegments = clip.framingSegments;
           const untouched = (!Array.isArray(framingSegments) || framingSegments.length === 0)
             && crop.zoom === 1 && crop.offsetX === 0 && crop.offsetY === 0;
-          if (untouched && renderProfile === "standard" && process.env.CLIP_MAKER_AUTO_REFRAME !== "0") {
+          /* Dual Speaker has already framed every shot itself. */
+          if (untouched && !layout?.segments && renderProfile === "standard" && process.env.CLIP_MAKER_AUTO_REFRAME !== "0") {
             try {
               const auto = await detectFraming(actualHostedPath, clip.startTime - actualHostedOffset, clip.endTime - clip.startTime);
               if (auto.found) {

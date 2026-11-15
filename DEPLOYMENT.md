@@ -28,6 +28,10 @@ Video styles (Normal, four single-speaker looks and four split-screen layouts) a
 
 The Create wizard has four steps: Input (where the video style is chosen, or left to the AI), Highlights, Captions and Export. Export saves a clip for every selected highlight and renders them one after another without being asked; each render imports its own part of the video, follows the speaker and transcribes if needed. The Captions step fetches every selected range in the background (`videos.prefetch`), and a range that is already being fetched is shared rather than downloaded twice. Framing, cuts and per-clip styles can still be changed afterwards from the Clips page.
 
+The AI steps (highlights, titles) ask the Inworld router for `openai/gpt-4o-mini` unless `CLIP_MAKER_AI_MODEL` is set to another router id (`provider/model`, as listed on the Models page of the Inworld Portal). The model that answered is logged as `[Inworld] Highlights analysed by …`.
+
+Dual Speaker is worked out shot by shot: a shot with two people on screen is split, one person per half; a shot with one person keeps the whole frame and follows them. The editor previews ask the server for that plan (`videos.previewFraming` with `style: "dual"`) and for which clip ranges are already imported (`videos.sections`), so moving between clips plays each from its own file instead of importing it again. Imported files live on the instance's disk: run a single instance, or another instance will not have them.
+
 Speaker framing (`scripts/auto_frame.py`) cuts to whoever is talking when two people share a shot and are too far apart for one crop. It judges this from mouth movement, so it needs faces large enough to see; set `CLIP_MAKER_AUTO_REFRAME=0` to switch automatic framing off.
 
 Two settings exist only for local testing: `INWORLD_BASE_URL` points the AI calls at a stand-in server, and `CLIP_MAKER_DB_POOL_MAX` caps the database pool for a test database that accepts one connection at a time. Leave both unset in production.

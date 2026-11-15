@@ -64,6 +64,11 @@ function faceCrop(person, srcW, srcH, facePixels, maxZoom) {
   };
 }
 
+/** Crop that fills one half of the frame with one person of a two-person shot. */
+export function facePanelCrop(person, srcW, srcH) {
+  return faceCrop(person, srcW, srcH, 260, 2.2);
+}
+
 /**
  * Geometry for a split-screen render.
  * Returns `{ crop, segments, bottom }` for the top panel and what goes below:
@@ -83,11 +88,6 @@ export function planSplit({ kind, people = [], srcW, srcH, crop, segments }) {
       segments: Array.isArray(segments) ? segments.map((s) => ({ ...shift(s), ...(s.to ? { to: shift(s.to) } : {}) })) : segments,
       bottom: { type: "background" },
     };
-  }
-  if (kind === "dual") {
-    if (people.length < 2) return null;
-    const [top, low] = people.slice(0, 2).sort((a, b) => a.cx - b.cx);
-    return { crop: { ...crop, ...faceCrop(top, srcW, srcH, 260, 2.2) }, segments: [], bottom: { type: "source", crop: { ...crop, ...faceCrop(low, srcW, srcH, 260, 2.2) } } };
   }
   if (kind === "reaction") {
     if (people.length < 1) return null;

@@ -1,8 +1,9 @@
-import { useTheme } from "next-themes";
+import { useTheme } from "@/contexts/ThemeContext";
 import { Toaster as Sonner, type ToasterProps } from "sonner";
 
 const Toaster = ({ ...props }: ToasterProps) => {
-  const { theme = "system" } = useTheme();
+  /* The app's own light/dark switch, so toasts match the page. */
+  const { theme } = useTheme();
 
   return (
     <Sonner

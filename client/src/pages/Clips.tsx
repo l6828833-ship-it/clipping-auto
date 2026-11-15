@@ -70,6 +70,9 @@ type ClipRow = {
   layout?: unknown;
 };
 
+/** A framing segment from the server; a two-person shot carries the crop for each half. */
+type PlanSegment = TimelineSegment & { dual?: Framing[] };
+
 type VideoRow = {
   id: number;
   sourceUrl: string | null;
@@ -365,10 +368,25 @@ function ClipEditorModal({
     () => (layout?.style === "dynamic" ? punchIns(effectiveWords, duration) : []),
     [layout?.style, effectiveWords, duration],
   );
+  /* Dual Speaker: which shots have two people, and the crop for each half.
+   * The export frames every shot of this style itself, so its preview uses
+   * that plan too rather than the manual framing. */
+  const { data: dualPlan } = trpc.videos.previewFraming.useQuery(
+    { id: video?.id ?? 0, startTime: start, endTime: end, style: "dual" },
+    { enabled: layout?.style === "dual" && !!video && hostedStatus === "ready" && end > start, staleTime: Infinity },
+  );
+  const plan = layout?.style === "dual"
+    ? (((dualPlan as { segments?: PlanSegment[] } | undefined)?.segments) ?? [])
+    : [];
+  const planIndex = plan.length ? segmentAt(plan, playhead) : undefined;
+  const planSegment = planIndex != null ? plan[planIndex] : undefined;
+  const pair = planSegment?.dual?.length === 2 ? { top: planSegment.dual[0], bottom: planSegment.dual[1] } : null;
   const look = {
     style: layout?.style ?? "normal",
     backgroundUrl,
     punch: punches.some(([a, b]) => playhead >= a && playhead < b),
+    dual: pair,
+    hasDual: plan.some(seg => seg.dual),
   };
   const valid = end > start;
   const isRendered = !!clip.downloadUrl && clip.downloadUrl !== "#";
@@ -525,7 +543,7 @@ function ClipEditorModal({
                 {/* The exported result at full size. */}
                 <CropView
                   src={hostedUrl}
-                  framing={activeFraming}
+                  framing={planSegment && !planSegment.dual ? framingAt(planSegment, playhead) : activeFraming}
                   onChange={applyFraming}
                   startTime={previewSpan.start - hostedOffset}
                   endTime={previewSpan.end - hostedOffset}
@@ -554,7 +572,9 @@ function ClipEditorModal({
                       <SubtitleOverlay
                         words={visibleCaption.words}
                         activeIndex={visibleCaption.activeIndex}
-                        style={shownCaptionStyle}
+                        /* Across the join while the picture is split. */
+                        style={pair && shownCaptionStyle.posX == null && shownCaptionStyle.posY == null
+                          ? { ...shownCaptionStyle, position: "center" } : shownCaptionStyle}
                         positionOverride={posOverride}
                         onPositionChange={pos => {
                           if (captionIdx >= 0) {
@@ -820,7 +840,7 @@ function ClipEditorModal({
                 onClick={undo}
                 disabled={framingHistory.length === 0}
                 title="Undo (Ctrl+Z)"
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:bg-foreground/10 disabled:opacity-30 disabled:cursor-not-allowed"
               >
                 <Undo2 className="w-3.5 h-3.5" /> Undo
               </button>
@@ -828,7 +848,7 @@ function ClipEditorModal({
                 onClick={redo}
                 disabled={framingFuture.length === 0}
                 title="Redo (Ctrl+Shift+Z)"
-                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:bg-foreground/10 disabled:opacity-30 disabled:cursor-not-allowed"
               >
                 <Redo2 className="w-3.5 h-3.5" /> Redo
               </button>
@@ -1190,8 +1210,10 @@ export default function ClipsPage() {
             return (
               <div key={clip.id} className="glass rounded-2xl overflow-hidden hover:border-primary/30 transition-colors group">
                 {/* Thumbnail — real poster frame when we have one */}
+                {/* Always a dark picture, so its badges use the dark palette in
+                    either theme; the light one was dark text on a dark image. */}
                 <div
-                  className="relative cursor-pointer overflow-hidden"
+                  className="dark relative cursor-pointer overflow-hidden"
                   /* A fixed height across the whole card. A 9:16 box capped at this
                    * height came out a third of the card wide, with a blank strip beside it. */
                   style={{ height: "200px", background: "linear-gradient(135deg, #0a0a1a, #1a0a2e)" }}

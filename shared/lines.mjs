@@ -3,7 +3,8 @@
  * renderer and the editor preview, so all three agree on where a line starts.
  */
 
-const SENTENCE_END = /[.!?؟…]["'»)\]]*$/;
+/** A word that ends a sentence, allowing for a closing quote or bracket. */
+export const SENTENCE_END = /[.!?؟…]["'»)\]]*$/;
 
 /**
  * Groups timed words into lines that break at sentence ends and pauses.

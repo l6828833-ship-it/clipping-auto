@@ -464,13 +464,27 @@ export function CropView({
    * split-screen layout, the colour grade, the punch-in zoom. An
    * approximation; the render is the reference.
    */
-  look?: { style: string; backgroundUrl?: string | null; punch?: boolean } | null;
+  look?: {
+    style: string;
+    backgroundUrl?: string | null;
+    punch?: boolean;
+    /**
+     * Dual Speaker only. While two people are on screen: the crop for each
+     * half. Null while one person is, and the picture then fills the frame.
+     */
+    dual?: { top: Framing; bottom: Framing } | null;
+    /** Dual Speaker: the clip has two-person shots, so keep the second player loaded between them. */
+    hasDual?: boolean;
+  } | null;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const lowerRef = useRef<HTMLVideoElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
-  const splitKind = look ? (VIDEO_STYLES as Record<string, { split?: string }>)[look.style]?.split : undefined;
+  const styleSplit = look ? (VIDEO_STYLES as Record<string, { split?: string }>)[look.style]?.split : undefined;
+  /* Dual Speaker is split only while two people are on screen. */
+  const pair = styleSplit === "dual" ? look?.dual ?? null : null;
+  const splitKind = styleSplit === "dual" ? (pair ? "dual" : undefined) : styleSplit;
   const grade = look?.style === "cinematic" ? "contrast(1.1) saturate(0.78) brightness(0.88) sepia(0.18)"
     : look?.style === "podcast" ? "contrast(1.05) saturate(1.06)" : undefined;
 
@@ -576,13 +590,15 @@ export function CropView({
    * so the edge sits outside it) and positive when smaller (a bar), which is why
    * a single expression covers both cases.
    */
-  const layout = useMemo(() => {
+  /* `forPanel` framings are already made for the half-height panel (the two
+   * faces of Dual Speaker); others are made for the tall frame. */
+  const place = (f: Framing, split: boolean, forPanel: boolean) => {
     const aspect = natural.w / Math.max(1, natural.h);
     // A split-screen style gives the speaker the top half only.
-    const boxHeightInWidths = (splitKind ? 0.5 : 1) / TARGET_ASPECT;
+    const boxHeightInWidths = (split ? 0.5 : 1) / TARGET_ASPECT;
 
     // Picture height in box-width units, cover-scaled then zoomed.
-    const pictureH = framing.zoom * Math.max(boxHeightInWidths, 1 / aspect);
+    const pictureH = f.zoom * Math.max(boxHeightInWidths, 1 / aspect);
     const pictureW = pictureH * aspect;
 
     // Re-expressed against each box axis.
@@ -593,20 +609,31 @@ export function CropView({
      * panel: scale the sideways offset so the same point of the source stays
      * centred, as the renderer does. */
     const keptTall = TARGET_ASPECT / aspect, keptPanel = (2 * TARGET_ASPECT) / aspect;
-    const offsetX = splitKind
-      ? framing.offsetX * (keptPanel < 0.999 && keptTall < 0.999 ? (1 - keptTall) / (1 - keptPanel) : 0)
-      : framing.offsetX;
+    const offsetX = split && !forPanel
+      ? f.offsetX * (keptPanel < 0.999 && keptTall < 0.999 ? (1 - keptTall) / (1 - keptPanel) : 0)
+      : f.offsetX;
 
     return {
       widthFrac,
       heightFrac,
       leftFrac: ((1 - widthFrac) / 2) * (1 + Math.max(-1, Math.min(1, offsetX))),
-      topFrac: ((1 - heightFrac) / 2) * (1 + framing.offsetY),
+      topFrac: ((1 - heightFrac) / 2) * (1 + f.offsetY),
       // How far the picture can travel on each axis, either side of centre.
       slackX: Math.abs(1 - widthFrac) / 2,
       slackY: Math.abs(1 - heightFrac) / 2,
     };
-  }, [natural, framing, splitKind]);
+  };
+  const top = pair?.top, low = pair?.bottom;
+  const layout = useMemo(
+    () => place(top ?? framing, !!splitKind, !!top),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [natural, framing, splitKind, top?.zoom, top?.offsetX, top?.offsetY],
+  );
+  const lowerLayout = useMemo(
+    () => (low ? place(low, true, true) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [natural, low?.zoom, low?.offsetX, low?.offsetY],
+  );
 
   const canPan = !!onChange && (layout.slackX > 0.0005 || layout.slackY > 0.0005);
 
@@ -740,16 +767,35 @@ export function CropView({
         <div className="absolute inset-0 pointer-events-none"
           style={{ background: "radial-gradient(ellipse at 50% 42%, transparent 45%, rgba(0,0,0,0.6) 100%)" }} />
       )}
-      {splitKind && (
-        <div className="absolute left-0 bottom-0 w-full h-1/2 overflow-hidden pointer-events-none bg-neutral-900">
+      {(splitKind || (styleSplit === "dual" && look?.hasDual)) && (
+        <div className="absolute left-0 bottom-0 w-full h-1/2 overflow-hidden pointer-events-none bg-neutral-900"
+          /* Between two-person shots the second player stays loaded but out of
+           * sight, so the next split appears at once and in step. */
+          style={splitKind ? undefined : { visibility: "hidden" }}>
           {splitKind === "background" && look?.backgroundUrl ? (
             <video src={look.backgroundUrl} className="w-full h-full object-cover" muted autoPlay loop playsInline />
-          ) : splitKind === "reaction" ? (
-            /* The full picture, kept roughly in step with the main player. */
-            <video ref={lowerRef} src={src} className="w-full h-full object-cover" muted playsInline />
+          ) : splitKind === "reaction" || styleSplit === "dual" ? (
+            /* The same video again, kept in step with the main player: the
+             * whole picture for a reaction split, the second person for Dual
+             * Speaker. */
+            <video ref={lowerRef} src={src} muted playsInline
+              className={lowerLayout ? "absolute max-w-none" : "w-full h-full object-cover"}
+              style={lowerLayout ? {
+                width: `${lowerLayout.widthFrac * 100}%`,
+                height: `${lowerLayout.heightFrac * 100}%`,
+                left: `${lowerLayout.leftFrac * 100}%`,
+                top: `${lowerLayout.topFrac * 100}%`,
+                objectFit: "fill",
+              } : undefined}
+              onLoadedMetadata={e => {
+                const main = videoRef.current;
+                if (!main) return;
+                e.currentTarget.currentTime = main.currentTime;
+                if (!main.paused) void e.currentTarget.play().catch(() => {});
+              }} />
           ) : (
             <div className="w-full h-full flex items-center justify-center px-4 text-center text-[11px] font-semibold text-white/70">
-              {splitKind === "background" ? "Choose a background video to fill this half" : "The second speaker appears here in the rendered clip"}
+              Choose a background video to fill this half
             </div>
           )}
         </div>
