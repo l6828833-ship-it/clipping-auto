@@ -79,6 +79,14 @@ HUMOUR. Funny moments are often the best clips, and the easiest to ruin with a b
 - Do not explain or soften the joke in the title. Tease it without giving the punchline away.
 Apply the same care to any moment built on timing: a reveal, a challenge, a wrong guess. The clip must contain the question and the answer, the attempt and the result.
 
+TITLES. A title is the reason someone taps, so it must be about THIS clip and no other:
+- Build it from what is actually said: the surprising claim, the name, the number, the object, the insult, the question being answered. Quote or closely paraphrase the strongest line.
+- A title that would fit any video is a failure. Never write labels that only name the category or the mood, such as "Hilarious moment", "Funny take on marriage", "Comical discussion", "Great advice", "Interesting story", "Emotional moment", "Best moments", or their equivalents in any language. Never use the words "moment", "discussion", "take on", "reaction to" as the subject of a title.
+- Make the viewer need the answer: state the tension or the first half of the idea and hold back the payoff. For a joke, tease the setup, never the punchline.
+- Bad: "FUNNY TAKE ON MARRIAGE". Good: "HE ASKED HER DAD FOR PERMISSION... TWICE". Bad: "HILARIOUS MISTAKE ABOUT LEBANON". Good: "THEY THOUGHT I WAS LEBANESE FOR 3 YEARS".
+- No two titles in the answer may share their main words. "reelTitle" follows the same rules for the video as a whole.
+- "reason" is specific too: say what happens in the clip and why it holds attention, not that it is "engaging" or "relatable".
+
 Return ONLY valid JSON - no markdown, no code fences, no commentary.
 ${languageInstruction}`;
   const timing = timed
@@ -108,7 +116,7 @@ Return exactly this JSON shape:
   "highlights": [
     {
       "id": 1,
-      "title": "short catchy title, max 8 words, in the required language (capitals where the script has them)",
+      "title": "specific to this clip, built from what is said in it, max 8 words, in the required language (capitals where the script has them)",
       "startTime": <seconds, the start of the hook line>,
       "endTime": <seconds, the end of the payoff line>,
       "engagementScore": <integer 60-99, honest: 90+ only for a genuinely exceptional hook AND payoff>,

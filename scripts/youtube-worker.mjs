@@ -36,7 +36,11 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     const audio = kind === "audio";
     const section = !audio && range && Number.isFinite(range.start) && Number.isFinite(range.duration) && range.duration > 0;
-    const format = audio ? "ba[ext=m4a]/ba/b" : "bv[height<=480][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[height<=720][ext=mp4]/b";
+    /* A clip's part of a video is short, so it can be fetched at 720p and
+     * still fit the upload limit; 480p looked soft once cropped to vertical.
+     * A whole video stays at 480p. */
+    const height = section ? 720 : 480;
+    const format = audio ? "ba[ext=m4a]/ba/b" : `bv[height<=${height}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[height<=720][ext=mp4]/b`;
     const ytArgs = [
       "--ignore-config", "--no-playlist", "--no-progress", "--socket-timeout", "15", "--retries", "1",
       "--js-runtimes", `node:${process.execPath}`, "--max-filesize", "350M", "--check-formats", "-f", format,
@@ -100,11 +104,16 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
     } else {
       output = path.join(directory, "source.mp4");
       const rangeArgs = section && !downloadedSection ? ["-ss", String(Math.max(0, range.start))] : [];
+      /* The upload is capped at 28 MiB. Hold a section's bitrate to what fits
+       * in 24 MiB for its length (up to 4.5 Mbit/s, plenty for 720p). */
+      const seconds = section ? Math.max(1, range.duration) : 0;
+      const kbps = section ? Math.max(600, Math.min(4500, Math.floor(24 * 1024 * 8 / seconds) - 160)) : 0;
+      const rateArgs = section ? ["-crf", "21", "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`] : [];
       await run(ffmpeg, [
         "-nostdin", "-loglevel", "error", ...rangeArgs, "-i", filepath, ...(section ? ["-t", String(range.duration)] : []),
-        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", ...rateArgs, "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-movflags", "+faststart", "-y", output,
-      ], { timeout: 90_000, maxBuffer: 1024 * 1024 });
+      ], { timeout: section ? 240_000 : 90_000, maxBuffer: 1024 * 1024 });
     }
     const mime = audio ? "audio/mpeg" : "video/mp4";
     const media = await openAsBlob(output, { type: mime });

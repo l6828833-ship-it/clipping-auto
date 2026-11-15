@@ -17,6 +17,11 @@ function workerToken() {
   return process.env.CLIP_MAKER_YOUTUBE_WORKER_TOKEN?.trim() || "";
 }
 
+/** True while the download worker is polling this server. */
+export function youtubeWorkerAlive() {
+  return Boolean(workerToken()) && Date.now() - lastPoll <= 20_000;
+}
+
 export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, language, onTranscribing } = {}) {
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (Date.now() - lastPoll > 20_000 && !jobs.size)) return null;
   if (jobs.size >= 4) throw new Error("The YouTube download worker is busy. Try again shortly.");

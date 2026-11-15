@@ -14,7 +14,7 @@ import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, 
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
-import { downloadWithYouTubeWorker, registerYouTubeWorker } from "../server/youtube-worker.mjs";
+import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 
 // shared/const.ts
 var COOKIE_NAME = "app_session_id";
@@ -2715,10 +2715,15 @@ async function hostVideo(opts) {
        * ffmpeg downloader can emit an incomplete merged file for adaptive audio
        * and video streams, which then fails during the preview normalization. */
     ] : [];
+    /* A clip's part of a video downloads in well under a minute when YouTube
+     * serves this server normally. With the download worker standing by, give
+     * up on a stalled download early and let the worker fetch it instead of
+     * waiting three minutes to fail. */
+    const sectionTimeout = youtubeSourceId(sourceUrl) && youtubeWorkerAlive() ? 75e3 : 18e4;
     const downloadFull = () => runStreaming(
       ytDlp,
       [...commonArgs, ...sectionArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
-      { timeout: range ? 18e4 : 18e5, onLine: makeProgressHandler() }
+      { timeout: range ? sectionTimeout : 18e5, onLine: makeProgressHandler() }
     );
     /*
      * Generic fallback for TikTok, X and providers where the specialised
@@ -2747,7 +2752,7 @@ async function hostVideo(opts) {
         "--match-filter", `duration < ${maxMinutes * 60}`,
         sourceUrl
       ],
-      { timeout: 18e4, onLine: makeProgressHandler() }
+      { timeout: range ? sectionTimeout : 18e4, onLine: makeProgressHandler() }
     );
     const downloadCompatible = (clientArgs = []) => runStreaming(
       ytDlp,
@@ -2834,7 +2839,10 @@ async function hostVideo(opts) {
       await downloadWithFallback();
       downloaded = await findWritten(tmpDir, "source");
     } catch (error) {
-      if (!/403|429|forbidden|sign in|not a bot/i.test(error.message)) throw error;
+      /* Refused, or so slow that it timed out: both mean YouTube is not
+       * serving this server, and the worker on another network can. */
+      if (!/403|429|forbidden|sign in|not a bot|timed out/i.test(error.message)) throw error;
+      if (/timed out/i.test(error.message) && !(youtubeSourceId(sourceUrl) && youtubeWorkerAlive())) throw error;
       if (youtubeSourceId(sourceUrl)) youtubeBlockedUntil = Date.now() + 10 * 60e3;
       const workerVideo = path5.join(tmpDir, "worker.mp4");
       const metadata = await downloadWithYouTubeWorker(youtubeSourceId(sourceUrl), workerVideo, {
@@ -3038,7 +3046,15 @@ function buildCropFilter(crop, srcW = 0, srcH = 0) {
     const slackY = Math.max(0, scaledH - cropH);
     const x = Math.round(slackX / 2 + ox * (slackX / 2));
     const y = Math.round(slackY / 2 + oy * (slackY / 2));
-    const parts = [`scale=${scaledW}:${scaledH}:flags=lanczos`, `crop=${cropW}:${cropH}:${x}:${y}`];
+    /* Cut the kept region out of the source, then enlarge only that. Enlarging
+     * the whole frame and throwing most of it away gives the same picture for
+     * several times the work: a 9:16 crop keeps a third of a 16:9 frame. */
+    const k = cover * zoom;
+    const fromW = Math.min(even(srcW), even(cropW / k));
+    const fromH = Math.min(even(srcH), even(cropH / k));
+    const fromX = Math.max(0, Math.min(srcW - fromW, Math.round(x / k)));
+    const fromY = Math.max(0, Math.min(srcH - fromH, Math.round(y / k)));
+    const parts = [`crop=${fromW}:${fromH}:${fromX}:${fromY}`, `scale=${cropW}:${cropH}:flags=lanczos`];
     /*
      * A 9:16 crop out of a 16:9 source only keeps about a third of its width,
      * so the kept region is enlarged by `cover * zoom`. On a low-resolution
@@ -3201,7 +3217,20 @@ function renderClipFromHosted(opts) {
  * `{ found, segments, faceCoverage, shots, reason }`; `found` is false when
  * too few faces were seen to trust the result.
  */
-async function detectFraming(hostedPath, startInFile, duration, mode) {
+/* The same part of the same file gives the same answer, and it is asked for
+ * by the preview and again by the render: work it out once. */
+const framingRuns = new Map();
+function detectFraming(hostedPath, startInFile, duration, mode) {
+  const key = `${hostedPath}:${Number(startInFile).toFixed(2)}:${Number(duration).toFixed(2)}:${mode ?? ""}`;
+  const known = framingRuns.get(key);
+  if (known) return known;
+  const run = analyseFraming(hostedPath, startInFile, duration, mode);
+  if (framingRuns.size >= 100) framingRuns.delete(framingRuns.keys().next().value);
+  framingRuns.set(key, run);
+  run.catch(() => framingRuns.delete(key));
+  return run;
+}
+async function analyseFraming(hostedPath, startInFile, duration, mode) {
   const ffmpeg = await findFfmpeg();
   if (!ffmpeg) throw new Error(FFMPEG_MISSING);
   const meta = await probeMedia(hostedPath);
@@ -3264,7 +3293,12 @@ async function renderClipFromHostedNow(opts) {
   /* The final Top 5 composition is 30 fps, so ranked intermediates must not
    * waste CPU encoding a 60 fps source that will be reduced immediately. */
   const outputFps = rankedProfile ? 30 : Math.round(hostedMeta?.fps || 30);
-  const encoderPreset = rankedProfile ? "medium" : "slow";
+  /* "veryfast" encodes several times quicker than "slow" at the same quality
+   * setting, for a somewhat larger file, which matters on a small server.
+   * CLIP_MAKER_X264_PRESET picks another x264 preset. */
+  const presetChoice = process.env.CLIP_MAKER_X264_PRESET?.trim();
+  const encoderPreset = /^(ultrafast|superfast|veryfast|faster|fast|medium|slow|slower)$/.test(presetChoice ?? "")
+    ? presetChoice : rankedProfile ? "medium" : "veryfast";
   const outputCrf = rankedProfile ? "18" : (hostedMeta && hostedMeta.width >= 1280 ? "17" : "18");
   const renderTimeout = rankedProfile ? 3e5 : 9e5;
   const captionKey = captions ? crypto2.createHash("sha1").update(JSON.stringify({ w: captions.words, s: captions.style })).digest("hex").slice(0, 8) : "nocap";

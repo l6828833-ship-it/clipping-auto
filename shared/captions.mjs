@@ -310,7 +310,10 @@ export function buildAssFile(words, style, clipDuration, synced = true, overlays
     const pct = Math.round(scale * 100);
     /* A line with no position of its own that falls inside a centre span (a
      * split-screen stretch of the clip) sits across the join of the two halves. */
-    const centred = centreSpans.some(([a, b]) => group.start >= a - 0.01 && group.start < b);
+    const inSpans = centreSpans.reduce((sum, [a, b]) => sum + Math.max(0, Math.min(group.end, b) - Math.max(group.start, a)), 0);
+    /* Judged by where most of the line is shown, so one that begins just
+     * before the picture splits still moves to the join. */
+    const centred = inSpans > 0 && inSpans >= 0.5 * (group.end - group.start);
     const anchor = resolveCaptionAnchor(s, group.words[0])
       ?? (centred ? { x: Math.round(CAPTION_CANVAS_W / 2), y: Math.round(CAPTION_CANVAS_H / 2) } : null);
     const pos = anchor ? `\\an5\\pos(${anchor.x},${anchor.y})` : "";

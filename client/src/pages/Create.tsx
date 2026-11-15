@@ -1337,13 +1337,24 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
     if (videoId == null || !existingClips || !isFetchedAfterMount || started.current) return;
     started.current = true;
     (async () => {
+      /* A clip this video already has for the same moment is reused, not made
+       * again. "The same moment" is judged by overlap, because analysing a
+       * video a second time moves the edges by a second or two and an exact
+       * match then left two copies of every clip. */
+      const taken = new Set<number>();
+      const shared = (c: { startTime?: number | null; endTime?: number | null }, h: Highlight) => {
+        const a = c.startTime ?? 0, b = c.endTime ?? 0;
+        const both = Math.min(b, h.endTime) - Math.max(a, h.startTime);
+        const either = Math.max(b, h.endTime) - Math.min(a, h.startTime);
+        return either > 0 ? Math.max(0, both) / either : 0;
+      };
       for (const h of clips) {
         try {
-          // Same range on the same video is the same clip.
-          const found = existingClips.find(c =>
-            Math.abs((c.startTime ?? -1) - h.startTime) < 0.5 &&
-            Math.abs((c.endTime ?? -1) - h.endTime) < 0.5
-          );
+          const found = existingClips
+            .filter(c => !taken.has(c.id) && shared(c, h) >= 0.6)
+            .sort((x, y) => shared(y, h) - shared(x, h))[0];
+          if (found) taken.add(found.id);
+          const moved = !!found && (Math.abs((found.startTime ?? 0) - h.startTime) > 0.05 || Math.abs((found.endTime ?? 0) - h.endTime) > 0.05);
           // The style chosen in the first step, else the one the AI suggested.
           const wanted: VideoLayout | null = layout
             ?? (h.montage && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage as VideoStyleId } : null);
@@ -1362,12 +1373,17 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
           const styleChanged = wanted != null && (found
             ? saved?.style !== wanted.style || (saved?.backgroundVideoId ?? null) !== (wanted.backgroundVideoId ?? null)
             : wanted.backgroundVideoId != null);
-          await updateClip.mutateAsync({ id, captionsEnabled: captionsOn, ...(styleChanged ? { layout: wanted } : {}) });
+          await updateClip.mutateAsync({
+            id, captionsEnabled: captionsOn,
+            ...(styleChanged ? { layout: wanted } : {}),
+            // Bring a reused clip onto the newly chosen edges and title.
+            ...(moved ? { startTime: h.startTime, endTime: h.endTime, title: h.title } : {}),
+          });
           if (captionsOn) await saveSubtitles.mutateAsync({ clipId: id, style });
           setClipIds(prev => ({ ...prev, [h.id]: id }));
 
           const status = found?.status;
-          const upToDate = status === "done" && (renderLog.current[id] ?? signature) === signature && !styleChanged;
+          const upToDate = status === "done" && (renderLog.current[id] ?? signature) === signature && !styleChanged && !moved;
           if (!upToDate && status !== "rendering") enqueue(h, id);
         } catch (err) {
           const message = err instanceof Error ? err.message : "Could not save this clip";
