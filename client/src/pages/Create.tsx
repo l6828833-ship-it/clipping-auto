@@ -5,7 +5,7 @@ import ClipPreview from "@/components/ClipPreview";
 import { CropView, DEFAULT_FRAMING, type Framing } from "@/components/VideoFramer";
 import SubtitleOverlay, {
   DEFAULT_SUBTITLE_STYLE, MIN_FONT_SIZE, MAX_FONT_SIZE,
-  CAPTION_FONTS, CaptionPresetPicker, previewWordsFor,
+  CAPTION_FONTS, CaptionPresetPicker, captionAnchor, previewWordsFor,
 } from "@/components/SubtitleOverlay";
 import { captionAt, groupCaptionWords, type CaptionPresetId } from "@shared/captions.mjs";
 import {
@@ -141,6 +141,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   onLayoutChange: (layout: VideoLayout | null) => void;
   onNext: (v: {
     videoId: number; title: string; url: string;
+    /** The source's own title and channel, for titles that name its people. */
+    sourceTitle: string; channel: string;
     transcript: string; duration: number; subtitlesOn: boolean;
     words: { word: string; start: number; end: number }[];
     heatmap: { start: number; end: number; value: number }[];
@@ -276,6 +278,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       videoId: videoResult.id,
       title: name,
       url: url.trim(),
+      sourceTitle: found.meta?.title ?? "",
+      channel: found.meta?.uploader ?? "",
       transcript: found.transcript,
       duration: found.meta?.duration ?? 0,
       subtitlesOn,
@@ -340,6 +344,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       if (result.note) toast.info(result.note);
       onNext({
         videoId: result.id, title: title.trim(), url: "", duration: result.duration,
+        sourceTitle: title.trim(), channel: "",
         subtitlesOn, transcript: result.transcript, words: result.words, heatmap: [], chapters: [],
       });
     } catch (error) {
@@ -724,13 +729,15 @@ function ManualClipPicker({ videoTitle, videoDuration, onNext }: {
 
 // ─── Step 2: Highlights ───────────────────────────────────────────────────────
 function StepHighlights({
-  videoId, layout, videoTitle, transcript, apiKey, model, videoDuration,
+  videoId, layout, videoTitle, sourceTitle, channel, transcript, apiKey, model, videoDuration,
   transcriptWords, heatmap, chapters, titleLanguage, onTitleLanguageChange,
   detected, onDetected, pickedIds, onNext
 }: {
   videoId: number | null;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
   layout: VideoLayout | null;
+  /** The source's own title and channel: the names the clip titles should use. */
+  sourceTitle: string; channel: string;
   videoTitle: string; transcript: string; apiKey: string; model: string;
   videoDuration: number;
   /** Word timings, so detected clips land on the words actually spoken. */
@@ -797,6 +804,9 @@ function StepHighlights({
   /** Everything the detector needs, including whichever signals this source had. */
   const detectInput = {
     transcript, model, apiKey, videoDuration, titleLanguage,
+    /* The names people search for are in the video's title, rarely in what is said. */
+    sourceTitle: (sourceTitle || videoTitle).slice(0, 200) || undefined,
+    channel: channel.slice(0, 200) || undefined,
     transcriptWords: transcriptWords.length > 0 ? transcriptWords : undefined,
     heatmap: heatmap.length > 0 ? heatmap : undefined,
     chapters: chapters.length > 0 ? chapters : undefined,
@@ -1163,6 +1173,13 @@ function StepSubtitles({
     const next = groups.find(g => g.start >= previewTime) ?? groups[groups.length - 1];
     return { words: next.words.map(w => w.text), activeIndex: 0 };
   })();
+  /* Where the caption sits now, from the preset or from a hand placement;
+   * the sliders start there and move it from there. */
+  const anchor = captionAnchor(shownStyle);
+  const place = (axis: "x" | "y", value: number) => {
+    setFreePos({ posX: axis === "x" ? value : anchor.x, posY: axis === "y" ? value : anchor.y });
+    choose("position");
+  };
   const captionLayer = captionsOn && caption ? (
     <SubtitleOverlay
       words={caption.words}
@@ -1226,10 +1243,34 @@ function StepSubtitles({
                   </button>
                 ))}
               </div>
+              {/* Exact placement: where the caption's centre sits, in percent
+                  of the frame, the same number the export positions it by. */}
+              <div className="mt-3 space-y-3">
+                {([
+                  { axis: "y", label: "Vertical", from: "Top", to: "Bottom", min: 4, max: 96 },
+                  { axis: "x", label: "Horizontal", from: "Left", to: "Right", min: 10, max: 90 },
+                ] as const).map(({ axis, label, from, to, min, max }) => (
+                  <div key={axis}>
+                    <div className="flex items-center justify-between text-[11px] text-muted-foreground mb-1">
+                      <span>{label}</span>
+                      <span className="tabular-nums font-semibold text-foreground">{Math.round(anchor[axis])}%</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                      <span className="w-9 shrink-0">{from}</span>
+                      <input type="range" min={min} max={max} step={0.5}
+                        value={Math.min(max, Math.max(min, anchor[axis]))}
+                        aria-label={`Caption position, ${label.toLowerCase()}`}
+                        onChange={e => place(axis, Number(e.target.value))}
+                        className="flex-1 accent-primary" />
+                      <span className="w-9 shrink-0 text-right">{to}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
               <p className="text-[10px] text-muted-foreground mt-1.5">
                 {freePos
-                  ? "Dragged to a custom spot — pick a preset above to reset."
-                  : "Drag the caption in the preview to place it anywhere."}
+                  ? "Placed by hand. Pick Top, Center or Bottom to go back to a preset."
+                  : "Use the sliders, or drag the caption in the preview, to place it exactly."}
               </p>
             </div>
             <div className="flex items-center justify-between"><label className="text-xs text-muted-foreground">Text Outline</label><button role="switch" aria-checked={shownStyle.outline} aria-label="Text outline" onClick={() => { setOutline(!shownStyle.outline); choose("outline"); }} className="w-10 h-5 rounded-full transition-all relative" style={{ background: shownStyle.outline ? "var(--cobalt)" : "var(--secondary)" }}><div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${shownStyle.outline ? "left-5" : "left-0.5"}`} /></button></div>
@@ -1422,8 +1463,10 @@ function plainError(err: unknown, fallback: string) {
  * follows the speaker and transcribes as part of the render, so there is
  * nothing to prepare by hand in between.
  */
-function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, videoUrl, captionsOn, renderLog, apiKey, model, titleLanguage }: {
+function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, reelTitle, videoUrl, captionsOn, renderLog, apiKey, model, titleLanguage }: {
   clips: Highlight[]; style: SubStyle; videoTitle: string; reelTitle: string;
+  /** The source's own title, for AI hooks that name its people. */
+  sourceTitle: string;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
   layout: VideoLayout | null;
   videoId: number | null;
@@ -1568,7 +1611,10 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
 
   const genHook = async (h: Highlight) => {
     try {
-      const result = await generateTitle.mutateAsync({ clipContent: `${h.title}: ${h.reason}`, style: "tiktok", apiKey, model, titleLanguage });
+      const result = await generateTitle.mutateAsync({
+        clipContent: `${h.title}: ${h.reason}`, style: "tiktok", apiKey, model, titleLanguage,
+        videoTitle: (sourceTitle || videoTitle).slice(0, 200) || undefined,
+      });
       setHookTitles(prev => ({ ...prev, [h.id]: result }));
       toast.success("AI generated a viral hook!");
     } catch { toast.error("Failed to generate hook"); }
@@ -1738,6 +1784,9 @@ export default function CreatePage() {
   const model = "openai/gpt-4o-mini";
   const [step, setStep] = useState<Step>(1);
   const [videoTitle, setVideoTitle] = useState("");
+  /** The source's own title and channel, kept for the AI titles. */
+  const [sourceTitle, setSourceTitle] = useState("");
+  const [channel, setChannel] = useState("");
   const [videoDuration, setVideoDuration] = useState(0);
   const [transcript, setTranscript] = useState("");
   /**
@@ -1775,6 +1824,7 @@ export default function CreatePage() {
           <StepInput apiKey={apiKey} layout={videoLayout} onLayoutChange={setVideoLayout} onNext={v => {
             setVideoId(v.videoId); setVideoUrl(v.url);
             setVideoTitle(v.title); setTranscript(v.transcript); setVideoDuration(v.duration);
+            setSourceTitle(v.sourceTitle); setChannel(v.channel);
             setTranscriptWords(v.words);
             setHeatmap(v.heatmap); setChapters(v.chapters);
             // Subtitles off at import means nothing to burn in at export either.
@@ -1786,7 +1836,8 @@ export default function CreatePage() {
         )}
         {step === 2 && (
           <StepHighlights videoId={videoId} layout={videoLayout}
-            videoTitle={videoTitle} transcript={transcript} apiKey={apiKey} model={model} videoDuration={videoDuration}
+            videoTitle={videoTitle} sourceTitle={sourceTitle} channel={channel}
+            transcript={transcript} apiKey={apiKey} model={model} videoDuration={videoDuration}
             transcriptWords={transcriptWords}
             heatmap={heatmap} chapters={chapters}
             titleLanguage={titleLanguage} onTitleLanguageChange={setTitleLanguage}
@@ -1808,7 +1859,7 @@ export default function CreatePage() {
         )}
         {step === 4 && subStyle && (
           <StepExport clips={selectedClips} style={subStyle} layout={videoLayout} videoId={videoId}
-            videoTitle={videoTitle} reelTitle={reelTitle} videoUrl={videoUrl}
+            videoTitle={videoTitle} sourceTitle={sourceTitle} reelTitle={reelTitle} videoUrl={videoUrl}
             captionsOn={captionsOn} renderLog={renderLog}
             apiKey={apiKey} model={model} titleLanguage={titleLanguage} />
         )}

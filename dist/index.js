@@ -1782,8 +1782,14 @@ const titleLanguages = {
 const titleLanguageInput = z2.enum(["auto", ...Object.keys(titleLanguages)]).default("auto");
 function titleLanguageInstruction(language, sourceText = "") {
   const choice = titleLanguages[language] || detectTextLanguage(sourceText);
+  /* "Same as video" and the speakers talk Arabic: titles read best in their
+   * own dialect (Egyptian, Gulf, Levantine...), the way a viral post for that
+   * audience is written. Formal Arabic reads like a news headline. */
+  const dialect = !titleLanguages[language] && choice === "Arabic"
+    ? " Write the titles and reelTitle in the dialect the speakers use (Egyptian, Gulf, Levantine, Moroccan or other), as a viral post for that audience would read, not in formal Modern Standard Arabic unless they speak it. The reason may be plain Arabic."
+    : "";
   return choice
-    ? `LANGUAGE: write every title, reelTitle, reason and any other generated text in ${choice}.${choice === "English" ? "" : " This is required even though these instructions are in English. Do not translate into English."} Keep the JSON keys and the "kind" and "montage" values in English.`
+    ? `LANGUAGE: write every title, reelTitle, reason and any other generated text in ${choice}.${choice === "English" ? "" : " This is required even though these instructions are in English. Do not translate into English."}${dialect} Keep the JSON keys and the "kind" and "montage" values in English.`
     : "LANGUAGE: write every title, reelTitle, reason and any other generated text in the same language and dialect as the transcript, NOT in English unless the transcript is English. For Moroccan Darija, use natural Moroccan expressions and Arabic script. Keep the JSON keys and the \"kind\" and \"montage\" values in English.";
 }
 var geminiRouter = router({
@@ -1825,7 +1831,9 @@ var geminiRouter = router({
     /** Pick candidates for one ranked source instead of five moments from one video. */
     rankingMode: z2.boolean().default(false),
     rank: z2.number().int().min(1).max(99).optional(),
-    sourceTitle: z2.string().max(200).optional()
+    /** The source video's own title and channel: where the names people search for are. */
+    sourceTitle: z2.string().max(200).optional(),
+    channel: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
     const timedWords = (input.transcriptWords ?? []).filter((w) => w.word.trim());
     const lines = timedWords.length >= 5 ? transcriptLines(timedWords) : [];
@@ -1837,7 +1845,9 @@ var geminiRouter = router({
       videoDuration: input.videoDuration,
       peaks,
       chapters: input.chapters ?? [],
-      count: clipCountFor(input.videoDuration)
+      count: clipCountFor(input.videoDuration),
+      videoTitle: input.sourceTitle ?? "",
+      channel: input.channel ?? ""
     });
     const timingNote = lines.length
       ? `Each transcript line is "[start-end] text" in seconds. Start a clip at the start of one line and end it at the end of a later line.`
@@ -1936,9 +1946,14 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
     titleLanguage: titleLanguageInput,
     style: z2.enum(["tiktok", "youtube", "instagram"]).default("tiktok"),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
-    apiKey: z2.string().min(1, "Inworld API key is required")
+    apiKey: z2.string().min(1, "Inworld API key is required"),
+    /** The source video's title, where the names people search for are. */
+    videoTitle: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
     try {
+      const source = input.videoTitle?.trim()
+        ? `\n\nThe clip comes from the video "${input.videoTitle.trim()}". Name the guest, host or show from that title in the hook title when the clip is told by or about them, spelled as in the title, rather than "he" or "she", and use them in the hashtags.`
+        : "";
       const { response, modelUsed } = await inworldAnswer({
         model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
@@ -1951,7 +1966,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
             role: "user",
             content: `Generate a viral hook title and 3 hashtags for this clip:
 
-"${input.clipContent}"
+"${input.clipContent}"${source}
 
 Return: { "title": "HOOK TITLE IN CAPS", "hook": "First sentence hook max 15 words", "hashtags": ["tag1", "tag2", "tag3"] }`
           }

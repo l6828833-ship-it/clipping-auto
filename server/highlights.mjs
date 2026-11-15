@@ -61,7 +61,7 @@ export function clipCountFor(durationSeconds) {
   return 8;
 }
 
-export function buildHighlightPrompts({ transcript, timed, videoDuration, peaks = [], chapters = [], count = 5, languageInstruction = "" }) {
+export function buildHighlightPrompts({ transcript, timed, videoDuration, peaks = [], chapters = [], count = 5, languageInstruction = "", videoTitle = "", channel = "" }) {
   const system = `You are a senior short-form video editor. You cut long videos into clips for TikTok, Instagram Reels and YouTube Shorts, and you are judged on watch-through rate.
 
 A clip is worth making only if a stranger who has never seen the full video would stop scrolling for it and understand it completely. Judge every candidate on:
@@ -84,7 +84,10 @@ TITLES. A title is the reason someone taps, so it must be about THIS clip and no
 - A title that would fit any video is a failure. Never write labels that only name the category or the mood, such as "Hilarious moment", "Funny take on marriage", "Comical discussion", "Great advice", "Interesting story", "Emotional moment", "Best moments", or their equivalents in any language. Never use the words "moment", "discussion", "take on", "reaction to" as the subject of a title.
 - Make the viewer need the answer: state the tension or the first half of the idea and hold back the payoff. For a joke, tease the setup, never the punchline.
 - Bad: "FUNNY TAKE ON MARRIAGE". Good: "HE ASKED HER DAD FOR PERMISSION... TWICE". Bad: "HILARIOUS MISTAKE ABOUT LEBANON". Good: "THEY THOUGHT I WAS LEBANESE FOR 3 YEARS".
-- No two titles in the answer may share their main words. "reelTitle" follows the same rules for the video as a whole.
+- Name names. When the clip is told by or about someone a viewer could search for (the guest, the host, a celebrity they mention), write their name, spelled as in the video title, instead of "he", "she", "his brother" or "a man". "[GUEST NAME]'S BROTHER BROUGHT A CROCODILE HOME" beats "HIS BROTHER BROUGHT A CROCODILE HOME".
+- Tie every clip to its video. The video title (given with the transcript) holds the keywords people search for: the guest, the show, the topic. Use them in the titles of the clips that are about them, so each clip is recognisably from this video. Do not force a name into a clip that is not about that person.
+- Write it like the hook of a viral post: 3 to 8 words, concrete, with a curiosity gap, a contrast or a surprising number. A short quote from the clip often works best. No hashtags, no emojis, and nothing that is not true to the clip.
+- No two titles in the answer may share their main words, apart from the names. "reelTitle" follows the same rules for the video as a whole and names its guest or show.
 - "reason" is specific too: say what happens in the clip and why it holds attention, not that it is "engaging" or "relatable".
 
 Return ONLY valid JSON - no markdown, no code fences, no commentary.
@@ -93,6 +96,15 @@ ${languageInstruction}`;
     ? `Each transcript line is "[start-end] text" in seconds. A clip MUST start at the start time of one line and end at the end time of a later line. Copy those numbers exactly; do not invent times between lines.`
     : `The transcript has no timings. Estimate startTime and endTime in seconds from each passage's position in the text and the total duration.`;
   const extras = [];
+  /* The names and keywords people search for usually sit in the title, not
+   * in what is said: a guest is rarely called by name in their own interview. */
+  const source = [
+    videoTitle && `VIDEO TITLE: ${String(videoTitle).slice(0, 200)}`,
+    channel && `CHANNEL: ${String(channel).slice(0, 120)}`,
+  ].filter(Boolean);
+  if (source.length) {
+    extras.push(`${source.join("\n")}\nThese are the names and keywords viewers search for. Use them in the titles as the TITLES rules say.`);
+  }
   if (videoDuration) extras.push(`Total video duration: ${Math.floor(videoDuration)} seconds.`);
   if (peaks.length) {
     extras.push(`MOST REPLAYED (real viewer data - strongly prefer clips that cover these, if they also pass the rules):\n${peaks.map((p) => `- ${fmt(p.start)}s to ${fmt(p.end)}s (intensity ${p.value.toFixed(2)})`).join("\n")}`);
