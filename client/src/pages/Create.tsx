@@ -744,7 +744,7 @@ function StepHighlights({
   return (
     <div className="max-w-2xl mx-auto animate-slide-up">
       <div className="mb-6">
-        <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Gemini AI Highlights</h2>
+        <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Highlights</h2>
         <p className="text-sm text-muted-foreground">Analyzing: <span className="text-foreground font-medium">{videoTitle}</span></p>
       </div>
       <label className="mb-4 block text-sm font-semibold text-foreground">
@@ -780,7 +780,7 @@ function StepHighlights({
                 style={{ height:`${20+i*8}px`, background:"var(--cobalt)", animationDelay:`${i*0.1}s` }} />
             ))}
           </div>
-          <p className="text-sm font-semibold text-foreground mb-1">AI is analyzing your transcript…</p>
+          <p className="text-sm font-semibold text-foreground mb-1">Analyzing your transcript…</p>
           <p className="text-xs text-muted-foreground">Detecting the best moments…</p>
         </div>
       )}
@@ -804,7 +804,7 @@ function StepHighlights({
             <div className="glass rounded-xl p-3 mb-4 flex items-center gap-3">
               <Wand2 className="w-4 h-4 shrink-0" style={{ color: "var(--mint)" }} />
               <div className="flex-1 min-w-0">
-                <p className="text-xs text-muted-foreground">Gemini suggested reel title:</p>
+                <p className="text-xs text-muted-foreground">Suggested reel title:</p>
                 <p dir="auto" className="text-sm font-bold text-foreground truncate">{reelTitle}</p>
               </div>
             </div>
@@ -1247,6 +1247,36 @@ function wordsInClip(words: TimelineWord[] | null | undefined, clip: Highlight):
 }
 
 // ─── Step 4: Export ───────────────────────────────────────────────────────────
+
+/**
+ * True for a failure that says the server could not be reached or answered
+ * with something that was not ours: it was restarting, or a proxy replied in
+ * its place. The browser reports the latter as a JSON parsing error, which
+ * means nothing to the person looking at it.
+ */
+function serverAway(err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  return /is not valid JSON|Unexpected token|Unexpected end of JSON|Failed to fetch|NetworkError|Load failed|\b50[234]\b/i.test(message);
+}
+
+/** Runs a request, waiting and trying again (three more times) while the server is away. */
+async function patiently<T>(request: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await request();
+    } catch (err) {
+      if (attempt >= 3 || !serverAway(err)) throw err;
+      await new Promise(resolve => setTimeout(resolve, 4000 * (attempt + 1)));
+    }
+  }
+}
+
+/** An error message fit to show: never the raw text of a JSON parsing failure. */
+function plainError(err: unknown, fallback: string) {
+  if (serverAway(err)) return "The server was restarting and did not answer. Try again in a moment.";
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 /**
  * Creates a clip row for every selected highlight, saves the caption design
  * and video style on it, then renders them all, one after another, without
@@ -1303,10 +1333,10 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
     try {
       /* Resolves once this clip's part of the video is on the server and the
        * render is under way; the card then follows the clip's status. */
-      await startRender.mutateAsync({ id: clipId, captionsEnabled: captionsOn });
+      await patiently(() => startRender.mutateAsync({ id: clipId, captionsEnabled: captionsOn }));
       renderLog.current[clipId] = signature;
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Could not start the render";
+      const message = plainError(err, "Could not start the render");
       setFailed(prev => ({ ...prev, [h.id]: message }));
       toast.error(`${h.title}: ${message}`);
     } finally {
@@ -1360,33 +1390,34 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
             ?? (h.montage && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage as VideoStyleId } : null);
           let id = found?.id;
           if (id == null) {
-            ({ id } = await createClip.mutateAsync({
+            ({ id } = await patiently(() => createClip.mutateAsync({
               videoId,
               title: h.title,
               startTime: h.startTime,
               endTime: h.endTime,
               engagementScore: h.engagementScore,
               ...(wanted ? { style: wanted.style } : {}),
-            }));
+            })));
           }
           const saved = (found as { layout?: VideoLayout | null } | undefined)?.layout ?? null;
           const styleChanged = wanted != null && (found
             ? saved?.style !== wanted.style || (saved?.backgroundVideoId ?? null) !== (wanted.backgroundVideoId ?? null)
             : wanted.backgroundVideoId != null);
-          await updateClip.mutateAsync({
-            id, captionsEnabled: captionsOn,
+          const clipRow = id;
+          await patiently(() => updateClip.mutateAsync({
+            id: clipRow, captionsEnabled: captionsOn,
             ...(styleChanged ? { layout: wanted } : {}),
             // Bring a reused clip onto the newly chosen edges and title.
             ...(moved ? { startTime: h.startTime, endTime: h.endTime, title: h.title } : {}),
-          });
-          if (captionsOn) await saveSubtitles.mutateAsync({ clipId: id, style });
+          }));
+          if (captionsOn) await patiently(() => saveSubtitles.mutateAsync({ clipId: clipRow, style }));
           setClipIds(prev => ({ ...prev, [h.id]: id }));
 
           const status = found?.status;
           const upToDate = status === "done" && (renderLog.current[id] ?? signature) === signature && !styleChanged && !moved;
           if (!upToDate && status !== "rendering") enqueue(h, id);
         } catch (err) {
-          const message = err instanceof Error ? err.message : "Could not save this clip";
+          const message = plainError(err, "Could not save this clip");
           setFailed(prev => ({ ...prev, [h.id]: message }));
           toast.error(`${h.title}: ${message}`);
         }
@@ -1413,6 +1444,16 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
   const finished = clips.filter(h => exportById.get(clipIds[h.id])?.status === "done" && !busy(h)).length;
   const working = saving || clips.some(busy);
 
+  /* The clip shown in the side preview: the one clicked, else the first. */
+  const [chosen, setChosen] = useState<number | null>(null);
+  const shown = clips.find(h => h.id === chosen) ?? clips[0];
+  const shownRow = shown ? exportById.get(clipIds[shown.id]) : undefined;
+  const shownBusy = shown ? busy(shown) || clipIds[shown.id] == null : false;
+  const shownFile = shownRow?.status === "done" && !shownBusy ? shownRow.downloadUrl : null;
+  const shownProblem = shown
+    ? failed[shown.id] ?? (shownRow?.status === "error" ? shownRow.errorMessage ?? "Rendering failed." : null)
+    : null;
+
   return (
     <div className="animate-slide-up">
       <div className="mb-6 flex items-center justify-between flex-wrap gap-3">
@@ -1438,7 +1479,8 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
           </button>
         )}
       </div>
-      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px] items-start">
+      <div className="grid sm:grid-cols-2 gap-4">
         {clips.map(h => {
           const clipId = clipIds[h.id];
           const result = exportById.get(clipId);
@@ -1454,8 +1496,11 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
           const ytId = parseYouTubeId(videoUrl);
           const thumbnail = ytId ? youTubeThumbnail(ytId) : null;
           return (
-            <div key={h.id} className="glass rounded-2xl overflow-hidden hover:border-primary/30 transition-colors">
-              <div className="relative flex items-center justify-center overflow-hidden" style={{ height:"140px", background:"linear-gradient(135deg, #0a0a1a, #1a0a2e)" }}>
+            <div key={h.id} className="glass rounded-2xl overflow-hidden transition-colors"
+              style={shown?.id === h.id ? { borderColor: "var(--cobalt)", boxShadow: "0 0 0 1px var(--cobalt)" } : undefined}>
+              <button type="button" onClick={() => setChosen(h.id)} aria-pressed={shown?.id === h.id}
+                aria-label={`Preview ${h.title}`}
+                className="relative flex w-full items-center justify-center overflow-hidden" style={{ height:"140px", background:"linear-gradient(135deg, #0a0a1a, #1a0a2e)" }}>
                 {thumbnail && (
                   <img src={thumbnail} alt="" className="absolute inset-0 w-full h-full object-cover opacity-70" loading="lazy" />
                 )}
@@ -1468,7 +1513,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
                   </span>
                 </div>
                 <div className="absolute top-2 right-2 text-xs font-black px-1.5 py-0.5 rounded" style={{ color: scoreColor, background: `${scoreColor}22` }}>{h.engagementScore}</div>
-              </div>
+              </button>
               <div className="p-4">
                 <h3 className="text-sm font-bold text-foreground mb-1 truncate" style={{ fontFamily: "Montserrat, sans-serif" }}>{h.title}</h3>
                 <p className="text-xs text-muted-foreground mb-1">{fmt(h.startTime)} – {fmt(h.endTime)} · {Math.round(h.endTime - h.startTime)}s</p>
@@ -1481,7 +1526,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
                 <div className="flex gap-2 flex-wrap">
                   {!hook && <button onClick={() => genHook(h)} disabled={generateTitle.isPending} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all hover:opacity-80" style={{ background:"rgba(221, 125, 113, 0.1)", color:"var(--coral)" }}><Wand2 className="w-3 h-3" /> AI Hook</button>}
                   {file ? (
-                    <a href={downloadUrl(file)} download className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Download className="w-3.5 h-3.5" /> Download MP4</a>
+                    <a href={downloadUrl(file)} download className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold transition-all hover:opacity-80" style={{ background:"rgba(89, 164, 133, 0.1)", color:"var(--mint)" }}><Download className="w-3.5 h-3.5" /> Download</a>
                   ) : isRendering || clipId == null ? (
                     <div className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-semibold text-muted-foreground bg-secondary/60"><Loader2 className="w-3.5 h-3.5 animate-spin" /> {progressLabel}</div>
                   ) : (
@@ -1493,6 +1538,48 @@ function StepExport({ clips, style, layout, videoId, videoTitle, reelTitle, vide
             </div>
           );
         })}
+      </div>
+
+      {/* Side preview of the selected clip */}
+      {shown && (
+        <aside className="glass rounded-2xl p-4 lg:sticky lg:top-4" aria-label="Clip preview">
+          <p className="text-[11px] font-semibold text-muted-foreground mb-0.5">Preview</p>
+          <p className="text-sm font-bold text-foreground mb-3 truncate" style={{ fontFamily: "Montserrat, sans-serif" }}>{shown.title}</p>
+          {shownFile ? (
+            /* Keyed by file so choosing another clip starts its own player. */
+            <ClipPreview key={shownFile} url={shownFile} startTime={0} endTime={shown.endTime - shown.startTime}
+              className="rounded-xl w-full" style={{ aspectRatio: "9/16" }} autoPlay />
+          ) : (
+            <div className="rounded-xl w-full flex flex-col items-center justify-center gap-2 px-4 text-center"
+              style={{ aspectRatio: "9/16", background: "linear-gradient(135deg, #0a0a1a, #1a0a2e)" }}>
+              {shownBusy ? (
+                <>
+                  <Loader2 className="w-6 h-6 animate-spin text-white/80" />
+                  <p className="text-xs font-semibold text-white/80">
+                    {clipIds[shown.id] == null ? "Saving…"
+                      : queued.has(shown.id) ? "Waiting its turn…"
+                      : rendering.has(shown.id) ? "Importing this part of the video…"
+                      : "Rendering…"}
+                  </p>
+                  <p className="text-[11px] text-white/50">It plays here as soon as it is ready.</p>
+                </>
+              ) : (
+                <>
+                  <AlertCircle className="w-6 h-6 text-white/70" />
+                  <p className="text-xs text-white/80">{shownProblem ?? "This clip has not been rendered yet."}</p>
+                </>
+              )}
+            </div>
+          )}
+          {shownFile && (
+            <a href={downloadUrl(shownFile)} download
+              className="mt-3 flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-bold transition-all hover:opacity-80"
+              style={{ background: "rgba(89, 164, 133, 0.1)", color: "var(--mint)" }}>
+              <Download className="w-3.5 h-3.5" /> Download MP4
+            </a>
+          )}
+        </aside>
+      )}
       </div>
       <div className="mt-6 glass rounded-2xl p-5 flex items-center gap-4">
         <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background:"rgba(89, 164, 133, 0.1)" }}>

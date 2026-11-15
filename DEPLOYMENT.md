@@ -36,6 +36,8 @@ Speaker framing (`scripts/auto_frame.py`) cuts to whoever is talking when two pe
 
 Clips are encoded with the x264 `veryfast` preset, which is several times quicker than `slow` on a small instance for a somewhat larger file; set `CLIP_MAKER_X264_PRESET` (`faster`, `medium`, `slow`, …) to trade speed for size. When a direct YouTube download of a clip stalls for 75 seconds and the download worker is connected, the worker fetches that part instead. The worker now fetches clip parts at 720p (whole videos stay at 480p); restart it after updating so it picks this up.
 
+Run exactly one instance (minimum 1, maximum 1) with CPU always allocated. Imported videos and rendered clips are files on the instance's disk and renders run after the request has returned, so a second instance has neither the files nor the job. A running import or render stamps its row every half minute; one whose stamp is three minutes old is released as failed (checked at start-up and every two minutes), which replaces the old behaviour of failing every running job whenever any instance started.
+
 Two settings exist only for local testing: `INWORLD_BASE_URL` points the AI calls at a stand-in server, and `CLIP_MAKER_DB_POOL_MAX` caps the database pool for a test database that accepts one connection at a time. Leave both unset in production.
 
 Jump cuts ("Tighten") are stored in a new nullable `clips.cuts` column (migration `0002_clip_cuts`). The server also adds it on start-up with `ADD COLUMN IF NOT EXISTS`, so a deploy works before `npm run db:migrate` has been run. AI reframing needs `onnxruntime` (in `scripts/requirements-whisper.txt`) and `assets/models/face-rfb-320.onnx`.

@@ -42,7 +42,7 @@ var decodeOAuthState = (state) => {
 import { parse as parseCookieHeader2 } from "cookie";
 
 // server/db.ts
-import { eq, desc, and, isNotNull, sql } from "drizzle-orm";
+import { eq, desc, and, isNotNull, lt, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 
 // drizzle/schema.ts
@@ -262,25 +262,51 @@ async function getVideoById(id, userId) {
 async function updateVideo(id, data) {
   const db = await getDb();
   if (!db) return;
-  await db.update(videos).set(data).where(eq(videos.id, id));
+  /* Every write stamps the row, which is how a job shows it is still alive. */
+  await db.update(videos).set({ ...data, updatedAt: new Date() }).where(eq(videos.id, id));
 }
+/**
+ * Runs `task` while calling `beat` every half minute, so the row it works on
+ * keeps a fresh timestamp for as long as the work is really going on.
+ */
+async function keepAlive(beat, task) {
+  const timer = setInterval(() => { void Promise.resolve().then(beat).catch(() => {}); }, 3e4);
+  try {
+    return await task();
+  } finally {
+    clearInterval(timer);
+  }
+}
+/**
+ * Marks imports and renders that nothing is working on any more as failed,
+ * so they can be tried again instead of spinning for ever.
+ *
+ * A job counts as abandoned only when its row has not been touched for three
+ * minutes; running jobs touch theirs every half minute. Simply failing every
+ * job at start-up was wrong: when a second copy of the server started (a
+ * deploy, or the host adding an instance under load) it failed the renders
+ * the first copy was still busy with.
+ */
 async function resetOrphanedJobs() {
   const db = await getDb();
   if (!db) return { videos: 0, clips: 0 };
-  const stuckVideos = await db.select({ id: videos.id }).from(videos).where(eq(videos.hostedStatus, "downloading"));
+  const stale = new Date(Date.now() - 3 * 60e3);
+  const deadImport = and(eq(videos.hostedStatus, "downloading"), lt(videos.updatedAt, stale));
+  const stuckVideos = await db.select({ id: videos.id }).from(videos).where(deadImport);
   if (stuckVideos.length > 0) {
     await db.update(videos).set({
       hostedStatus: "none",
       hostProgress: 0,
-      hostError: "The import was interrupted by a server restart. Try again."
-    }).where(eq(videos.hostedStatus, "downloading"));
+      hostError: "The import stopped before it finished (the server restarted). Try again."
+    }).where(deadImport);
   }
-  const stuckClips = await db.select({ id: clips.id }).from(clips).where(eq(clips.status, "rendering"));
+  const deadRender = and(eq(clips.status, "rendering"), lt(clips.updatedAt, stale));
+  const stuckClips = await db.select({ id: clips.id }).from(clips).where(deadRender);
   if (stuckClips.length > 0) {
     await db.update(clips).set({
       status: "error",
-      errorMessage: "Rendering was interrupted by a server restart. Try again."
-    }).where(eq(clips.status, "rendering"));
+      errorMessage: "Rendering stopped before it finished (the server restarted). Try again."
+    }).where(deadRender);
   }
   return { videos: stuckVideos.length, clips: stuckClips.length };
 }
@@ -303,7 +329,7 @@ async function getClipsByVideo(videoId, userId) {
 async function updateClip(id, data) {
   const db = await getDb();
   if (!db) return;
-  await db.update(clips).set(data).where(eq(clips.id, id));
+  await db.update(clips).set({ ...data, updatedAt: new Date() }).where(eq(clips.id, id));
 }
 async function getSubtitleByClip(clipId) {
   const db = await getDb();
@@ -4048,7 +4074,7 @@ var appRouter = router({
         };
         try {
           const range = input.startTime != null && input.endTime != null ? { start: input.startTime, end: input.endTime } : null;
-          const result = await hostVideoShared({ videoId: video.id, sourceUrl, range, onProgress });
+          const result = await keepAlive(() => updateVideo(video.id, {}), () => hostVideoShared({ videoId: video.id, sourceUrl, range, onProgress }));
           const isLowRes = result.width > 0 && result.height > 0 && (result.width < 1280 || result.height < 720);
           const qualityState = isLowRes ? "LOW_QUALITY_FALLBACK" : "HIGH_QUALITY_SOURCE";
           await updateVideo(video.id, {
@@ -4354,13 +4380,13 @@ var appRouter = router({
         console.log(`[Render] Auto-importing clip range ${clip.startTime}-${clip.endTime}s for clip ${clip.id}...`);
         await updateVideo(video.id, { hostedStatus: "downloading", hostError: null, hostProgress: 0 });
         try {
-          const result = await hostVideoShared({
+          const result = await keepAlive(() => updateVideo(video.id, {}), () => hostVideoShared({
             videoId: video.id,
             sourceUrl,
             range: { start: clip.startTime, end: clip.endTime },
             maxHeight: 2160,
             onProgress: (pct) => { void updateVideo(video.id, { hostProgress: pct }).catch(() => {}); }
-          });
+          }));
           await updateVideo(video.id, {
             hostedStatus: "ready",
             hostedUrl: result.url,
@@ -4395,7 +4421,7 @@ var appRouter = router({
         offsetY: crop.offsetY,
         captionsEnabled
       });
-      void (async () => {
+      void keepAlive(() => updateClip(clip.id, {}), async () => {
         let finalCaptions = null;
         try {
           finalCaptions = captionsEnabled ? await captionsForClip(clip, video) : null;
@@ -4542,7 +4568,7 @@ var appRouter = router({
           await updateClip(clip.id, { status: "error", errorMessage: msg.slice(0, 500) }).catch(() => {
           });
         }
-      })();
+      });
       return { success: true, status: "rendering" };
     }),
     /**
@@ -4997,8 +5023,12 @@ function serveStatic(app) {
     );
   }
   app.use(express.static(distPath));
-  app.use("*", (_req, res) => {
-    res.sendFile(path7.resolve(distPath, "index.html"));
+  app.use("*", (req, res) => {
+    /* The app's own pages get the page. Any other address still gets it (the
+     * app shows its "not found" screen) but with a 404, so the probes that
+     * scanners send for /etc/passwd and the like are not answered "200 OK". */
+    const page = /^\/(?:$|login\/?$|register\/?$|404\/?$|dashboard(?:\/|$))/.test(req.originalUrl.split("?")[0]);
+    res.status(page ? 200 : 404).sendFile(path7.resolve(distPath, "index.html"));
   });
 }
 
@@ -5029,6 +5059,12 @@ async function startServer() {
   } catch (err) {
     console.warn("[Startup] Could not reset interrupted jobs:", err);
   }
+  /* Keep checking: a job that dies later has to be released too. */
+  setInterval(() => {
+    resetOrphanedJobs().then(({ videos: videos2, clips: clips2 }) => {
+      if (videos2 > 0 || clips2 > 0) console.log(`[Jobs] Released ${videos2} abandoned import(s) and ${clips2} abandoned render(s)`);
+    }).catch(() => {});
+  }, 12e4).unref();
   const app = express2();
   const server = createServer(app);
   app.get("/healthz", (_req, res) => res.json({ status: "ok" }));
