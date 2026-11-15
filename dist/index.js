@@ -1566,6 +1566,36 @@ async function inworldChatResilient(opts) {
     throw err;
   }
 }
+/**
+ * Asks the model and makes sure it actually wrote something.
+ *
+ * A model that thinks before it answers spends part of its token allowance on
+ * that thinking. If the allowance runs out first, the reply comes back with no
+ * text at all. So an empty reply is asked again with far more room, and if
+ * that is empty too (or refused), `fallbackModel` answers instead.
+ */
+async function inworldAnswer(opts, fallbackModel) {
+  const empty = (result) => !inworldGetContent(result.response).trim();
+  const report = (result) => {
+    const choice = result.response?.choices?.[0];
+    console.warn(`[Inworld] ${result.modelUsed} returned no text (finish_reason=${choice?.finish_reason ?? "?"}, usage=${JSON.stringify(result.response?.usage ?? null)}).`);
+  };
+  let result = await inworldChatResilient(opts);
+  if (!empty(result)) return result;
+  report(result);
+  try {
+    const roomier = await inworldChatResilient({ ...opts, max_tokens: Math.max(32e3, (opts.max_tokens ?? 2048) * 4) });
+    if (!empty(roomier)) return roomier;
+    report(roomier);
+  } catch (error) {
+    console.warn(`[Inworld] Retry with a larger allowance failed: ${String(error?.message ?? error).slice(0, 200)}`);
+  }
+  if (fallbackModel && fallbackModel !== opts.model) {
+    console.warn(`[Inworld] Falling back to ${fallbackModel}.`);
+    return inworldChatResilient({ ...opts, model: fallbackModel });
+  }
+  return result;
+}
 async function inworldListModels(apiKey) {
   const res = await fetch(`${INWORLD_BASE_URL}/v1/models`, {
     headers: { "Authorization": `Basic ${apiKey}` }
@@ -1801,7 +1831,7 @@ Return exactly this JSON:
 Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTime must be no more than 15 seconds after its startTime.`
       : prompts.user;
     try {
-      const { response, modelUsed, substituted } = await inworldChatResilient({
+      const { response, modelUsed, substituted } = await inworldAnswer({
         model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
@@ -1810,9 +1840,10 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         ],
         // Low enough to keep timestamps faithful to the transcript lines.
         temperature: 0.4,
-        // Headroom so the highlights are never cut off mid-object.
-        max_tokens: 4096
-      });
+        // Headroom so the highlights are never cut off mid-object, and so a
+        // model that reasons first still has room left to write them.
+        max_tokens: 8192
+      }, input.model);
       if (substituted) {
         console.warn(`[Inworld] "${aiModel(input.model)}" is unavailable \u2014 used "${modelUsed}" instead.`);
       }
@@ -1868,7 +1899,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
     apiKey: z2.string().min(1, "Inworld API key is required")
   })).mutation(async ({ input }) => {
     try {
-      const { response, modelUsed } = await inworldChatResilient({
+      const { response, modelUsed } = await inworldAnswer({
         model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
@@ -1886,8 +1917,8 @@ Return: { "title": "HOOK TITLE IN CAPS", "hook": "First sentence hook max 15 wor
           }
         ],
         temperature: 0.8,
-        max_tokens: 1024
-      });
+        max_tokens: 2048
+      }, input.model);
       const parsed = inworldParseJSON(response);
       return z2.object({
         title: z2.string(),
@@ -1911,7 +1942,7 @@ Return: { "title": "HOOK TITLE IN CAPS", "hook": "First sentence hook max 15 wor
     apiKey: z2.string().min(1, "Inworld API key is required")
   })).mutation(async ({ input }) => {
     try {
-      const { response, modelUsed } = await inworldChatResilient({
+      const { response, modelUsed } = await inworldAnswer({
         model: aiModel(input.model),
         apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
         messages: [
@@ -1926,8 +1957,8 @@ Return: { "summary": "2-3 sentence summary", "category": "education|entertainmen
           }
         ],
         temperature: 0.3,
-        max_tokens: 1024
-      });
+        max_tokens: 2048
+      }, input.model);
       const parsed = inworldParseJSON(response);
       return z2.object({
         summary: z2.string(),
