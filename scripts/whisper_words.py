@@ -12,7 +12,13 @@ Environment:
   WHISPER_MODEL_ARABIC          model for Arabic (does not override Darija)
   WHISPER_MODEL_DARIJA          model for Darija only (default "large-v3-turbo";
                                 "darija-finetune" remains an explicit option)
-  WHISPER_BEAM_SIZE             beam width on the CPU engine (default 5 for Arabic)
+  WHISPER_BEAM_SIZE             beam width (default 1 on the int8 CPU engine,
+                                5 for Arabic elsewhere)
+  WHISPER_CHUNK_SECONDS         longest speech piece sent at once (default 28)
+  WHISPER_DETECT_EACH           "1" re-detects the language in every piece
+                                (slower; for heavily code-switched speech)
+  WHISPER_BATCH                 on the int8 CPU engine, pieces decoded together
+                                per encoder pass (default 0: one at a time)
   WHISPER_THREADS               CPU threads (default 4 for hosted int8, else 2)
   CLIP_MAKER_WHISPER_CPU        "int8" enables faster-whisper on Linux
   CLIP_MAKER_WHISPER_ACCELERATE "0" disables Apple-GPU (MLX) transcription
@@ -246,6 +252,29 @@ class Engine:
         }
 
 
+    def run_batched(self, audio, pieces, batch_size, report=None, **options):
+        """All pieces through the int8 model at once, `batch_size` windows per
+        encoder call. Yields segment dicts with times on the whole recording."""
+        from dataclasses import asdict
+        from faster_whisper import BatchedInferencePipeline
+
+        self.run_int8(audio[:SAMPLE_RATE], **dict(options))  # loads the model
+        pipeline = BatchedInferencePipeline(model=self.int8_model)
+        options.pop("verbose", None)
+        if "logprob_threshold" in options:
+            options["log_prob_threshold"] = options.pop("logprob_threshold")
+        options.setdefault("beam_size", 1)
+        segments, _ = pipeline.transcribe(
+            audio, batch_size=batch_size, vad_filter=False,
+            clip_timestamps=[{"start": a, "end": b} for a, b in pieces], **options,
+        )
+        for segment in segments:
+            item = asdict(segment)
+            if report:
+                report(item["end"])
+            yield item
+
+
 def mlx_checkpoint(checkpoint: Path) -> Path:
     """Converts an OpenAI-format checkpoint to an MLX model directory (cached)."""
     import mlx.core as mx
@@ -376,7 +405,10 @@ def main() -> None:
         # Darija frequently switches to English/French within one sentence.
         # Re-detect per short chunk rather than force those passages into
         # Arabic. An explicitly requested monolingual fine-tune stays Arabic.
-        "language": None if locale in {"auto", "ar-ma"} and not engine.finetune else language,
+        # The language is known by now (asked for, or detected once above).
+        # Re-detecting it in every piece ran the model twice per piece; only
+        # WHISPER_DETECT_EACH=1 does that, for heavily code-switched speech.
+        "language": None if os.environ.get("WHISPER_DETECT_EACH") == "1" and locale in {"auto", "ar-ma"} and not engine.finetune else language,
         "task": "transcribe",
         # Feeding earlier text back in is what turns one mistake into a loop.
         "condition_on_previous_text": False,
@@ -396,19 +428,34 @@ def main() -> None:
         prompt = PROMPTS.get(locale) or PROMPTS.get(language or "")
         if prompt:
             options["initial_prompt"] = prompt
-    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("5" if language == "ar" else "1" if engine.use_int8 else "")
+    # On the server's CPU engine a 5-wide beam cost several times the time of
+    # greedy decoding for little gain with large-v3-turbo; GPU/Metal runs keep
+    # the wider beam for Arabic.
+    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("1" if engine.use_int8 else "5" if language == "ar" else "")
     if beam.isdigit() and int(beam) > 1:
         options["beam_size"] = int(beam)
 
     if spans:
         # Apply speech gating to every model, not just the Darija checkpoint.
-        pieces = speech_chunks(spans, 12.0 if language == "ar" else BLOCK_SECONDS)
+        # Every piece is padded to Whisper's 30-second window, so a 12-second
+        # piece costs as much as a full one. Fill each window instead.
+        pieces = speech_chunks(spans, float(os.environ.get("WHISPER_CHUNK_SECONDS") or 28))
     else:
         points = split_points(duration, spans, BLOCK_SECONDS)
         pieces = list(zip(points, points[1:]))
 
     words, texts = [], []
     report = os.environ.get("CLIP_MAKER_WHISPER_PROGRESS") == "1"
+    batch = int(os.environ.get("WHISPER_BATCH") or 0)
+    if engine.use_int8 and batch > 1 and pieces:
+        # Batched: one encoder pass for several pieces. Same model and
+        # settings; the windows go through together instead of one by one.
+        progress = (lambda t: log(f"clip-maker-progress:{min(1.0, t / duration):.4f}")) if report else None
+        segments = list(engine.run_batched(audio, pieces, batch, progress, **options))
+        before = len(words)
+        collect_words({"segments": segments}, 0.0, duration, words, spans)
+        texts.append(" ".join(w["word"] for w in words[before:]))
+        pieces = []
     for start, end in pieces:
         chunk = audio[int(start * SAMPLE_RATE): int(end * SAMPLE_RATE)]
         if len(chunk) >= SAMPLE_RATE // 5:

@@ -1603,7 +1603,11 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
 }
 var sourceTranscriptionJobs = new Map();
 var runningSourceTranscriptions = 0;
-const SOURCE_IMPORT_BUDGET_MS = 20 * 60_000;
+/* A fixed 20-minute limit failed long videos that were transcribing fine,
+ * just slowly. Instead a job fails when it stops moving for 10 minutes (no
+ * progress report; waiting in the queue does not count), or after 2 hours. */
+const SOURCE_IMPORT_STALL_MS = 10 * 60_000;
+const SOURCE_IMPORT_HARD_CAP_MS = 120 * 60_000;
 var extractRouter = router({
   /**
    * POST /api/trpc/extract.videoInfo
@@ -1641,19 +1645,34 @@ var extractRouter = router({
       controller.abort();
       releaseWait();
     };
-    const deadline = setTimeout(() => {
+    const startedAt = Date.now();
+    let deadline = null;
+    const giveUp = (message) => {
       if (job.result || job.error) return;
-      job.error = "Transcription exceeded 20 minutes. Try a shorter video or select a clip first.";
+      job.error = message;
       controller.abort();
       releaseWait();
-    }, SOURCE_IMPORT_BUDGET_MS);
-    deadline?.unref();
+    };
+    const watch = () => {
+      clearTimeout(deadline);
+      const left = SOURCE_IMPORT_HARD_CAP_MS - (Date.now() - startedAt);
+      deadline = setTimeout(() => {
+        if (Date.now() - startedAt >= SOURCE_IMPORT_HARD_CAP_MS) {
+          return giveUp("Transcription took over 2 hours. Select a shorter part of the video first.");
+        }
+        /* Waiting behind another video's transcription is not being stuck. */
+        if (job.stage === "queued") return watch();
+        giveUp("Transcription stopped making progress. Try again, or select a shorter part of the video first.");
+      }, Math.max(1_000, Math.min(SOURCE_IMPORT_STALL_MS, left)));
+      deadline?.unref?.();
+    };
+    watch();
     sourceTranscriptionJobs.set(id, job);
     runningSourceTranscriptions++;
-    const work = transcribeSource(input, (stage) => { job.stage = stage; }, {
+    const work = transcribeSource(input, (stage) => { job.stage = stage; watch(); }, {
       signal: controller.signal,
       reportMetadata: (value) => { metadata = value; },
-      reportProgress: ({ stage, progress }) => { job.stage = stage; job.progress = progress; }
+      reportProgress: ({ stage, progress }) => { job.stage = stage; job.progress = progress; watch(); }
     }).then((result) => {
       if (!controller.signal.aborted) job.result = result;
     }, (error) => {
