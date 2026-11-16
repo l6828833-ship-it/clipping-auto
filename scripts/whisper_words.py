@@ -29,7 +29,7 @@ import sys
 import tempfile
 
 SAMPLE_RATE = 16000
-BLOCK_SECONDS = 300
+BLOCK_SECONDS = 30
 DARIJA_FINETUNE = "darija-finetune"
 
 # A short prompt in the target script keeps Whisper from drifting into Latin
@@ -164,9 +164,9 @@ class Engine:
         self.torch_model = None
         self.int8_model = None
         self.use_int8 = (
-            sys.platform == "linux" and not self.finetune
+            sys.platform == "linux"
             and os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8"
-            and model_name in whisper._MODELS
+            and (self.finetune or model_name in whisper._MODELS)
         )
         self.threads = int(os.environ.get(
             "WHISPER_THREADS", "4" if os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8" else "2"
@@ -229,8 +229,12 @@ class Engine:
         from faster_whisper import WhisperModel
 
         if self.int8_model is None:
+            source = self.name
+            if self.finetune:
+                from darija_int8 import model_path
+                source = str(model_path())
             self.int8_model = WhisperModel(
-                self.name, device="cpu", compute_type="int8", cpu_threads=self.threads,
+                source, device="cpu", compute_type="int8", cpu_threads=self.threads,
             )
         options.pop("verbose", None)
         if "logprob_threshold" in options:
@@ -386,7 +390,7 @@ def main() -> None:
         prompt = PROMPTS.get(locale) or PROMPTS.get(language or "")
         if prompt:
             options["initial_prompt"] = prompt
-    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("5" if language == "ar" else "")
+    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("1" if engine.use_int8 else "5" if language == "ar" else "")
     if beam.isdigit() and int(beam) > 1:
         options["beam_size"] = int(beam)
 

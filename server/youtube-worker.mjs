@@ -4,7 +4,6 @@ import { rename, rm } from "node:fs/promises";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import express from "express";
-import { hostedSttAvailable } from "./hosted-stt.mjs";
 
 const prefix = "/api/internal/youtube-worker";
 const maxBytes = 28 * 1024 * 1024;
@@ -94,9 +93,9 @@ export function registerYouTubeWorker(app) {
        * behind others used to expire while it was still being downloaded,
        * and its upload then got a 404. */
       job.touch();
-      /* With hosted transcription the worker only fetches the audio; the
-       * server transcribes it. Otherwise the worker may run Whisper itself. */
-      return res.json({ id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: !hostedSttAvailable() });
+      // The Mac worker only supplies blocked downloads. Self-hosted Whisper
+      // runs in the web container, regardless of paid API configuration.
+      return res.json({ id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: false });
     }
     return res.sendStatus(204);
   });

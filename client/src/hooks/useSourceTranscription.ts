@@ -1,6 +1,7 @@
+import { useState } from "react";
 import { trpc } from "@/lib/trpc";
 
-export type SourceTranscriptionStage = "fetching-info" | "checking-captions" | "downloading" | "transcribing";
+export type SourceTranscriptionStage = "queued" | "fetching-info" | "checking-captions" | "downloading" | "transcribing";
 
 type SourceTranscriptionResult = {
   source: "youtube" | "whisper" | "none";
@@ -20,6 +21,7 @@ type SourceTranscriptionResult = {
 export function useSourceTranscription() {
   // The precompiled backend does not expose a generated router type.
   const sourceTrpc = trpc as any;
+  const [progress, setProgress] = useState(0);
   const start = sourceTrpc.extract.startTranscription.useMutation();
   const skip = sourceTrpc.extract.skipTranscription.useMutation();
   const { client } = sourceTrpc.useUtils();
@@ -29,6 +31,7 @@ export function useSourceTranscription() {
     onStage?: (stage: SourceTranscriptionStage) => void,
     onJob?: (id: string) => void,
   ): Promise<SourceTranscriptionResult> {
+    setProgress(0);
     const { id } = await start.mutateAsync(input);
     onJob?.(id);
     const deadline = Date.now() + 30 * 60_000;
@@ -36,10 +39,11 @@ export function useSourceTranscription() {
       const status = await client.extract.transcriptionStatus.query({ id, wait: true });
       if (status.error) throw new Error(status.error);
       if (status.result) return status.result;
+      setProgress(Number(status.progress) || 0);
       onStage?.(status.stage);
       await new Promise(resolve => window.setTimeout(resolve, 250));
     }
     throw new Error("Video analysis timed out. Try a shorter video.");
   }
-  return { transcribe, skip };
+  return { transcribe, skip, progress };
 }

@@ -8,6 +8,7 @@ RUN apt-get update \
 
 COPY scripts/requirements-whisper.txt /tmp/requirements-whisper.txt
 COPY scripts/darija_whisper.py /tmp/darija_whisper.py
+COPY scripts/darija_int8.py /tmp/darija_int8.py
 # Fetch the CPU-only PyTorch wheel from PyTorch. Resolve its dependencies on PyPI.
 RUN python3 -m venv /opt/media-tools \
     && /opt/media-tools/bin/python -m pip install --no-cache-dir --index-url https://pypi.org/simple 'pip==26.3' \
@@ -21,6 +22,8 @@ ENV PATH="/opt/media-tools/bin:${PATH}" XDG_CACHE_HOME=/opt/clip-maker-cache CLI
 RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
     && python3 -c 'from faster_whisper.utils import download_model; download_model("base")' \
     && python3 /tmp/darija_whisper.py \
+    && python3 /tmp/darija_int8.py \
+    && python3 -c 'from faster_whisper.utils import download_model; download_model("small")' \
     && chown -R node:node /opt/clip-maker-cache
 
 COPY package.json package-lock.json ./
@@ -37,7 +40,7 @@ COPY vite.config.ts tsconfig.json drizzle.config.ts ./
 
 RUN npm run build && install -d -o node -g node /app/.data
 
-ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000
+ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000 CLIP_MAKER_HOSTED_STT=0 WHISPER_MODEL_ARABIC=small
 EXPOSE 3000
 USER node
 CMD ["node", "dist/index.js"]

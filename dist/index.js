@@ -5,7 +5,7 @@ import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { totalmem, tmpdir as systemTmpdir } from "os";
-import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
+
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { facePanelCrop, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
 import { OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
@@ -15,6 +15,7 @@ import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } fr
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
+import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile } from "../server/object-storage.mjs";
 import { pipeline as nodePipeline } from "node:stream/promises";
@@ -1149,14 +1150,29 @@ var WHISPER_PYTHON = process.env.WHISPER_PYTHON ?? "python3";
 var WHISPER_SCRIPT = process.env.WHISPER_SCRIPT ?? path3.join(process.cwd(), "scripts", "whisper_words.py");
 var WHISPER_MODEL = process.env.WHISPER_MODEL ?? "base";
 var whisperQueue = Promise.resolve();
-async function localWhisperWords(audioPath, language = "auto", signal) {
-  // Keep PyTorch inference to one process at a time on the shared server.
-  const transcription = whisperQueue.then(() => {
+async function localWhisperWords(audioPath, language = "auto", signal, onProgress = () => {}) {
+  onProgress({ stage: "queued", progress: 0 });
+  const transcription = whisperQueue.then(async () => {
     signal?.throwIfAborted();
-    return promisify(execFile)(
+    onProgress({ stage: "transcribing", progress: 0 });
+    console.log(`[Whisper] Starting self-hosted transcription, language=${language}`);
+    const execution = promisify(execFile)(
       WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
-      { timeout: 36e5, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL" }
+      { timeout: 20 * 60_000, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL",
+        env: { ...process.env, CLIP_MAKER_WHISPER_PROGRESS: "1" } }
     );
+    let pending = "";
+    execution.child.stderr.on("data", chunk => {
+      pending += chunk.toString();
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop().slice(-2000);
+      for (const line of lines) {
+        const match = /^clip-maker-progress:([0-9.]+)$/.exec(line);
+        if (match) onProgress({ stage: "transcribing", progress: Math.min(1, Number(match[1])) });
+        else if (line.startsWith("whisper:") || line.includes("retrying with")) console.log(`[Whisper] ${line}`);
+      }
+    });
+    return execution;
   });
   whisperQueue = transcription.then(() => {}, () => {});
   const { stdout } = await transcription;
@@ -1164,27 +1180,30 @@ async function localWhisperWords(audioPath, language = "auto", signal) {
   const words = (Array.isArray(parsed.words) ? parsed.words : []).filter(
     (w) => w && typeof w.word === "string" && w.word.trim() && Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start
   ).map((w) => ({ word: w.word.trim(), start: w.start, end: w.end }));
-  return { text: typeof parsed.text === "string" ? parsed.text.trim() : "", words };
+  console.log(`[Whisper] Finished self-hosted transcription, ${words.length} timed words`);
+  return { text: typeof parsed.text === "string" ? parsed.text.trim() : "", words, language: parsed.language };
 }
-/**
- * Word-timed transcript for an audio file: the hosted speech API when the
- * server has a key for it, local Whisper otherwise or if the API fails.
- */
-async function transcribeWords(audioPath, language = "auto", signal) {
+async function transcribeWords(audioPath, language = "auto", signal, onProgress) {
   signal?.throwIfAborted();
+  /* Only when CLIP_MAKER_TRANSCRIBE=openai is set (and OPENAI_API_KEY):
+   * seconds instead of minutes, paid per minute of audio. Anything that goes
+   * wrong falls back to the local Whisper below. */
   if (hostedSttAvailable()) {
     try {
-      const hosted = await hostedWords({ audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir(), signal });
+      const hosted = await hostedWords({
+        audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir(), signal,
+        onProgress: onProgress ? (fraction) => onProgress({ stage: "transcribing", progress: Math.min(1, fraction) }) : void 0
+      });
       if (hosted) {
-        console.log(`[STT] Hosted transcription (${hosted.model}): ${hosted.words.length} words.`);
+        console.log(`[STT] OpenAI transcription (${hosted.model}): ${hosted.words.length} words.`);
         return { text: hosted.text, words: hosted.words };
       }
     } catch (error) {
       signal?.throwIfAborted();
-      console.warn("[STT] Hosted transcription failed, using local Whisper:", String(error.message ?? error).slice(0, 300));
+      console.warn("[STT] OpenAI transcription failed, using local Whisper:", String(error.message ?? error).slice(0, 300));
     }
   }
-  return localWhisperWords(audioPath, language, signal);
+  return localWhisperWords(audioPath, language, signal, onProgress);
 }
 var FFMPEG_MISSING = "ffmpeg is not installed on the server. Install it with `winget install Gyan.FFmpeg` (or your package manager) and restart the dev server.";
 function q(value) {
@@ -1361,33 +1380,6 @@ async function tryYouTubeTranscript(url, language, abort) {
     return null;
   }
 }
-async function inworldTranscribe(audioPath, apiKey, language = "en") {
-  const audioBytes = await fs4.readFile(audioPath);
-  const audioB64 = audioBytes.toString("base64");
-  const payload = {
-    transcribeConfig: {
-      modelId: "groq/whisper-large-v3",
-      language,
-      audioEncoding: "MP3"
-    },
-    audioData: { content: audioB64 }
-  };
-  const res = await fetch("https://api.inworld.ai/stt/v1/transcribe", {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => res.statusText);
-    throw new Error(`Inworld STT error ${res.status}: ${errText}`);
-  }
-  const data = await res.json();
-  if (data.error) throw new Error(`STT error: ${data.error.message}`);
-  return data.transcription?.transcript ?? "";
-}
 async function getVideoInfo(url, signal) {
   const source = assertSafeUrl(url);
   const ytDlp = await getYtDlp();
@@ -1461,7 +1453,7 @@ var sourceTranscriptionInput = z.object({
   language: captionLanguageInput,
   allowSpeechToText: z.boolean().default(true)
 });
-async function transcribeSource(input, reportStage = () => {}, { signal, reportMetadata = () => {} } = {}) {
+async function transcribeSource(input, reportStage = () => {}, { signal, reportMetadata = () => {}, reportProgress = () => {} } = {}) {
   const url = assertSafeUrl(input.url);
   let meta = { title: "Untitled", duration: 0, uploader: "" };
   let language = input.language;
@@ -1485,7 +1477,7 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
   /* YouTube's automatic Arabic captions are weak and carry no usable word
    * timings. When this machine can run the large Whisper model (the same RAM
    * rule as scripts/whisper_words.py), Arabic goes straight to Whisper. */
-  const whisperFirst = language === "ar-ma" || (/^ar\b/.test(language) && (hostedSttAvailable() || totalmem() >= 7.5 * 2 ** 30));
+  const whisperFirst = /^ar\b/.test(language);
   const captions = whisperFirst ? null : await tryYouTubeTranscript(url, language, signal);
   if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
@@ -1524,7 +1516,8 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     }
     reportStage("transcribing");
     try {
-      const { text, words } = await transcribeWords(audioPath, language, signal);
+      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, language, signal, reportProgress);
+      if (language === "auto" && detectedLanguage) language = detectedLanguage;
       if (text && words.length) return result("whisper", text, words);
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {
@@ -1538,7 +1531,7 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
 }
 var sourceTranscriptionJobs = new Map();
 var runningSourceTranscriptions = 0;
-const SOURCE_IMPORT_BUDGET_MS = 180_000;
+const SOURCE_IMPORT_BUDGET_MS = 20 * 60_000;
 var extractRouter = router({
   /**
    * POST /api/trpc/extract.videoInfo
@@ -1562,7 +1555,7 @@ var extractRouter = router({
     }
     assertSafeUrl(input.url);
     const id = crypto.randomUUID();
-    const job = { userId: ctx.user.id, stage: "fetching-info", result: null, error: null };
+    const job = { userId: ctx.user.id, stage: "fetching-info", progress: 0, result: null, error: null };
     const controller = new AbortController();
     let metadata = {
       success: true, source: "none", title: "Untitled video", duration: 0, uploader: "",
@@ -1576,15 +1569,19 @@ var extractRouter = router({
       controller.abort();
       releaseWait();
     };
-    const deadline = input.quickImport ? setTimeout(() => job.finishEarly(
-      "Full-video transcription took too long. Choose a clip and Clip Maker can add its captions during export."
-    ), SOURCE_IMPORT_BUDGET_MS) : undefined;
+    const deadline = setTimeout(() => {
+      if (job.result || job.error) return;
+      job.error = "Transcription exceeded 20 minutes. Try a shorter video or select a clip first.";
+      controller.abort();
+      releaseWait();
+    }, SOURCE_IMPORT_BUDGET_MS);
     deadline?.unref();
     sourceTranscriptionJobs.set(id, job);
     runningSourceTranscriptions++;
     const work = transcribeSource(input, (stage) => { job.stage = stage; }, {
       signal: controller.signal,
-      reportMetadata: (value) => { metadata = value; }
+      reportMetadata: (value) => { metadata = value; },
+      reportProgress: ({ stage, progress }) => { job.stage = stage; job.progress = progress; }
     }).then((result) => {
       if (!controller.signal.aborted) job.result = result;
     }, (error) => {
@@ -1623,18 +1620,18 @@ var extractRouter = router({
         new Promise(resolve => { timer = setTimeout(resolve, 12_000); }),
       ]).finally(() => clearTimeout(timer));
     }
-    return { stage: job.stage, result: job.result, error: job.error };
+    return { stage: job.stage, progress: job.progress, result: job.result, error: job.error };
   }),
   /**
    * POST /api/trpc/extract.uploadTranscribe
    * Accepts a base64-encoded audio/video file, extracts audio with ffmpeg,
-   * and transcribes it using Inworld STT.
+   * and transcribes it with self-hosted Whisper.
    * Supports chunking for files longer than ~30 min.
    */
   uploadTranscribe: protectedProcedure.input(z.object({
     fileBase64: z.string().min(1),
     fileName: z.string(),
-    apiKey: z.string().min(1, "Inworld API key is required"),
+    apiKey: z.string().optional(),
     language: z.string().default("en")
   })).mutation(async ({ input }) => {
     const tmpDir = await fs4.mkdtemp(path3.join(os2.tmpdir(), "shortspro-upload-"));
@@ -1652,32 +1649,12 @@ var extractRouter = router({
         `${q(ffmpeg)} -i "${inputPath}" -ar 16000 -ac 1 -b:a 64k "${audioPath}" -y -loglevel error`,
         { timeout: 12e4 }
       );
-      const stat = await fs4.stat(audioPath);
-      const fileSizeMB = stat.size / (1024 * 1024);
-      let transcript = "";
-      if (fileSizeMB <= 15) {
-        transcript = await inworldTranscribe(audioPath, input.apiKey, input.language);
-      } else {
-        const chunkDir = path3.join(tmpDir, "chunks");
-        await fs4.mkdir(chunkDir);
-        const chunkPattern = path3.join(chunkDir, "chunk_%03d.mp3");
-        await execAsync(
-          `${q(ffmpeg)} -i "${audioPath}" -f segment -segment_time 900 -c copy "${chunkPattern}" -loglevel error`,
-          { timeout: 12e4 }
-        );
-        const chunks = (await fs4.readdir(chunkDir)).filter((f) => f.endsWith(".mp3")).sort();
-        const parts = [];
-        for (const chunk of chunks) {
-          const chunkPath = path3.join(chunkDir, chunk);
-          const part = await inworldTranscribe(chunkPath, input.apiKey, input.language);
-          parts.push(part);
-        }
-        transcript = parts.join(" ");
-      }
+      const { text: transcript, words } = await transcribeWords(audioPath, input.language);
       return {
         success: true,
         transcript: transcript.trim(),
-        wordCount: transcript.trim().split(/\s+/).length,
+        wordCount: words.length,
+        words,
         source: "whisper"
       };
     } finally {
@@ -1691,137 +1668,105 @@ var extractRouter = router({
 import { z as z2 } from "zod";
 import { TRPCError as TRPCError3 } from "@trpc/server";
 
-// server/inworld.ts
-/* Overridable so the AI steps can be tested against a local stand-in. */
-var INWORLD_BASE_URL = process.env.INWORLD_BASE_URL || "https://api.inworld.ai";
-/**
- * The model the AI steps use. The app asks for a default; setting
- * CLIP_MAKER_AI_MODEL on the server (an Inworld router id such as
- * "provider/model") overrides it without a code change.
+// server/openai.ts
+/*
+ * The AI steps (finding highlights, writing titles and hooks) call the OpenAI
+ * API directly.
+ *
+ *   OPENAI_API_KEY      the API key (required)
+ *   OPENAI_MODEL        the model, e.g. "gpt-5-mini" (default) or "gpt-5"
+ *   OPENAI_BASE_URL     optional, for a compatible endpoint or a test stand-in
+ *
+ * CLIP_MAKER_AI_MODEL is still read if OPENAI_MODEL is not set; a "provider/"
+ * prefix left over from the old router ("openai/gpt-5") is dropped.
  */
-function aiModel(requested) {
-  return process.env.CLIP_MAKER_AI_MODEL?.trim() || requested;
+var AI_DEFAULT_MODEL = "gpt-5-mini";
+function aiBaseUrl() {
+  return (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
 }
-async function inworldChat(opts) {
-  const res = await fetch(`${INWORLD_BASE_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${opts.apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: opts.model,
+function aiKey() {
+  const key = process.env.OPENAI_API_KEY?.trim();
+  if (!key) throw new Error("OPENAI_API_KEY is not set on the server.");
+  return key;
+}
+/** The model to use. The browser no longer chooses: the server setting decides. */
+function aiModel() {
+  const chosen = process.env.OPENAI_MODEL?.trim() || process.env.CLIP_MAKER_AI_MODEL?.trim() || AI_DEFAULT_MODEL;
+  return chosen.replace(/^openai\//, "");
+}
+/*
+ * Settings a model has refused, learnt from its error replies. Reasoning
+ * models (gpt-5, o-series) refuse a temperature; some models refuse JSON mode.
+ * Each refusal is remembered per model so it is only paid for once.
+ */
+var aiRefused = new Map();
+async function aiChat(opts) {
+  const model = opts.model;
+  const refused = aiRefused.get(model) ?? new Set();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const body = {
+      model,
       messages: opts.messages,
-      temperature: opts.temperature ?? 0.7,
-      max_tokens: opts.max_tokens ?? 2048,
-      ...opts.response_format ? { response_format: opts.response_format } : {}
-    })
-  });
-  if (!res.ok) {
+      max_completion_tokens: opts.max_tokens ?? 2048,
+      ...!refused.has("temperature") && opts.temperature != null ? { temperature: opts.temperature } : {},
+      ...!refused.has("response_format") ? { response_format: { type: "json_object" } } : {},
+      ...process.env.OPENAI_REASONING_EFFORT?.trim() && !refused.has("reasoning_effort") ? { reasoning_effort: process.env.OPENAI_REASONING_EFFORT.trim() } : {}
+    };
+    const res = await fetch(`${aiBaseUrl()}/chat/completions`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${aiKey()}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(24e4)
+    });
+    if (res.ok) {
+      const response = await res.json();
+      return { response, modelUsed: response.model || model };
+    }
     const errText = await res.text().catch(() => res.statusText);
-    throw new Error(`Inworld API error ${res.status}: ${errText}`);
-  }
-  return res.json();
-}
-function isUnsupportedModelError(err) {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /not supported|unknown model|invalid model|model not found|InvalidArgument/i.test(msg);
-}
-async function inworldChatResilient(opts) {
-  try {
-    const response = await inworldChat(opts);
-    return { response, modelUsed: response.model || opts.model, substituted: false };
-  } catch (err) {
-    if (!isUnsupportedModelError(err)) throw err;
-    let available = [];
-    try {
-      available = (await inworldListModels(opts.apiKey)).map((m) => m.id);
-    } catch {
+    const param = res.status === 400 && /"param"\s*:\s*"(temperature|response_format|reasoning_effort)"/.exec(errText)?.[1]
+      || res.status === 400 && ["temperature", "response_format", "reasoning_effort"].find((name) => body[name] !== void 0 && new RegExp(`unsupported[^.]*${name}|${name}[^.]*(not supported|unsupported|does not support)`, "i").test(errText));
+    if (param && !refused.has(param)) {
+      refused.add(param);
+      aiRefused.set(model, refused);
+      continue;
     }
-    const requestedFamily = opts.model.split("/")[0];
-    const alternatives = [
-      // Prefer a live model from the same provider family.
-      ...available.filter((id) => id.startsWith(`${requestedFamily}/`)),
-      // Then anything else the key can see.
-      ...available,
-      // Last resort: let the router choose.
-      "auto"
-    ].filter((id) => id !== opts.model);
-    const tried = /* @__PURE__ */ new Set([opts.model]);
-    for (const candidate of alternatives) {
-      if (tried.has(candidate)) continue;
-      tried.add(candidate);
-      try {
-        const response = await inworldChat({ ...opts, model: candidate });
-        return { response, modelUsed: response.model || candidate, substituted: true };
-      } catch (retryErr) {
-        if (!isUnsupportedModelError(retryErr)) throw retryErr;
-      }
-    }
-    throw err;
+    throw Object.assign(new Error(`OpenAI API error ${res.status}: ${errText.slice(0, 400)}`), { status: res.status });
   }
+  throw new Error("OpenAI API: the request kept being refused.");
 }
 /**
  * Asks the model and makes sure it actually wrote something.
  *
  * A model that thinks before it answers spends part of its token allowance on
- * that thinking. If the allowance runs out first, the reply comes back with no
- * text at all. So an empty reply is asked again with far more room, and if
- * that is empty too (or refused), `fallbackModel` answers instead.
+ * that thinking, and if the allowance runs out first the reply has no text at
+ * all. Such a reply is asked again with four times the room.
  */
-async function inworldAnswer(opts, fallbackModel) {
-  const empty = (result) => !inworldGetContent(result.response).trim();
+async function aiAnswer(opts) {
+  const empty = (result) => !aiContent(result.response).trim();
   const report = (result) => {
     const choice = result.response?.choices?.[0];
-    console.warn(`[Inworld] ${result.modelUsed} returned no text (finish_reason=${choice?.finish_reason ?? "?"}, usage=${JSON.stringify(result.response?.usage ?? null)}).`);
+    console.warn(`[AI] ${result.modelUsed} returned no text (finish_reason=${choice?.finish_reason ?? "?"}, usage=${JSON.stringify(result.response?.usage ?? null)}).`);
   };
-  const roomy = { ...opts, max_tokens: Math.max(32768, (opts.max_tokens ?? 2048) * 4) };
-  /* A model chosen with CLIP_MAKER_AI_MODEL is usually one that thinks first,
-   * and thinking alone has been seen to use a whole 8,192-token allowance. Give
-   * it the larger allowance from the start rather than paying for a wasted
-   * first attempt; if the model refuses that size, ask the normal way. */
-  const chosen = Boolean(fallbackModel) && fallbackModel !== opts.model;
-  let result;
-  if (chosen) {
-    result = await inworldChatResilient(roomy).catch((error) => {
-      console.warn(`[Inworld] ${opts.model} refused the larger allowance: ${String(error?.message ?? error).slice(0, 200)}`);
-      return inworldChatResilient(opts);
-    });
-  } else {
-    result = await inworldChatResilient(opts);
-  }
+  const result = await aiChat(opts);
   if (!empty(result)) return result;
   report(result);
-  if (!chosen) {
-    try {
-      const again = await inworldChatResilient(roomy);
-      if (!empty(again)) return again;
-      report(again);
-    } catch (error) {
-      console.warn(`[Inworld] Retry with a larger allowance failed: ${String(error?.message ?? error).slice(0, 200)}`);
-    }
-  }
-  if (chosen) {
-    console.warn(`[Inworld] Falling back to ${fallbackModel}.`);
-    return inworldChatResilient({ ...opts, model: fallbackModel });
-  }
-  return result;
+  const again = await aiChat({ ...opts, max_tokens: Math.max(32768, (opts.max_tokens ?? 2048) * 4) });
+  if (empty(again)) report(again);
+  return again;
 }
-async function inworldListModels(apiKey) {
-  const res = await fetch(`${INWORLD_BASE_URL}/v1/models`, {
-    headers: { "Authorization": `Basic ${apiKey}` }
-  });
+async function aiListModels() {
+  const res = await fetch(`${aiBaseUrl()}/models`, { headers: { "Authorization": `Bearer ${aiKey()}` }, signal: AbortSignal.timeout(2e4) });
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText);
-    throw new Error(`Inworld models error ${res.status}: ${errText}`);
+    throw new Error(`OpenAI models error ${res.status}: ${errText.slice(0, 300)}`);
   }
   const data = await res.json();
   return data.data ?? [];
 }
-function inworldGetContent(response) {
+function aiContent(response) {
   return response.choices?.[0]?.message?.content ?? "";
 }
-function inworldWasTruncated(response) {
+function aiTruncated(response) {
   const reason = response.choices?.[0]?.finish_reason;
   return reason === "length" || reason === "max_tokens";
 }
@@ -1885,8 +1830,8 @@ function repairTruncatedJson(input) {
   while (open.length > 0) out += open.pop() === "{" ? "}" : "]";
   return out;
 }
-function inworldParseJSON(response) {
-  const raw = inworldGetContent(response).trim();
+function aiParseJSON(response) {
+  const raw = aiContent(response).trim();
   if (!raw) {
     throw new Error("The model returned an empty response. Try again or pick a different model.");
   }
@@ -1906,25 +1851,11 @@ function inworldParseJSON(response) {
     } catch {
     }
   }
-  const hint = inworldWasTruncated(response) ? "The response hit the token limit and was cut off. Try a shorter transcript." : "The model did not return valid JSON.";
+  const hint = aiTruncated(response) ? "The response hit the token limit and was cut off. Try a shorter transcript." : "The model did not return valid JSON.";
   throw new Error(`${hint} Raw output started with: ${raw.slice(0, 120)}`);
 }
 
 // server/routers/gemini.ts
-var INWORLD_GEMINI_MODELS = [
-  "google-ai-studio/gemini-3.1-pro-preview",
-  "google-ai-studio/gemini-3-flash-preview",
-  "google-ai-studio/gemini-2.5-pro",
-  "google-ai-studio/gemini-2.5-flash"
-];
-var INWORLD_POPULAR_MODELS = [
-  ...INWORLD_GEMINI_MODELS,
-  "openai/gpt-4o",
-  "openai/gpt-5.2",
-  "anthropic/claude-opus-4-6",
-  "anthropic/claude-sonnet-4-6",
-  "auto"
-];
 var HighlightSchema = z2.object({
   id: z2.coerce.number().optional(),
   title: z2.string(),
@@ -1966,27 +1897,15 @@ function titleLanguageInstruction(language, sourceText = "") {
 var geminiRouter = router({
   /**
    * GET /api/trpc/gemini.models
-   * Lists all available models from the Inworld AI Router.
-   * Falls back to a curated list if no API key is provided.
+   * The model the server uses (OPENAI_MODEL).
    */
-  models: publicProcedure.input(z2.object({ apiKey: z2.string().optional() })).query(async ({ input }) => {
-    const resolvedKey = input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY;
-    if (!resolvedKey) {
-      return INWORLD_POPULAR_MODELS.map((id) => ({ id, provider: id.split("/")[0] ?? "inworld" }));
-    }
-    try {
-      const models = await inworldListModels(resolvedKey);
-      return models.map((m) => ({
-        id: m.id,
-        provider: m.id.includes("/") ? m.id.split("/")[0] : "inworld"
-      }));
-    } catch {
-      return INWORLD_POPULAR_MODELS.map((id) => ({ id, provider: id.split("/")[0] ?? "inworld" }));
-    }
+  models: publicProcedure.input(z2.object({ apiKey: z2.string().optional() })).query(async () => {
+    /* One model, chosen on the server with OPENAI_MODEL. */
+    return [{ id: aiModel(), provider: "openai" }];
   }),
   /**
    * POST /api/trpc/gemini.detectHighlights
-   * Sends a video transcript to the selected Inworld model (default: Gemini)
+   * Sends a video transcript to the OpenAI model set in OPENAI_MODEL
    * and returns the top 5 most viral/engaging clip suggestions.
    */
   detectHighlights: protectedProcedure.input(z2.object({
@@ -1998,7 +1917,7 @@ var geminiRouter = router({
     videoDuration: z2.number().optional(),
     titleLanguage: titleLanguageInput,
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
-    apiKey: z2.string().min(1, "Inworld API key is required"),
+    apiKey: z2.string().min(1, "API key placeholder is required"),
     /** Pick candidates for one ranked source instead of five moments from one video. */
     rankingMode: z2.boolean().default(false),
     rank: z2.number().int().min(1).max(99).optional(),
@@ -2052,9 +1971,8 @@ Return exactly this JSON:
 Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTime must be no more than 15 seconds after its startTime.`
       : prompts.user;
     try {
-      const { response, modelUsed, substituted } = await inworldAnswer({
-        model: aiModel(input.model),
-        apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
+      const { response, modelUsed } = await aiAnswer({
+        model: aiModel(),
         messages: [
           { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` },
           { role: "user", content: `${userPrompt}\n\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` }
@@ -2064,12 +1982,9 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         // Headroom so the highlights are never cut off mid-object, and so a
         // model that reasons first still has room left to write them.
         max_tokens: 8192
-      }, input.model);
-      if (substituted) {
-        console.warn(`[Inworld] "${aiModel(input.model)}" is unavailable \u2014 used "${modelUsed}" instead.`);
-      }
-      console.log(`[Inworld] Highlights analysed by ${modelUsed}.`);
-      const parsed = inworldParseJSON(response);
+      });
+      console.log(`[AI] Highlights analysed by ${modelUsed}.`);
+      const parsed = aiParseJSON(response);
       const highlights = [];
       for (const item of parsed.highlights ?? []) {
         const result = HighlightSchema.safeParse(item);
@@ -2098,11 +2013,11 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         highlights: ordered,
         reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : ordered[0].title),
         modelUsed,
-        modelSubstituted: substituted,
+        modelSubstituted: false,
         metadata: response.metadata
       };
     } catch (err) {
-      console.error("[Inworld] detectHighlights error:", err);
+      console.error("[AI] detectHighlights error:", err);
       if (err instanceof TRPCError3) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       throw new TRPCError3({ code: "INTERNAL_SERVER_ERROR", message: `AI analysis failed: ${msg}` });
@@ -2117,7 +2032,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
     titleLanguage: titleLanguageInput,
     style: z2.enum(["tiktok", "youtube", "instagram"]).default("tiktok"),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
-    apiKey: z2.string().min(1, "Inworld API key is required"),
+    apiKey: z2.string().min(1, "API key placeholder is required"),
     /** The source video's title, where the names people search for are. */
     videoTitle: z2.string().max(200).optional()
   })).mutation(async ({ input }) => {
@@ -2125,9 +2040,8 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       const source = input.videoTitle?.trim()
         ? `\n\nThe clip comes from the video "${input.videoTitle.trim()}". Name the guest, host or show from that title in the hook title when the clip is told by or about them, spelled as in the title, rather than "he" or "she", and use them in the hashtags.`
         : "";
-      const { response, modelUsed } = await inworldAnswer({
-        model: aiModel(input.model),
-        apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
+      const { response, modelUsed } = await aiAnswer({
+        model: aiModel(),
         messages: [
           {
             role: "system",
@@ -2144,8 +2058,8 @@ Return: { "title": "HOOK TITLE IN CAPS", "hook": "First sentence hook max 15 wor
         ],
         temperature: 0.8,
         max_tokens: 2048
-      }, input.model);
-      const parsed = inworldParseJSON(response);
+      });
+      const parsed = aiParseJSON(response);
       return z2.object({
         title: z2.string(),
         hook: z2.string(),
@@ -2165,12 +2079,11 @@ Return: { "title": "HOOK TITLE IN CAPS", "hook": "First sentence hook max 15 wor
   analyzeTranscript: protectedProcedure.input(z2.object({
     transcript: z2.string().min(10),
     model: z2.string().default("google-ai-studio/gemini-3-flash-preview"),
-    apiKey: z2.string().min(1, "Inworld API key is required")
+    apiKey: z2.string().min(1, "API key placeholder is required")
   })).mutation(async ({ input }) => {
     try {
-      const { response, modelUsed } = await inworldAnswer({
-        model: aiModel(input.model),
-        apiKey: (input.apiKey && input.apiKey !== "server" ? input.apiKey : process.env.INWORLD_API_KEY || input.apiKey),
+      const { response, modelUsed } = await aiAnswer({
+        model: aiModel(),
         messages: [
           { role: "system", content: "You are a content analyst. Return ONLY JSON, no markdown." },
           {
@@ -2184,8 +2097,8 @@ Return: { "summary": "2-3 sentence summary", "category": "education|entertainmen
         ],
         temperature: 0.3,
         max_tokens: 2048
-      }, input.model);
-      const parsed = inworldParseJSON(response);
+      });
+      const parsed = aiParseJSON(response);
       return z2.object({
         summary: z2.string(),
         category: z2.string(),
@@ -2202,12 +2115,14 @@ Return: { "summary": "2-3 sentence summary", "category": "education|entertainmen
   }),
   /**
    * POST /api/trpc/gemini.testConnection
-   * Tests the Inworld API key and returns available model count.
+   * Checks the server's OpenAI key and that it can use OPENAI_MODEL.
    */
-  testConnection: publicProcedure.input(z2.object({ apiKey: z2.string().min(1) })).mutation(async ({ input }) => {
+  testConnection: publicProcedure.input(z2.object({ apiKey: z2.string().optional() }).optional()).mutation(async () => {
     try {
-      const models = await inworldListModels(input.apiKey);
-      return { success: true, modelCount: models.length, message: `Connected! ${models.length} models available.` };
+      const models = await aiListModels();
+      const model = aiModel();
+      const found = models.some((m) => m.id === model);
+      return { success: found, modelCount: models.length, message: found ? `Connected. Using ${model}.` : `Connected, but this key cannot use the model "${model}". Check OPENAI_MODEL.` };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { success: false, modelCount: 0, message: msg };
@@ -2389,7 +2304,7 @@ function buildClipCaptions(input) {
 // server/stt.ts
 import { promises as fs5 } from "fs";
 import path4 from "path";
-var INWORLD_STT_URL = "https://api.inworld.ai/stt/v1/transcribe";
+
 var SttError = class extends Error {
 };
 var MAX_AUDIO_MB = 15;
@@ -2474,47 +2389,7 @@ function extractText(payload) {
   return typeof hit === "string" ? hit.trim() : "";
 }
 async function transcribeAudio(opts) {
-  const audio = await fs5.readFile(opts.audioPath);
-  const res = await fetch(INWORLD_STT_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${opts.apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      transcribeConfig: {
-        modelId: "groq/whisper-large-v3",
-        language: opts.language ?? "en",
-        audioEncoding: "MP3",
-        // Ask for word timings. Harmless if the provider ignores it.
-        enableWordTimeOffsets: true,
-        enableWordTimestamps: true,
-        timestampGranularities: ["word", "segment"]
-      },
-      audioData: { content: audio.toString("base64") }
-    })
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => res.statusText);
-    throw new SttError(`Inworld STT error ${res.status}: ${detail.slice(0, 300)}`);
-  }
-  const payload = await res.json();
-  const text2 = extractText(payload);
-  const rawWords = extractWords(payload);
-  if (opts.debugShape) {
-    const top = payload && typeof payload === "object" ? Object.keys(payload) : [];
-    const inner = payload?.transcription;
-    console.log(
-      `[STT] response keys=[${top.join(",")}] transcription keys=[${inner && typeof inner === "object" ? Object.keys(inner).join(",") : "-"}] words found=${rawWords.length}`
-    );
-  }
-  const offset = opts.offsetSeconds ?? 0;
-  const words = rawWords.map((w) => ({
-    word: w.word,
-    start: w.start + offset,
-    end: w.end + offset
-  }));
-  return { text: text2, words, timed: words.length > 0 };
+  return transcribeWords(opts.audioPath, opts.language ?? "auto");
 }
 async function cleanupAudio(audioPath) {
   await fs5.rm(path4.dirname(audioPath), { recursive: true, force: true }).catch(() => {
@@ -4214,7 +4089,7 @@ var appRouter = router({
       captionLanguage: captionLanguageInput,
       /**
        * Whether this video should have subtitles at all. Off skips every
-       * speech-to-text call, so no Inworld credits are spent, and can be
+       * speech-to-text call, so no AI credits are spent, and can be
        * switched on later to transcribe on demand.
        */
       transcriptionEnabled: z4.boolean().default(true)

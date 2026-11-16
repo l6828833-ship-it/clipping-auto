@@ -96,7 +96,8 @@ const STAGE_LABELS: Record<Stage, string> = {
   "fetching-info": "Fetching video info…",
   "checking-captions": "Checking for YouTube captions…",
   downloading: "Downloading source audio…",
-  transcribing: "Transcribing the audio…",
+  queued: "Waiting for the current transcription to finish…",
+  transcribing: "Transcribing with local Whisper…",
   uploading: "Uploading and preparing your file…",
   saving: "Saving your video…",
   done: "Transcript ready!",
@@ -104,7 +105,7 @@ const STAGE_LABELS: Record<Stage, string> = {
 };
 const STAGE_PROGRESS: Record<Stage, number> = {
   idle: 0, "fetching-info": 15, "checking-captions": 35, downloading: 55,
-  transcribing: 75, uploading: 0, saving: 95, done: 100, error: 0,
+  queued: 60, transcribing: 75, uploading: 0, saving: 95, done: 100, error: 0,
 };
 
 // ─── Step bar ─────────────────────────────────────────────────────────────────
@@ -190,7 +191,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     onError: (err) => toast.error(err.message),
   });
 
-  const { transcribe: transcribeSource, skip: skipTranscription } = useSourceTranscription();
+  const { transcribe: transcribeSource, skip: skipTranscription, progress: transcriptionProgress } = useSourceTranscription();
 
   /** Set when transcription came back empty, so the person can go on without it. */
   const [noTranscript, setNoTranscript] = useState(false);
@@ -504,11 +505,11 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
           <div className="glass rounded-2xl p-5 space-y-3">
             <div className="flex items-center gap-3">
               <Loader2 className="w-4 h-4 animate-spin shrink-0" style={{ color: "var(--cobalt)" }} />
-              <span className="text-sm font-semibold text-foreground">{STAGE_LABELS[stage]}</span>
+              <span className="text-sm font-semibold text-foreground">{STAGE_LABELS[stage]}{stage === "transcribing" && transcriptionProgress > 0 ? ` ${Math.round(transcriptionProgress * 100)}%` : ""}</span>
             </div>
             {stage !== "uploading" && <><div className="h-2 rounded-full bg-secondary overflow-hidden">
               <div className="h-full rounded-full transition-all duration-700"
-                style={{ width: `${progress}%`, background: "linear-gradient(90deg, var(--cobalt), var(--coral))" }} />
+                style={{ width: `${stage === "transcribing" ? 60 + transcriptionProgress * 35 : progress}%`, background: "linear-gradient(90deg, var(--cobalt), var(--coral))" }} />
             </div>
             <div className="flex items-center gap-4 text-xs text-muted-foreground">
               {[

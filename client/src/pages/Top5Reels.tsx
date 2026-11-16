@@ -35,6 +35,8 @@ type RankEntry = {
   rank: number;
   url: string;
   sourceTitle: string;
+  language?: string;
+  analysisProgress?: string;
   videoId?: number;
   duration?: number;
   transcript?: string;
@@ -463,9 +465,9 @@ export default function Top5ReelsPage() {
     try {
       const source = await transcribeSource({
         url: entry.url.trim(),
-        language: "auto",
+        language: entry.language || "auto",
         allowSpeechToText: true,
-      });
+      }, stage => patchRank(rank, { analysisProgress: stage === "queued" ? "Waiting for Whisper…" : stage === "transcribing" ? "Transcribing with local Whisper…" : "Preparing source audio…" }));
       const sourceTitle = source.title || `Rank ${rank} source`;
       const transcript = String(source.transcript || "").trim();
       if (transcript.length < 10) {
@@ -481,6 +483,7 @@ export default function Top5ReelsPage() {
         rankingMode: true,
         rank,
         sourceTitle,
+        titleLanguage: entry.language || source.language || "auto",
       });
       const candidates: Candidate[] = (analysis.highlights || []).slice(0, 3).map((candidate: Candidate) => limitToShortClip(candidate, source.duration));
       if (!candidates.length) throw new Error("The AI did not return a usable highlight from this source.");
@@ -498,6 +501,7 @@ export default function Top5ReelsPage() {
         duration: fullDuration || undefined,
         transcriptWords: source.words?.length ? source.words : undefined,
         transcriptionEnabled: true,
+        captionLanguage: entry.language || source.language || "auto",
       });
       patchRank(rank, {
         videoId: created.id,
@@ -765,11 +769,21 @@ export default function Top5ReelsPage() {
                             <Link2 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                             <input value={entry.url} onFocus={() => setActiveRank(entry.rank)} onChange={(event) => patchRank(entry.rank, { url: event.target.value, state: "idle", candidates: [], selectedId: undefined, clipId: undefined, clipUrl: undefined, hostedUrl: undefined, error: undefined })} placeholder="Paste YouTube, TikTok, or X video link" className="w-full rounded-xl border border-border bg-input py-2.5 pl-9 pr-3 text-sm text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20" />
                           </div>
+                          <select aria-label={`Spoken language for rank ${entry.rank}`} value={entry.language || "auto"}
+                            disabled={entry.state === "analyzing"} onChange={event => patchRank(entry.rank, { language: event.target.value })}
+                            className="rounded-xl border border-border bg-input px-2 text-xs">
+                            <option value="auto">Auto-detect language</option>
+                            <option value="ar-ma">Moroccan Darija</option>
+                            <option value="ar">Arabic</option>
+                            <option value="en">English</option>
+                            <option value="fr">French</option>
+                          </select>
                           <button type="button" onClick={() => analyseRank(entry.rank)} disabled={!entry.url.trim() || entry.state === "analyzing"} className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-secondary px-3 py-2 text-xs font-bold text-foreground transition hover:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-50">
                             {entry.state === "analyzing" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />} Analyse
                           </button>
                         </div>
                         {entry.sourceTitle && <p className="mt-2 truncate text-xs font-semibold text-foreground">{entry.sourceTitle}{entry.duration ? <span className="font-normal text-muted-foreground"> · {timecode(entry.duration)}</span> : null}</p>}
+                        {entry.state === "analyzing" && <p className="text-xs text-muted-foreground">{entry.analysisProgress || "Preparing source…"}</p>}
                         {entry.error && <p className="mt-2 text-xs text-destructive">{entry.error}</p>}
                       </div>
                     </div>

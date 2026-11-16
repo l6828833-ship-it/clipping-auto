@@ -1,5 +1,6 @@
 openai-whisper==20250625
 faster-whisper==1.2.1
 safetensors==0.7.0
+transformers==4.57.6
 # Face detection for AI reframing (scripts/auto_frame.py).
 onnxruntime==1.31.1
