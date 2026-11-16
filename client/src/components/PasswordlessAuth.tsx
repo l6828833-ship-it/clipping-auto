@@ -3,6 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, Loader2, MailCheck, Zap } from "lucide-react";
 import { useRedirectIfAuth } from "@/hooks/useCustomAuth";
 
+const googleButton = new URL("../assets/sign-in-with-google.png", import.meta.url).href;
+
 export function AuthOptions({ children }: { children: ReactNode }) {
   const config = useQuery({
     queryKey: ["auth-options"],
@@ -31,7 +33,8 @@ function PasswordlessAuth({ site }: { site: string }) {
   const [isSending, setIsSending] = useState(false);
   const callback = new URLSearchParams(window.location.search).get("auth");
   const [error, setError] = useState(
-    callback === "email" ? "That link has expired or was already used. Enter your email to get a new one." : "",
+    callback === "email" ? "That link has expired or was already used. Enter your email to get a new one."
+      : callback === "google" ? "Google sign-in couldn’t finish. Try again." : "",
   );
   const canonical = window.location.origin === site;
 
@@ -103,33 +106,40 @@ function PasswordlessAuth({ site }: { site: string }) {
               </button>
             </div>
           ) : (
-            <form onSubmit={sendLink} className="space-y-4">
-              <div className="space-y-2">
-                <label className="block text-sm font-medium" htmlFor="signin-email">Email address</label>
-                <input
-                  id="signin-email"
-                  type="email"
-                  autoComplete="email"
-                  autoFocus
-                  maxLength={320}
-                  required
-                  value={email}
-                  onChange={event => setEmail(event.target.value)}
-                  placeholder="you@example.com"
-                  className="w-full px-4 py-3 rounded-xl bg-input border border-border placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
-                />
+            <>
+              <a href="/api/auth/google" className="flex w-fit mx-auto rounded-full hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-4">
+                <img src={googleButton} className="h-10 w-auto" alt="Sign in with Google" />
+              </a>
+              <div className="flex items-center gap-3 text-xs text-muted-foreground" aria-hidden="true">
+                <span className="h-px flex-1 bg-border" /> or <span className="h-px flex-1 bg-border" />
               </div>
-              <button
-                type="submit"
-                disabled={isSending}
-                className="w-full flex items-center justify-center gap-2 py-3 px-6 rounded-full font-bold text-sm text-white hover:opacity-90 disabled:opacity-50 glow-blue"
-                style={{ background: "var(--cobalt)" }}
-              >
-                {isSending
-                  ? <><Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Sending…</>
-                  : <>Continue with email <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
-              </button>
-            </form>
+              <form onSubmit={sendLink} className="space-y-4">
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium" htmlFor="signin-email">Email address</label>
+                  <input
+                    id="signin-email"
+                    type="email"
+                    autoComplete="email"
+                    maxLength={320}
+                    required
+                    value={email}
+                    onChange={event => setEmail(event.target.value)}
+                    placeholder="you@example.com"
+                    className="w-full px-4 py-3 rounded-xl bg-input border border-border placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={isSending}
+                  className="w-full flex items-center justify-center gap-2 py-3 px-6 rounded-full font-bold text-sm text-white hover:opacity-90 disabled:opacity-50 glow-blue"
+                  style={{ background: "var(--cobalt)" }}
+                >
+                  {isSending
+                    ? <><Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Sending…</>
+                    : <>Continue with email <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
+                </button>
+              </form>
+            </>
           )}
           {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
         </div>

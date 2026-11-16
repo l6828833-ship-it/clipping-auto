@@ -5,6 +5,7 @@ import { z } from "zod";
 
 const prefix = "/api/auth";
 const emailCallback = `${prefix}/email/confirm`;
+const googleCallback = `${prefix}/google/callback`;
 const emailAddress = z.string().trim().toLowerCase().max(320).email();
 const supabaseUser = z.object({
   id: z.string().uuid(),
@@ -69,6 +70,19 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
   const cookieOptions = { httpOnly: true, secure, sameSite: "lax", path: "/" };
   const cookieName = method => `${secure ? "__Host-" : ""}clip-maker-${method}-pkce`;
 
+  app.get(`${prefix}/google`, (_req, res) => {
+    const verifier = randomBytes(32).toString("base64url");
+    const url = new URL(`${config.url}/auth/v1/authorize`);
+    url.search = new URLSearchParams({
+      provider: "google",
+      redirect_to: `${config.site}${googleCallback}`,
+      code_challenge: challengeFor(verifier),
+      code_challenge_method: "s256",
+    }).toString();
+    res.cookie(cookieName("google"), verifier, { ...cookieOptions, maxAge: 10 * 60 * 1000 });
+    return res.redirect(303, url.href);
+  });
+
   app.post(`${prefix}/email`, express.json({ limit: "2kb" }), async (req, res) => {
     // The reverse proxy can rewrite Host. Origin identifies the browser page making this request.
     if (req.get("origin") !== config.site) return res.sendStatus(403);
@@ -105,29 +119,34 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
    *   Supabase first. That code is only good together with the cookie set when
    *   the link was requested, so it works only in the browser that asked.
    */
-  app.get(emailCallback, async (req, res) => {
-    const failed = "/login?auth=email";
-    const { code, token_hash: tokenHash, error: providerError } = req.query;
-    if (providerError) return res.redirect(303, failed);
-    try {
-      let session;
-      if (typeof tokenHash === "string" && /^[A-Za-z0-9_-]{16,256}$/.test(tokenHash)) {
-        session = await supabasePost(config, "/verify", { type: "email", token_hash: tokenHash });
-      } else {
-        const verifier = parse(req.headers.cookie ?? "")[cookieName("email")];
-        if (typeof code !== "string" || !code || code.length > 256 || !verifier || !/^[A-Za-z0-9_-]{43}$/.test(verifier)) {
-          return res.redirect(303, failed);
+  function finishSignIn(method) {
+    return async (req, res) => {
+      const failed = `/login?auth=${method}`;
+      const { code, token_hash: tokenHash, error: providerError } = req.query;
+      if (providerError) return res.redirect(303, failed);
+      try {
+        let session;
+        if (method === "email" && typeof tokenHash === "string" && /^[A-Za-z0-9_-]{16,256}$/.test(tokenHash)) {
+          session = await supabasePost(config, "/verify", { type: "email", token_hash: tokenHash });
+        } else {
+          const verifier = parse(req.headers.cookie ?? "")[cookieName(method)];
+          if (typeof code !== "string" || !code || code.length > 256 || !verifier || !/^[A-Za-z0-9_-]{43}$/.test(verifier)) {
+            return res.redirect(303, failed);
+          }
+          session = await supabasePost(config, "/token?grant_type=pkce", { auth_code: code, code_verifier: verifier });
         }
-        session = await supabasePost(config, "/token?grant_type=pkce", { auth_code: code, code_verifier: verifier });
+        const identity = supabaseUser.parse(session.user);
+        const account = await linkUser(identity, method);
+        await setSession(req, res, account, secure);
+        res.clearCookie(cookieName(method), cookieOptions);
+        return res.redirect(303, "/dashboard");
+      } catch (error) {
+        console.warn("[Auth] Could not complete sign-in", method, error.status ?? error.name);
+        return res.redirect(303, failed);
       }
-      const identity = supabaseUser.parse(session.user);
-      const account = await linkUser(identity, "email");
-      await setSession(req, res, account, secure);
-      res.clearCookie(cookieName("email"), cookieOptions);
-      return res.redirect(303, "/dashboard");
-    } catch (error) {
-      console.warn("[Auth] Could not complete email sign-in", error.status ?? error.name);
-      return res.redirect(303, failed);
-    }
-  });
+    };
+  }
+
+  app.get(emailCallback, finishSignIn("email"));
+  app.get(googleCallback, finishSignIn("google"));
 }

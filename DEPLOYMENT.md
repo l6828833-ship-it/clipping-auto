@@ -16,9 +16,9 @@ The project root contains a Dockerfile that builds the Vite website and starts t
 5. For a fresh database, run `npm run db:migrate` once with `DATABASE_URL` set before creating web accounts. For an existing deployment, check its Drizzle migration history before running migrations.
 6. Open the assigned HTTPS URL and test web sign-in, video import, and clip export. Then set the Xcode target’s `CLIP_MAKER_SERVICE_URL` to that HTTPS origin. The iOS YouTube flow does not require a Clip Maker account.
 
-### Sign-in by email link
+### Sign-in with Google or an email link
 
-Sign-in is passwordless: a person enters their email and opens the link they are sent. Supabase Auth project `zmlrtyzrwmhbydcidpku` sends and checks the links; Clip Maker accounts and media records stay in the existing `DATABASE_URL`. No SQL migration is needed. There is no Google or password sign-in while this is on.
+Users can sign in with Google or request a link by email. Supabase Auth project `zmlrtyzrwmhbydcidpku` handles sign-in. Clip Maker accounts and media records use the existing `DATABASE_URL`.
 
 1. **Runtime variables** (already set if email links are being sent). Use the **Publishable key** from Supabase and keep the existing `JWT_SECRET`.
 
@@ -28,7 +28,7 @@ Sign-in is passwordless: a person enters their email and opens the link they are
    | `CLIP_MAKER_AUTH_SUPABASE_KEY` | The project's `sb_publishable_…` key |
    | `CLIP_MAKER_AUTH_SITE_URL` | `https://clip-maker.com` |
 
-2. **Supabase Auth → URL Configuration.** Site URL `https://clip-maker.com`; allow `https://clip-maker.com/api/auth/email/confirm` as a redirect URL.
+2. In **Supabase Auth → URL Configuration**, set the site URL to `https://clip-maker.com`. Allow `https://clip-maker.com/api/auth/email/confirm` and `https://clip-maker.com/api/auth/google/callback`. Enable Google under **Sign In / Providers** with the Clip Maker web OAuth client. [Supabase Google setup](https://supabase.com/docs/guides/auth/social-sign-in/auth-google)
 
 3. **Send from clip-maker.com.** Without a custom SMTP server Supabase sends from `noreply@mail.app.supabase.io`, only a few emails an hour. In Supabase Auth → Emails → SMTP Settings, enable custom SMTP. With Cloudflare Email Service (the domain must use Cloudflare DNS, and sending to any recipient needs the Workers Paid plan):
 
