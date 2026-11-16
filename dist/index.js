@@ -1724,17 +1724,33 @@ async function inworldAnswer(opts, fallbackModel) {
     const choice = result.response?.choices?.[0];
     console.warn(`[Inworld] ${result.modelUsed} returned no text (finish_reason=${choice?.finish_reason ?? "?"}, usage=${JSON.stringify(result.response?.usage ?? null)}).`);
   };
-  let result = await inworldChatResilient(opts);
+  const roomy = { ...opts, max_tokens: Math.max(32768, (opts.max_tokens ?? 2048) * 4) };
+  /* A model chosen with CLIP_MAKER_AI_MODEL is usually one that thinks first,
+   * and thinking alone has been seen to use a whole 8,192-token allowance. Give
+   * it the larger allowance from the start rather than paying for a wasted
+   * first attempt; if the model refuses that size, ask the normal way. */
+  const chosen = Boolean(fallbackModel) && fallbackModel !== opts.model;
+  let result;
+  if (chosen) {
+    result = await inworldChatResilient(roomy).catch((error) => {
+      console.warn(`[Inworld] ${opts.model} refused the larger allowance: ${String(error?.message ?? error).slice(0, 200)}`);
+      return inworldChatResilient(opts);
+    });
+  } else {
+    result = await inworldChatResilient(opts);
+  }
   if (!empty(result)) return result;
   report(result);
-  try {
-    const roomier = await inworldChatResilient({ ...opts, max_tokens: Math.max(32e3, (opts.max_tokens ?? 2048) * 4) });
-    if (!empty(roomier)) return roomier;
-    report(roomier);
-  } catch (error) {
-    console.warn(`[Inworld] Retry with a larger allowance failed: ${String(error?.message ?? error).slice(0, 200)}`);
+  if (!chosen) {
+    try {
+      const again = await inworldChatResilient(roomy);
+      if (!empty(again)) return again;
+      report(again);
+    } catch (error) {
+      console.warn(`[Inworld] Retry with a larger allowance failed: ${String(error?.message ?? error).slice(0, 200)}`);
+    }
   }
-  if (fallbackModel && fallbackModel !== opts.model) {
+  if (chosen) {
     console.warn(`[Inworld] Falling back to ${fallbackModel}.`);
     return inworldChatResilient({ ...opts, model: fallbackModel });
   }
@@ -3994,7 +4010,7 @@ var appRouter = router({
       email: z4.string().email("Invalid email address"),
       password: z4.string().min(8, "Password must be at least 8 characters")
     })).mutation(async ({ input, ctx }) => {
-      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Use Google or an email sign-in link." });
+      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Sign in with the link we email you." });
       const existing = await getUserByEmail(input.email);
       if (existing) throw new TRPCError5({ code: "CONFLICT", message: "Email already in use" });
       const passwordHash = await bcrypt.hash(input.password, 12);
@@ -4020,7 +4036,7 @@ var appRouter = router({
       email: z4.string().email(),
       password: z4.string().min(1)
     })).mutation(async ({ input, ctx }) => {
-      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Use Google or an email sign-in link." });
+      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Sign in with the link we email you." });
       const user = await getUserByEmail(input.email, { passwordOnly: true });
       if (!user || !user.passwordHash) throw new TRPCError5({ code: "UNAUTHORIZED", message: "Invalid email or password" });
       const valid = await bcrypt.compare(input.password, user.passwordHash);

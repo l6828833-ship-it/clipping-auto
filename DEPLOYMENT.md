@@ -16,14 +16,11 @@ The project root contains a Dockerfile that builds the Vite website and starts t
 5. For a fresh database, run `npm run db:migrate` once with `DATABASE_URL` set before creating web accounts. For an existing deployment, check its Drizzle migration history before running migrations.
 6. Open the assigned HTTPS URL and test web sign-in, video import, and clip export. Then set the Xcode target’s `CLIP_MAKER_SERVICE_URL` to that HTTPS origin. The iOS YouTube flow does not require a Clip Maker account.
 
-### Google sign-in and email links
+### Sign-in by email link
 
-Use the Supabase Auth project `zmlrtyzrwmhbydcidpku` for sign-in. Continue using the existing `DATABASE_URL` to store Clip Maker accounts and media records. No SQL migration is needed.
+Sign-in is passwordless: a person enters their email and opens the link they are sent. Supabase Auth project `zmlrtyzrwmhbydcidpku` sends and checks the links; Clip Maker accounts and media records stay in the existing `DATABASE_URL`. No SQL migration is needed. There is no Google or password sign-in while this is on.
 
-1. In Supabase Auth → URL Configuration, set the Site URL to `https://clip-maker.com`. Allow `https://clip-maker.com/api/auth/google/callback` and `https://clip-maker.com/api/auth/email/confirm` as redirect URLs.
-2. Create a Google OAuth **Web application** client with the authorized redirect URI `https://zmlrtyzrwmhbydcidpku.supabase.co/auth/v1/callback`. In Supabase Auth → Sign In / Providers → Google, save the client ID and client secret, then enable Google. Configure the Google client for the intended audience. [Supabase Google setup](https://supabase.com/docs/guides/auth/social-sign-in/auth-google)
-3. In Supabase Auth → Emails, configure a custom SMTP sender and keep the email provider, email confirmation, and new sign-ups enabled. Use the default confirmation and magic link templates with `{{ .ConfirmationURL }}`. [Supabase SMTP setup](https://supabase.com/docs/guides/auth/auth-smtp)
-4. After both providers are ready, add these three runtime variables together and redeploy. Use the **Publishable key** from Supabase and keep the existing `JWT_SECRET`.
+1. **Runtime variables** (already set if email links are being sent). Use the **Publishable key** from Supabase and keep the existing `JWT_SECRET`.
 
    | Variable | Value |
    | --- | --- |
@@ -31,16 +28,39 @@ Use the Supabase Auth project `zmlrtyzrwmhbydcidpku` for sign-in. Continue using
    | `CLIP_MAKER_AUTH_SUPABASE_KEY` | The project's `sb_publishable_…` key |
    | `CLIP_MAKER_AUTH_SITE_URL` | `https://clip-maker.com` |
 
-5. Test Google and an email link to an inbox outside the Supabase team. Open the email link in the browser where it was requested. Existing users should use the email already on their Clip Maker account to keep access to their projects. Sign-in matches one verified identity to the existing account and retires that account's previous sessions.
+2. **Supabase Auth → URL Configuration.** Site URL `https://clip-maker.com`; allow `https://clip-maker.com/api/auth/email/confirm` as a redirect URL.
+
+3. **Send from clip-maker.com.** Without a custom SMTP server Supabase sends from `noreply@mail.app.supabase.io`, only a few emails an hour. In Supabase Auth → Emails → SMTP Settings, enable custom SMTP. With Cloudflare Email Service (the domain must use Cloudflare DNS, and sending to any recipient needs the Workers Paid plan):
+
+   | Setting | Value |
+   | --- | --- |
+   | Sender email | `login@clip-maker.com` |
+   | Sender name | `Clip Maker` |
+   | Host | `smtp.mx.cloudflare.net` |
+   | Port | `465` |
+   | Username | `api_token` |
+   | Password | A Cloudflare API token with the **Email Sending: Edit** permission |
+
+   First onboard the domain in the Cloudflare dashboard under Compute → Email Service → Email Sending → Onboard Domain; Cloudflare adds the SPF, DKIM and DMARC records itself. [Cloudflare SMTP reference](https://developers.cloudflare.com/email-service/api/send-emails/smtp/). Any other SMTP provider works the same way with its own host and credentials. [Supabase SMTP setup](https://supabase.com/docs/guides/auth/auth-smtp)
+
+4. **Make the link work in any browser.** In Supabase Auth → Emails → Templates, set the link in both the **Confirm signup** and the **Magic Link** template to:
+
+   ```
+   {{ .SiteURL }}/api/auth/email/confirm?token_hash={{ .TokenHash }}&type=email
+   ```
+
+   With Supabase's default `{{ .ConfirmationURL }}` the link still works, but only in the browser that asked for it.
+
+5. Test with an inbox outside the Supabase team. Existing users should use the email already on their Clip Maker account to keep their projects.
 
 ### Cloudflare R2 media storage
 
-Create a private R2 bucket and an **Object Read & Write** token scoped to that bucket. Set these runtime variables in the app's deployment settings. Keep the access key and secret on the server.
+The private R2 bucket `clip-maker-media` already exists in the Cloudflare account. Create an **Object Read & Write** API token scoped to that bucket (R2 → Manage API tokens); it gives the access key ID and secret. Set these runtime variables in the app's deployment settings. Keep the access key and secret on the server.
 
 | Variable | Value |
 | --- | --- |
 | `CLIP_MAKER_S3_ENDPOINT` | The S3 endpoint from the R2 dashboard, such as `https://<account-id>.r2.cloudflarestorage.com` |
-| `CLIP_MAKER_S3_BUCKET` | The bucket name |
+| `CLIP_MAKER_S3_BUCKET` | `clip-maker-media` |
 | `CLIP_MAKER_S3_REGION` | `auto` |
 | `CLIP_MAKER_S3_ACCESS_KEY_ID` | The R2 token's access key ID |
 | `CLIP_MAKER_S3_SECRET_ACCESS_KEY` | The R2 token's secret access key |

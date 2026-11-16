@@ -1,9 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Loader2, Mail, Zap } from "lucide-react";
+import { ArrowRight, Loader2, MailCheck, Zap } from "lucide-react";
 import { useRedirectIfAuth } from "@/hooks/useCustomAuth";
-
-const googleButton = new URL("../assets/sign-in-with-google.png", import.meta.url).href;
 
 export function AuthOptions({ children }: { children: ReactNode }) {
   const config = useQuery({
@@ -33,8 +31,7 @@ function PasswordlessAuth({ site }: { site: string }) {
   const [isSending, setIsSending] = useState(false);
   const callback = new URLSearchParams(window.location.search).get("auth");
   const [error, setError] = useState(
-    callback === "email" ? "This link couldn’t sign you in. Request a new link and open it in this browser."
-      : callback === "google" ? "Google sign-in couldn’t finish. Try again." : "",
+    callback === "email" ? "That link has expired or was already used. Enter your email to get a new one." : "",
   );
   const canonical = window.location.origin === site;
 
@@ -79,54 +76,62 @@ function PasswordlessAuth({ site }: { site: string }) {
             </span>
             Clip Maker
           </div>
-          <h1 className="text-3xl font-bold tracking-tight">Sign in or sign up</h1>
+          <h1 className="text-3xl font-bold tracking-tight">{sentTo ? "Check your email" : "Sign in to Clip Maker"}</h1>
+          {!sentTo && (
+            <p className="text-sm text-muted-foreground mt-2">
+              Enter your email and we’ll send you a link. No password needed. New here? The same link creates your account.
+            </p>
+          )}
         </header>
 
         <div className="glass rounded-2xl p-6 sm:p-8 space-y-5">
           {!canonical ? (
             <a className="text-sm font-semibold underline" href={`${site}/login`}>Continue to Clip Maker</a>
+          ) : sentTo ? (
+            <div role="status" className="text-center space-y-3">
+              <span className="mx-auto w-12 h-12 rounded-full grid place-items-center"
+                style={{ background: "color-mix(in srgb, var(--mint) 15%, transparent)" }}>
+                <MailCheck className="w-6 h-6" style={{ color: "var(--mint)" }} aria-hidden="true" />
+              </span>
+              <p className="text-sm break-words">
+                We sent a sign-in link to <span className="font-semibold">{sentTo}</span>.
+              </p>
+              <p className="text-sm text-muted-foreground">Open the link in the email to continue. It can take a minute to arrive; check your spam folder too.</p>
+              <button type="button" onClick={() => { setSentTo(""); setError(""); }}
+                className="text-sm font-semibold underline" style={{ color: "var(--cobalt)" }}>
+                Use a different email
+              </button>
+            </div>
           ) : (
-            <>
-              <a href="/api/auth/google" className="flex w-fit mx-auto rounded-full hover:opacity-85 focus-visible:outline-2 focus-visible:outline-offset-4">
-                <img src={googleButton} className="h-10 w-auto" alt="Sign in with Google" />
-              </a>
-              <div className="flex items-center gap-3 text-xs text-muted-foreground" aria-hidden="true">
-                <span className="h-px flex-1 bg-border" /> or <span className="h-px flex-1 bg-border" />
+            <form onSubmit={sendLink} className="space-y-4">
+              <div className="space-y-2">
+                <label className="block text-sm font-medium" htmlFor="signin-email">Email address</label>
+                <input
+                  id="signin-email"
+                  type="email"
+                  autoComplete="email"
+                  autoFocus
+                  maxLength={320}
+                  required
+                  value={email}
+                  onChange={event => setEmail(event.target.value)}
+                  placeholder="you@example.com"
+                  className="w-full px-4 py-3 rounded-xl bg-input border border-border placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                />
               </div>
-              <form onSubmit={sendLink} className="space-y-4">
-                <div className="space-y-2">
-                  <label className="block text-sm font-medium" htmlFor="signin-email">Email address</label>
-                  <input
-                    id="signin-email"
-                    type="email"
-                    autoComplete="email"
-                    maxLength={320}
-                    required
-                    value={email}
-                    onChange={event => setEmail(event.target.value)}
-                    placeholder="you@example.com"
-                    className="w-full px-4 py-3 rounded-xl bg-input border border-border placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  disabled={isSending}
-                  className="w-full flex items-center justify-center gap-2 py-3 px-6 rounded-full font-bold text-sm text-white hover:opacity-90 disabled:opacity-50 glow-blue"
-                  style={{ background: "var(--cobalt)" }}
-                >
-                  {isSending ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> : <Mail className="w-4 h-4" aria-hidden="true" />}
-                  {isSending ? "Sending…" : "Email me a sign-in link"}
-                </button>
-              </form>
-            </>
+              <button
+                type="submit"
+                disabled={isSending}
+                className="w-full flex items-center justify-center gap-2 py-3 px-6 rounded-full font-bold text-sm text-white hover:opacity-90 disabled:opacity-50 glow-blue"
+                style={{ background: "var(--cobalt)" }}
+              >
+                {isSending
+                  ? <><Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Sending…</>
+                  : <>Continue with email <ArrowRight className="w-4 h-4" aria-hidden="true" /></>}
+              </button>
+            </form>
           )}
           {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
-          {sentTo && (
-            <div role="status" className="text-sm bg-muted rounded-xl p-4 break-words">
-              <p className="font-semibold">Check your inbox</p>
-              <p className="text-muted-foreground mt-1">We sent a link to {sentTo}. Open it in this browser to continue.</p>
-            </div>
-          )}
         </div>
       </section>
     </main>
