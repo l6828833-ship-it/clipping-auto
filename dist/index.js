@@ -50,13 +50,29 @@ import { eq, desc, and, isNotNull, lt, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 
 // drizzle/schema.ts
-import { boolean, integer, jsonb, pgEnum, pgTable, real, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
-var userRole = pgEnum("user_role", ["user", "admin"]);
-var sourceType = pgEnum("source_type", ["upload", "url"]);
-var videoStatus = pgEnum("video_status", ["pending", "transcribing", "analyzing", "done", "error"]);
-var hostedStatus = pgEnum("hosted_status", ["none", "downloading", "ready", "error"]);
-var clipStatus = pgEnum("clip_status", ["pending", "rendering", "done", "error"]);
-var users = pgTable("users", {
+import { boolean, integer, jsonb, pgEnum, pgSchema, pgTable, real, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
+/*
+ * CLIP_MAKER_DB_SCHEMA puts every Clip Maker table and type in its own
+ * Postgres schema (e.g. "clip_maker"), so the app can share a database with
+ * another app whose tables have the same names. Unset: the default "public".
+ */
+var DB_SCHEMA = (() => {
+  const name = process.env.CLIP_MAKER_DB_SCHEMA?.trim();
+  if (!name || name === "public") return null;
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(name)) throw new Error("CLIP_MAKER_DB_SCHEMA must be a lowercase name such as clip_maker.");
+  return name;
+})();
+var appSchema = DB_SCHEMA ? pgSchema(DB_SCHEMA) : null;
+var appEnum = appSchema ? (name, values) => appSchema.enum(name, values) : pgEnum;
+var appTable = appSchema ? (name, columns) => appSchema.table(name, columns) : pgTable;
+/** A table's name for SQL that takes it as text, such as pg_get_serial_sequence. */
+var qualifiedTable = (name) => DB_SCHEMA ? `${DB_SCHEMA}.${name}` : name;
+var userRole = appEnum("user_role", ["user", "admin"]);
+var sourceType = appEnum("source_type", ["upload", "url"]);
+var videoStatus = appEnum("video_status", ["pending", "transcribing", "analyzing", "done", "error"]);
+var hostedStatus = appEnum("hosted_status", ["none", "downloading", "ready", "error"]);
+var clipStatus = appEnum("clip_status", ["pending", "rendering", "done", "error"]);
+var users = appTable("users", {
   id: serial("id").primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
@@ -68,7 +84,7 @@ var users = pgTable("users", {
   updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn", { withTimezone: true }).defaultNow().notNull()
 });
-var videos = pgTable("videos", {
+var videos = appTable("videos", {
   id: serial("id").primaryKey(),
   userId: integer("userId").notNull(),
   title: varchar("title", { length: 512 }),
@@ -92,7 +108,7 @@ var videos = pgTable("videos", {
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
-var clips = pgTable("clips", {
+var clips = appTable("clips", {
   id: serial("id").primaryKey(),
   videoId: integer("videoId").notNull(),
   userId: integer("userId").notNull(),
@@ -120,7 +136,7 @@ var clips = pgTable("clips", {
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true }).defaultNow().notNull()
 });
-var subtitles = pgTable("subtitles", {
+var subtitles = appTable("subtitles", {
   id: serial("id").primaryKey(),
   clipId: integer("clipId").notNull(),
   userId: integer("userId").notNull(),
@@ -158,10 +174,10 @@ async function getDb() {
         : drizzle(process.env.DATABASE_URL);
       /* Additive and idempotent, the same statement as migration 0002. Run
        * here so a deploy that has not run migrations yet keeps serving clips. */
-      await _db.execute(sql`ALTER TABLE "clips" ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
+      await _db.execute(sql`ALTER TABLE ${clips} ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
         console.warn("[Database] Could not add clips.cuts; run `npm run db:migrate`:", String(error?.message ?? error));
       });
-      await _db.execute(sql`ALTER TABLE "clips" ADD COLUMN IF NOT EXISTS "layout" jsonb`).catch((error) => {
+      await _db.execute(sql`ALTER TABLE ${clips} ADD COLUMN IF NOT EXISTS "layout" jsonb`).catch((error) => {
         console.warn("[Database] Could not add clips.layout; run `npm run db:migrate`:", String(error?.message ?? error));
       });
     } catch (error) {
@@ -238,7 +254,7 @@ async function linkSupabaseUser(identity, loginMethod) {
      * and try once more. */
     if (error?.code !== "23505" || error?.constraint !== "users_pkey") throw error;
     const db = await getDb();
-    await db.execute(sql`SELECT setval(pg_get_serial_sequence('users', 'id'), (SELECT COALESCE(MAX(id), 1) FROM users))`);
+    await db.execute(sql`SELECT setval(pg_get_serial_sequence(${qualifiedTable("users")}, 'id'), (SELECT COALESCE(MAX(id), 1) FROM ${users}))`);
     console.warn("[Auth] The users id counter was behind the table; moved it forward.");
     return linkSupabaseUserOnce(identity, loginMethod);
   }
