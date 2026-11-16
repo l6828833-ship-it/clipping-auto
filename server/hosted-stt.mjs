@@ -26,6 +26,7 @@ function candidateModels() {
   return override ? [override] : ["groq/whisper-large-v3", "inworld/inworld-stt-1"];
 }
 let workingModel = null;
+let retryAfterCredits = 0;
 
 export function hostedSttAvailable() {
   return Boolean(process.env.INWORLD_API_KEY?.trim()) && process.env.CLIP_MAKER_HOSTED_STT !== "0";
@@ -47,8 +48,9 @@ export function wordsFromResponse(payload) {
   return words;
 }
 
-async function transcribePiece(file, { apiKey, modelId, language }) {
+async function transcribePiece(file, { apiKey, modelId, language, signal }) {
   const audio = await readFile(file);
+  const timeout = AbortSignal.timeout(180_000);
   const response = await fetch(STT_URL, {
     method: "POST",
     headers: { Authorization: `Basic ${apiKey}`, "Content-Type": "application/json" },
@@ -61,11 +63,12 @@ async function transcribePiece(file, { apiKey, modelId, language }) {
       },
       audioData: { content: audio.toString("base64") },
     }),
-    signal: AbortSignal.timeout(180_000),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
   });
   if (!response.ok) {
+    if (response.status === 402) retryAfterCredits = Date.now() + 5 * 60_000;
     const detail = await response.text().catch(() => response.statusText);
-    throw new Error(`Inworld STT ${response.status} (${modelId}): ${detail.slice(0, 200)}`);
+    throw Object.assign(new Error(`Inworld STT ${response.status} (${modelId}): ${detail.slice(0, 200)}`), { status: response.status });
   }
   const payload = await response.json();
   return { text: String(payload?.transcription?.transcript ?? "").trim(), words: wordsFromResponse(payload) };
@@ -75,8 +78,9 @@ async function transcribePiece(file, { apiKey, modelId, language }) {
  * Transcribes `audioPath`. Resolves to `{ text, words, model }`, or null when
  * hosted transcription is unavailable or returns no word timings.
  */
-export async function hostedWords({ audioPath, language = "auto", ffmpeg, workDirectory, onProgress }) {
-  if (!hostedSttAvailable() || !ffmpeg) return null;
+export async function hostedWords({ audioPath, language = "auto", ffmpeg, workDirectory, onProgress, signal }) {
+  signal?.throwIfAborted();
+  if (!hostedSttAvailable() || !ffmpeg || Date.now() < retryAfterCredits) return null;
   const apiKey = process.env.INWORLD_API_KEY.trim();
   const code = language && language !== "auto" ? language.split("-")[0].toLowerCase() : "";
   const directory = await mkdtemp(path.join(workDirectory, "stt-"));
@@ -86,7 +90,7 @@ export async function hostedWords({ audioPath, language = "auto", ffmpeg, workDi
       "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
       "-f", "segment", "-segment_time", String(CHUNK_SECONDS), "-reset_timestamps", "1",
       path.join(directory, "piece-%04d.mp3"),
-    ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
+    ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024, signal, killSignal: "SIGKILL" });
     const pieces = (await readdir(directory)).filter((name) => name.endsWith(".mp3")).sort();
     if (pieces.length === 0) return null;
 
@@ -96,7 +100,7 @@ export async function hostedWords({ audioPath, language = "auto", ffmpeg, workDi
     const failures = [];
     for (const candidate of modelId ? [modelId] : candidateModels()) {
       try {
-        const result = await transcribePiece(path.join(directory, pieces[0]), { apiKey, modelId: candidate, language: code });
+        const result = await transcribePiece(path.join(directory, pieces[0]), { apiKey, modelId: candidate, language: code, signal });
         /* Speech with no word timings means this model cannot time words. A
          * silent first piece says nothing either way, so it is accepted. */
         if (result.text && result.words.length === 0) {
@@ -107,7 +111,9 @@ export async function hostedWords({ audioPath, language = "auto", ffmpeg, workDi
         modelId = candidate;
         break;
       } catch (error) {
+        signal?.throwIfAborted();
         failures.push(String(error.message ?? error));
+        if (error.status === 402) break;
       }
     }
     if (!first) {
@@ -123,9 +129,12 @@ export async function hostedWords({ audioPath, language = "auto", ffmpeg, workDi
     const worker = async () => {
       for (let job = pending.shift(); job; job = pending.shift()) {
         const file = path.join(directory, job.name);
-        const options = { apiKey, modelId, language: code };
+        const options = { apiKey, modelId, language: code, signal };
         /* One retry: a single dropped request should not cost the whole video. */
-        results[job.index] = await transcribePiece(file, options).catch(() => transcribePiece(file, options));
+        results[job.index] = await transcribePiece(file, options).catch(error => {
+          if (signal?.aborted || error.status === 402) throw error;
+          return transcribePiece(file, options);
+        });
         onProgress?.(++done / pieces.length);
       }
     };

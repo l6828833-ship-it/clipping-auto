@@ -22,7 +22,8 @@ export function youtubeWorkerAlive() {
   return Boolean(workerToken()) && Date.now() - lastPoll <= 20_000;
 }
 
-export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, language, onTranscribing } = {}) {
+export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, language, onTranscribing, signal } = {}) {
+  signal?.throwIfAborted();
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (Date.now() - lastPoll > 20_000 && !jobs.size)) return null;
   if (jobs.size >= 4) throw new Error("The YouTube download worker is busy. Try again shortly.");
 
@@ -36,10 +37,12 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
     let timeout;
     const finish = (error, metadata) => {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", cancel);
       jobs.delete(id);
       if (error) reject(error);
       else resolve(metadata);
     };
+    const cancel = () => finish(signal.reason);
     const touch = () => {
       clearTimeout(timeout);
       const left = started + MAX_JOB_MS - Date.now();
@@ -47,6 +50,7 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
     };
     touch();
     jobs.set(id, { videoId, destination, kind, range, language, onTranscribing, finish, touch, state: "waiting" });
+    signal?.addEventListener("abort", cancel, { once: true });
   });
 }
 

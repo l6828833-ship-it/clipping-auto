@@ -179,6 +179,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   const [stage, setStage] = useState<Stage>("idle");
   const [videoMeta, setVideoMeta] = useState<{ title: string; duration: number; uploader: string } | null>(null);
   const [stageError, setStageError] = useState("");
+  const [analysisJobId, setAnalysisJobId] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const utils = trpc.useUtils();
 
@@ -189,7 +190,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     onError: (err) => toast.error(err.message),
   });
 
-  const transcribeSource = useSourceTranscription();
+  const { transcribe: transcribeSource, skip: skipTranscription } = useSourceTranscription();
 
   /** Set when transcription came back empty, so the person can go on without it. */
   const [noTranscript, setNoTranscript] = useState(false);
@@ -218,7 +219,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         url: url.trim(),
         language,
         allowSpeechToText: subtitlesOn && !pasted,
-      }, setStage);
+        quickImport: true,
+      }, setStage, setAnalysisJobId);
       const found: Found = {
         transcript: pasted || result.transcript,
         words: pasted ? [] : result.words ?? [],
@@ -235,7 +237,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       setChapters(found.chapters);
       setVideoMeta(found.meta);
       if (!title.trim()) setTitle(result.title);
-      if (subtitlesOn && !found.transcript.trim()) {
+      if (result.skipped && result.note) toast.info(result.note);
+      if (!result.skipped && subtitlesOn && !found.transcript.trim()) {
         /* Nothing to find highlights in. Stop here so it can be tried again,
          * instead of landing in the manual clip picker without a word. */
         setStage("error");
@@ -251,6 +254,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       setStageError(message);
       toast.error(message);
       return null;
+    } finally {
+      setAnalysisJobId(null);
     }
   };
 
@@ -526,6 +531,15 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                 );
               })}
             </div></>}
+            {mode === "url" && analysisJobId && stage !== "saving" && (
+              <button type="button" disabled={skipTranscription.isPending}
+                onClick={() => skipTranscription.mutate({ id: analysisJobId }, {
+                  onError: (error: Error) => toast.error(error.message),
+                })}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-foreground hover:bg-secondary/60 disabled:opacity-40">
+                Choose a clip now
+              </button>
+            )}
           </div>
         )}
 
@@ -865,12 +879,10 @@ function StepHighlights({
         </select>
       </label>
       {!apiKey && <NoKeyWarning />}
-      {!analysing && (
-        <button type="button" onClick={() => setManual(true)}
-          className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
-          Choose Clip Manually
-        </button>
-      )}
+      <button type="button" onClick={() => setManual(true)}
+        className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
+        Choose Clip Manually
+      </button>
       {analysing && (
         <div className="glass rounded-2xl p-8 mb-6 text-center">
           <div className="flex justify-center gap-1 mb-4">

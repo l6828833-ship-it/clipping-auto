@@ -365,7 +365,7 @@ export default function Top5ReelsPage() {
   const autoPreviewKeyRef = useRef<string | null>(null);
   const utils = trpc.useUtils();
 
-  const transcribeSource = useSourceTranscription();
+  const { transcribe: transcribeSource } = useSourceTranscription();
   const isAnalyzing = ranks.some(entry => entry.state === "analyzing");
   const createVideo = trpc.videos.create.useMutation();
   const detectHighlights = trpc.gemini.detectHighlights.useMutation();

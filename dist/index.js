@@ -1149,12 +1149,15 @@ var WHISPER_PYTHON = process.env.WHISPER_PYTHON ?? "python3";
 var WHISPER_SCRIPT = process.env.WHISPER_SCRIPT ?? path3.join(process.cwd(), "scripts", "whisper_words.py");
 var WHISPER_MODEL = process.env.WHISPER_MODEL ?? "base";
 var whisperQueue = Promise.resolve();
-async function localWhisperWords(audioPath, language = "auto") {
+async function localWhisperWords(audioPath, language = "auto", signal) {
   // Keep PyTorch inference to one process at a time on the shared server.
-  const transcription = whisperQueue.then(() => promisify(execFile)(
-    WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
-    { timeout: 36e5, maxBuffer: 64 * 1024 * 1024 }
-  ));
+  const transcription = whisperQueue.then(() => {
+    signal?.throwIfAborted();
+    return promisify(execFile)(
+      WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
+      { timeout: 36e5, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL" }
+    );
+  });
   whisperQueue = transcription.then(() => {}, () => {});
   const { stdout } = await transcription;
   const parsed = JSON.parse(stdout);
@@ -1167,19 +1170,21 @@ async function localWhisperWords(audioPath, language = "auto") {
  * Word-timed transcript for an audio file: the hosted speech API when the
  * server has a key for it, local Whisper otherwise or if the API fails.
  */
-async function transcribeWords(audioPath, language = "auto") {
+async function transcribeWords(audioPath, language = "auto", signal) {
+  signal?.throwIfAborted();
   if (hostedSttAvailable()) {
     try {
-      const hosted = await hostedWords({ audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir() });
+      const hosted = await hostedWords({ audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir(), signal });
       if (hosted) {
         console.log(`[STT] Hosted transcription (${hosted.model}): ${hosted.words.length} words.`);
         return { text: hosted.text, words: hosted.words };
       }
     } catch (error) {
+      signal?.throwIfAborted();
       console.warn("[STT] Hosted transcription failed, using local Whisper:", String(error.message ?? error).slice(0, 300));
     }
   }
-  return localWhisperWords(audioPath, language);
+  return localWhisperWords(audioPath, language, signal);
 }
 var FFMPEG_MISSING = "ffmpeg is not installed on the server. Install it with `winget install Gyan.FFmpeg` (or your package manager) and restart the dev server.";
 function q(value) {
@@ -1323,12 +1328,13 @@ function redactDownloadError(details) {
   return (youtubeProxy ? details.replaceAll(youtubeProxy, "[YouTube proxy]") : details)
     .replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[redacted]@");
 }
-async function tryYouTubeTranscript(url, language) {
+async function tryYouTubeTranscript(url, language, abort) {
   try {
     const videoId = youtubeSourceId(url);
     if (!videoId) return null;
     const { YoutubeTranscript } = await import("youtube-transcript");
-    const signal = AbortSignal.timeout(8000);
+    const timeout = AbortSignal.timeout(8000);
+    const signal = abort ? AbortSignal.any([abort, timeout]) : timeout;
     const segments = await YoutubeTranscript.fetchTranscript(videoId, {
       lang: language === "auto" ? undefined : language.split("-")[0],
       fetch: (input, init) => fetch(input, { ...init, signal })
@@ -1350,6 +1356,7 @@ async function tryYouTubeTranscript(url, language) {
     console.log(`[Extract] youtube-transcript fetched ${segments.length} segments, ${words.length} timed words`);
     return { text: fullText, words };
   } catch (err) {
+    abort?.throwIfAborted();
     console.warn(`[Extract] youtube-transcript failed: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
@@ -1381,7 +1388,7 @@ async function inworldTranscribe(audioPath, apiKey, language = "en") {
   if (data.error) throw new Error(`STT error: ${data.error.message}`);
   return data.transcription?.transcript ?? "";
 }
-async function getVideoInfo(url) {
+async function getVideoInfo(url, signal) {
   const source = assertSafeUrl(url);
   const ytDlp = await getYtDlp();
   let stdout;
@@ -1389,9 +1396,10 @@ async function getVideoInfo(url) {
     ({ stdout } = await promisify(execFile)(ytDlp,
       ["--ignore-config", "--no-playlist", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...youtubeNetworkArgs(source),
         "--print-json", "--skip-download", "--no-warnings", "--", source],
-      { timeout: 6e4, maxBuffer: 20 * 1024 * 1024 }
+      { timeout: 6e4, maxBuffer: 20 * 1024 * 1024, signal, killSignal: "SIGKILL" }
     ));
   } catch (error) {
+    signal?.throwIfAborted();
     throw new Error(redactDownloadError(String(error.stderr || error.message)));
   }
   const info = JSON.parse(stdout.trim());
@@ -1404,7 +1412,7 @@ async function getVideoInfo(url) {
     language: /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(info.language ?? "") ? info.language.toLowerCase() : "auto"
   };
 }
-async function downloadSourceAudio(url, tmpDir, language, onTranscribing) {
+async function downloadSourceAudio(url, tmpDir, language, onTranscribing, signal) {
   const ytDlp = await getYtDlp();
   const ffmpeg = await getFfmpeg();
   if (!ffmpeg) throw new Error(FFMPEG_MISSING);
@@ -1416,7 +1424,7 @@ async function downloadSourceAudio(url, tmpDir, language, onTranscribing) {
       ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS, ...networkArgs, ...clientArgs,
       "--format", format, "--ffmpeg-location", path3.dirname(ffmpeg),
       "--output", path3.join(tmpDir, `${stem}.%(ext)s`), "--", url
-    ], { timeout: 15e4 });
+    ], { timeout: 15e4, signal });
     const mediaPath = await findWritten(tmpDir, `${stem}.`);
     if (!mediaPath) throw new Error("No source audio or video file was downloaded.");
     return mediaPath;
@@ -1425,14 +1433,16 @@ async function downloadSourceAudio(url, tmpDir, language, onTranscribing) {
   try {
     mediaPath = await download("source-audio", "bestaudio/best");
   } catch (error) {
+    signal?.throwIfAborted();
     if (!youtubeSourceId(url) || !/403|429|forbidden|format|SABR|sign in|download video data|fragment/i.test(error.message)) throw error;
     console.warn("[Extract] Preferred YouTube audio failed. Trying a public stream with audio and video:", error.message.slice(0, 350));
     const fallbackArgs = networkArgs.length ? YT_PUBLIC_FALLBACK_CLIENT_ARGS : ["--force-ipv4", ...YT_PUBLIC_FALLBACK_CLIENT_ARGS];
     try {
       mediaPath = await download("source-muxed", "b[height<=480]/b", fallbackArgs);
     } catch (fallbackError) {
+      signal?.throwIfAborted();
       const workerAudio = path3.join(tmpDir, "worker-audio.mp3");
-      const metadata = await downloadWithYouTubeWorker(youtubeSourceId(url), workerAudio, { language, onTranscribing });
+      const metadata = await downloadWithYouTubeWorker(youtubeSourceId(url), workerAudio, { language, onTranscribing, signal });
       if (metadata) return { audioPath: workerAudio, metadata };
       throw new Error(`${error.message}\n${fallbackError.message}`);
     }
@@ -1442,7 +1452,7 @@ async function downloadSourceAudio(url, tmpDir, language, onTranscribing) {
   await promisify(execFile)(ffmpeg, [
     "-nostdin", "-hide_banner", "-loglevel", "error", "-i", mediaPath,
     "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", audioPath
-  ], { timeout: 12e4 });
+  ], { timeout: 12e4, signal, killSignal: "SIGKILL" });
   return { audioPath };
 }
 var captionLanguageInput = z.string().regex(/^(?:auto|[a-z]{2,3}(?:-[a-z]{2})?)$/i).transform(value => value.toLowerCase()).default("auto");
@@ -1451,15 +1461,16 @@ var sourceTranscriptionInput = z.object({
   language: captionLanguageInput,
   allowSpeechToText: z.boolean().default(true)
 });
-async function transcribeSource(input, reportStage = () => {}) {
+async function transcribeSource(input, reportStage = () => {}, { signal, reportMetadata = () => {} } = {}) {
   const url = assertSafeUrl(input.url);
   let meta = { title: "Untitled", duration: 0, uploader: "" };
   let language = input.language;
   try {
-    const { title, duration, uploader, language: sourceLanguage } = await getVideoInfo(url);
+    const { title, duration, uploader, language: sourceLanguage } = await getVideoInfo(url, signal);
     meta = { title, duration, uploader };
     if (language === "auto") language = sourceLanguage;
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof TRPCError2) throw error;
     if (/unsupported url|is not a valid url|unable to download webpage/i.test(error.message)) {
       throw new TRPCError2({ code: "BAD_REQUEST", message: "Enter a public video link that Clip Maker can open." });
@@ -1469,12 +1480,13 @@ async function transcribeSource(input, reportStage = () => {}) {
   const result = (source, transcript = "", words = [], note = "") => ({
     success: true, ...meta, source, transcript, words, wordCount: words.length, note, language
   });
+  reportMetadata(result("none"));
   reportStage("checking-captions");
   /* YouTube's automatic Arabic captions are weak and carry no usable word
    * timings. When this machine can run the large Whisper model (the same RAM
    * rule as scripts/whisper_words.py), Arabic goes straight to Whisper. */
   const whisperFirst = language === "ar-ma" || (/^ar\b/.test(language) && (hostedSttAvailable() || totalmem() >= 7.5 * 2 ** 30));
-  const captions = whisperFirst ? null : await tryYouTubeTranscript(url, language);
+  const captions = whisperFirst ? null : await tryYouTubeTranscript(url, language, signal);
   if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
     return result("none", "", [], "Subtitles are off for this import.");
@@ -1482,10 +1494,11 @@ async function transcribeSource(input, reportStage = () => {}) {
 
   const tmpDir = await fs4.mkdtemp(path3.join(os2.tmpdir(), "clip-maker-source-"));
   try {
+    signal?.throwIfAborted();
     reportStage("downloading");
     let audioPath;
     try {
-      const download = await downloadSourceAudio(url, tmpDir, language, () => reportStage("transcribing"));
+      const download = await downloadSourceAudio(url, tmpDir, language, () => reportStage("transcribing"), signal);
       audioPath = download.audioPath;
       if (download.metadata) {
         const { title, duration, uploader, language: sourceLanguage } = download.metadata;
@@ -1493,12 +1506,14 @@ async function transcribeSource(input, reportStage = () => {}) {
         if (Number.isFinite(duration) && duration > 0) meta.duration = duration;
         if (typeof uploader === "string") meta.uploader = uploader.slice(0, 512);
         if (language === "auto" && /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(sourceLanguage ?? "")) language = sourceLanguage;
+        reportMetadata(result("none"));
         if (download.metadata.transcript) {
           const { text, words } = download.metadata.transcript;
           return text && words.length ? result("whisper", text, words) : result("none", "", [], "Whisper didn’t detect speech in this video.");
         }
       }
     } catch (error) {
+      signal?.throwIfAborted();
       const details = redactDownloadError(String(error.stderr || error.message));
       console.warn("[Extract] Source audio unavailable:", details.slice(0, 600));
       const youtubeDenied = youtubeSourceId(url) && /403|429|forbidden|sign in|not a bot/i.test(details);
@@ -1509,10 +1524,11 @@ async function transcribeSource(input, reportStage = () => {}) {
     }
     reportStage("transcribing");
     try {
-      const { text, words } = await transcribeWords(audioPath, language);
+      const { text, words } = await transcribeWords(audioPath, language, signal);
       if (text && words.length) return result("whisper", text, words);
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {
+      signal?.throwIfAborted();
       console.warn("[Extract] Local Whisper failed:", String(error.stderr || error.message).slice(0, 600));
       return result("none", "", [], "Local Whisper couldn’t transcribe this video. Try again with a shorter source or paste a transcript.");
     }
@@ -1522,6 +1538,7 @@ async function transcribeSource(input, reportStage = () => {}) {
 }
 var sourceTranscriptionJobs = new Map();
 var runningSourceTranscriptions = 0;
+const SOURCE_IMPORT_BUDGET_MS = 180_000;
 var extractRouter = router({
   /**
    * POST /api/trpc/extract.videoInfo
@@ -1537,24 +1554,58 @@ var extractRouter = router({
     }
   }),
   transcribe: protectedProcedure.input(sourceTranscriptionInput).mutation(({ input }) => transcribeSource(input)),
-  startTranscription: protectedProcedure.input(sourceTranscriptionInput).mutation(({ input, ctx }) => {
+  startTranscription: protectedProcedure.input(sourceTranscriptionInput.extend({
+    quickImport: z.boolean().default(false)
+  })).mutation(({ input, ctx }) => {
     if (runningSourceTranscriptions >= 4) {
       throw new TRPCError2({ code: "TOO_MANY_REQUESTS", message: "Whisper is busy. Try again in a moment." });
     }
+    assertSafeUrl(input.url);
     const id = crypto.randomUUID();
     const job = { userId: ctx.user.id, stage: "fetching-info", result: null, error: null };
+    const controller = new AbortController();
+    let metadata = {
+      success: true, source: "none", title: "Untitled video", duration: 0, uploader: "",
+      transcript: "", words: [], wordCount: 0, language: input.language
+    };
+    let releaseWait;
+    const earlyResult = new Promise(resolve => { releaseWait = resolve; });
+    job.finishEarly = (note) => {
+      if (job.result || job.error || controller.signal.aborted) return;
+      job.result = { ...metadata, note, skipped: true };
+      controller.abort();
+      releaseWait();
+    };
+    const deadline = input.quickImport ? setTimeout(() => job.finishEarly(
+      "Full-video transcription took too long. Choose a clip and Clip Maker can add its captions during export."
+    ), SOURCE_IMPORT_BUDGET_MS) : undefined;
+    deadline?.unref();
     sourceTranscriptionJobs.set(id, job);
     runningSourceTranscriptions++;
-    job.finished = transcribeSource(input, (stage) => { job.stage = stage; }).then((result) => {
-      job.result = result;
+    const work = transcribeSource(input, (stage) => { job.stage = stage; }, {
+      signal: controller.signal,
+      reportMetadata: (value) => { metadata = value; }
+    }).then((result) => {
+      if (!controller.signal.aborted) job.result = result;
     }, (error) => {
+      if (controller.signal.aborted) return;
       job.error = error instanceof TRPCError2 ? error.message : "Couldn’t analyse this video. Try again.";
       console.warn("[Extract] Transcription job failed:", error.message);
     }).finally(() => {
+      clearTimeout(deadline);
       runningSourceTranscriptions--;
       setTimeout(() => sourceTranscriptionJobs.delete(id), 5 * 60_000).unref();
     });
+    job.finished = Promise.race([work, earlyResult]);
     return { id };
+  }),
+  skipTranscription: protectedProcedure.input(z.object({ id: z.string().uuid() })).mutation(({ input, ctx }) => {
+    const job = sourceTranscriptionJobs.get(input.id);
+    if (!job || job.userId !== ctx.user.id) {
+      throw new TRPCError2({ code: "NOT_FOUND", message: "This analysis expired. Start it again." });
+    }
+    job.finishEarly("Choose a clip and Clip Maker can add its captions during export.");
+    return { success: true };
   }),
   transcriptionStatus: protectedProcedure.input(z.object({
     id: z.string().uuid(), wait: z.boolean().default(false)
@@ -2627,7 +2678,7 @@ function assertSafeUrl(raw) {
 }
 function runStreaming(bin, args, opts) {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { windowsHide: true, cwd: opts.cwd });
+    const child = spawn(bin, args, { windowsHide: true, cwd: opts.cwd, signal: opts.signal, killSignal: "SIGKILL" });
     const tail = [];
     const captured = [];
     let buffer = "";
