@@ -141,7 +141,12 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
         res.clearCookie(cookieName(method), cookieOptions);
         return res.redirect(303, "/dashboard");
       } catch (error) {
-        console.warn("[Auth] Could not complete sign-in", method, error.status ?? error.name);
+        /* Database errors carry a code and the name of the table, column or
+         * rule involved, which says what went wrong without any of the data. */
+        const detail = error.code
+          ? ` code=${error.code}${error.table ? ` table=${error.table}` : ""}${error.column ? ` column=${error.column}` : ""}${error.constraint ? ` constraint=${error.constraint}` : ""}${error.routine ? ` routine=${error.routine}` : ""}`
+          : "";
+        console.warn("[Auth] Could not complete sign-in", method, error.status ?? error.name, detail);
         return res.redirect(303, failed);
       }
     };

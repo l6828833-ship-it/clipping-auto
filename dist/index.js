@@ -229,6 +229,20 @@ async function getUserByOpenId(openId) {
   return result.length > 0 ? result[0] : void 0;
 }
 async function linkSupabaseUser(identity, loginMethod) {
+  try {
+    return await linkSupabaseUserOnce(identity, loginMethod);
+  } catch (error) {
+    /* "duplicate key ... users_pkey" on a new account means the counter that
+     * numbers users is behind the rows already there, which happens after
+     * rows are copied in from another database. Move it past the highest id
+     * and try once more. */
+    if (error?.code !== "23505" || error?.constraint !== "users_pkey") throw error;
+    const db = await getDb();
+    await db.execute(sql`SELECT setval(pg_get_serial_sequence('users', 'id'), (SELECT COALESCE(MAX(id), 1) FROM users))`);
+    console.warn("[Auth] The users id counter was behind the table; moved it forward.");
+    return linkSupabaseUserOnce(identity, loginMethod);
+  }
+}
   const db = await getDb();
   if (!db) throw new Error("Database is unavailable");
   const openId = `supabase:${identity.id}`;
