@@ -243,6 +243,7 @@ async function linkSupabaseUser(identity, loginMethod) {
     return linkSupabaseUserOnce(identity, loginMethod);
   }
 }
+async function linkSupabaseUserOnce(identity, loginMethod) {
   const db = await getDb();
   if (!db) throw new Error("Database is unavailable");
   const openId = `supabase:${identity.id}`;
