@@ -13,6 +13,7 @@ import Top5SavedClipsPage from "./pages/Top5SavedClips";
 import SubtitleEditorPage from "./pages/SubtitleEditor";
 import ClipsPage from "./pages/Clips";
 import ProfilePage from "./pages/Profile";
+import PublishPage from "./pages/Publish";
 import Home from "./pages/Home";
 
 function Router() {
@@ -28,6 +29,7 @@ function Router() {
       <Route path="/dashboard/subtitle-editor" component={SubtitleEditorPage} />
       <Route path="/dashboard/clips"           component={ClipsPage} />
       <Route path="/dashboard/profile"         component={ProfilePage} />
+      <Route path="/dashboard/publish"         component={PublishPage} />
       <Route path="/404"                       component={NotFound} />
       <Route                                   component={NotFound} />
     </Switch>

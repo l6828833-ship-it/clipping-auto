@@ -1006,6 +1006,9 @@ function ClipEditorModal({
               </a>
             )}
 
+            {clip.status === "done" && clip.downloadUrl && <a href={`/dashboard/publish?clip=${clip.id}`}
+              className="flex w-full items-center justify-center rounded-xl bg-primary px-4 py-2.5 text-sm font-bold text-primary-foreground">Publish to social media</a>}
+
             {/* Attribution back to the original source. */}
             {sourceYtId && (
               <a
@@ -1335,6 +1338,7 @@ export default function ClipsPage() {
                         </button>
                       )
                     )}
+                    {clip.status === "done" && clip.downloadUrl && <a href={`/dashboard/publish?clip=${clip.id}`} className="flex-1 rounded-lg bg-primary px-3 py-2 text-center text-xs font-semibold text-primary-foreground">Publish</a>}
                     {/* A failed import is retried on the video, not the clip. */}
                     {hostedStatus === "error" && video && (
                       <button onClick={() => host.mutate({ id: video.id, startTime: clip.startTime ?? undefined, endTime: clip.endTime ?? undefined })}

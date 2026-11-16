@@ -54,7 +54,7 @@ type SubStyle = {
 };
 
 /** What highlight detection found for a video, and the title language it wrote in. */
-type Detected = { highlights: Highlight[]; reelTitle: string; language: string };
+type Detected = { highlights: Highlight[]; reelTitle: string; language: string; analysisNote?: string; contentType?: string; requestedType?: string };
 
 /** The video style a clip is exported in: the one chosen for the video, else the AI's pick for that clip. */
 function clipVideoStyle(clip: Highlight, layout: VideoLayout | null): VideoStyleId {
@@ -172,7 +172,11 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   const [url, setUrl] = useState("");
   const [title, setTitle] = useState("");
   const [transcript, setTranscript] = useState("");
-  const [language, setLanguage] = useState("auto");
+  const [language, setLanguage] = useState(() => {
+    try { const saved = localStorage.getItem("clip-maker-speech-language"); return LANGUAGES.some(l => l.code === saved) ? saved! : "auto"; }
+    catch { return "auto"; }
+  });
+  useEffect(() => { try { localStorage.setItem("clip-maker-speech-language", language); } catch {} }, [language]);
   const [detectedLanguage, setDetectedLanguage] = useState("auto");
   const [showLangPicker, setShowLangPicker] = useState(false);
   const [file, setFile] = useState<File|null>(null);
@@ -240,12 +244,9 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       if (!title.trim()) setTitle(result.title);
       if (result.skipped && result.note) toast.info(result.note);
       if (!result.skipped && subtitlesOn && !found.transcript.trim()) {
-        /* Nothing to find highlights in. Stop here so it can be tried again,
-         * instead of landing in the manual clip picker without a word. */
-        setStage("error");
-        setStageError(result.note || "No speech was found in this video.");
-        setNoTranscript(true);
-        return null;
+        // Music, sport and visual comedy can have no intelligible speech.
+        // Still save the source so the next step can inspect its frames.
+        toast.info(result.note || "No speech found. Continuing with visual analysis.");
       }
       setStage("done");
       return found;
@@ -455,6 +456,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
               </div>
             </div>
             <p className="text-xs text-muted-foreground">Supports YouTube, Vimeo, Twitter/X, TikTok, direct MP4 links, and 1000+ sites via yt-dlp.</p>
+            <p className="text-xs text-muted-foreground">For Moroccan videos, select Moroccan Darija. Auto-detect identifies Arabic but cannot reliably identify the dialect.</p>
           </div>
         )}
 
@@ -776,6 +778,7 @@ function StepHighlights({
   ));
   const [reelTitle, setReelTitle] = useState(detected?.reelTitle ?? "");
   const [manual, setManual] = useState(false);
+  const [contentType, setContentType] = useState(detected?.requestedType ?? "auto");
   /** The title language the shown highlights were written in. */
   const generatedLanguage = found?.language ?? "";
 
@@ -783,7 +786,8 @@ function StepHighlights({
   const prefetch = trpc.videos.prefetch.useMutation();
   const detect = trpc.gemini.detectHighlights.useMutation({
     onSuccess: (data) => {
-      const next: Detected = { highlights: data.highlights, reelTitle: data.reelTitle, language: titleLanguage };
+      const next: Detected = { highlights: data.highlights, reelTitle: data.reelTitle, language: titleLanguage,
+        analysisNote: data.analysisNote, contentType: data.contentType, requestedType: contentType };
       setFound(next);
       onDetected(next);
       setReelTitle(data.reelTitle);
@@ -803,14 +807,14 @@ function StepHighlights({
       toast.success(
         data.heatPeaksUsed > 0
           ? `Found ${data.highlights.length} moments, guided by ${data.heatPeaksUsed} most-replayed peaks.`
-          : `Found ${data.highlights.length} viral moments!`
+          : `Found ${data.highlights.length} clip suggestions.`
       );
       /*
        * Without word timings the boundaries are the model's estimate from the
        * text, so they can drift from what the title describes. Say so rather
        * than letting a mismatched clip look like a bug.
        */
-      if (!data.hasWordTimings) {
+      if (!data.hasWordTimings && data.analysisMode !== "visual-and-speech") {
         toast.info("This transcript has no word timings, so clip times are approximate. Nudge the start/end in the editor if a clip looks off.");
       }
     },
@@ -819,7 +823,7 @@ function StepHighlights({
 
   /** Everything the detector needs, including whichever signals this source had. */
   const detectInput = {
-    transcript, model, apiKey, videoDuration, titleLanguage,
+    transcript, model, apiKey, videoDuration, titleLanguage, contentType, videoId: videoId ?? undefined,
     /* The names people search for are in the video's title, rarely in what is said. */
     sourceTitle: (sourceTitle || videoTitle).slice(0, 200) || undefined,
     channel: channel.slice(0, 200) || undefined,
@@ -831,7 +835,7 @@ function StepHighlights({
   /* Runs by itself: pressing Continue on the first step already asked for it. */
   const autoStarted = useRef(false);
   useEffect(() => {
-    if (autoStarted.current || found || !transcript.trim()) return;
+    if (autoStarted.current || found || (!transcript.trim() && !videoId)) return;
     autoStarted.current = true;
     detect.mutate(detectInput);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -853,7 +857,7 @@ function StepHighlights({
    * import, and also when a video simply has no captions. Either way the user
    * needs a way to pick a clip range by hand instead of being stuck here.
    */
-  if (manual || !transcript.trim()) {
+  if (manual || (!transcript.trim() && !videoId)) {
     return (
       <ManualClipPicker
         videoTitle={videoTitle}
@@ -868,6 +872,7 @@ function StepHighlights({
       <div className="mb-6">
         <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Highlights</h2>
         <p className="text-sm text-muted-foreground">Analyzing: <span className="text-foreground font-medium">{videoTitle}</span></p>
+        <p className="mt-2 text-xs text-muted-foreground">Find spoken and visual moments in interviews, football, performances and mixed videos. Preview each suggestion before exporting.</p>
       </div>
       <label className="mb-4 block text-sm font-semibold text-foreground">
         Highlight title language
@@ -880,6 +885,20 @@ function StepHighlights({
         </select>
       </label>
       {!apiKey && <NoKeyWarning />}
+      <label className="mb-4 block text-sm font-semibold">
+        Video content
+        <select value={contentType} disabled={analysing} onChange={e => setContentType(e.target.value)}
+          className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
+          <option value="auto">Detect automatically</option>
+          <option value="interview">Interview / conversation</option>
+          <option value="sport">Football / sport</option>
+          <option value="music">Music / performance</option>
+          <option value="comedy">Comedy / visual jokes</option>
+          <option value="mixed">Mixed content</option>
+        </select>
+      </label>
+      {found?.analysisNote && <p className="mb-4 text-xs text-muted-foreground">{found.analysisNote}</p>}
+      {found?.contentType && <p className="mb-3 text-xs text-muted-foreground">Detected content: {found.contentType}</p>}
       <button type="button" onClick={() => setManual(true)}
         className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
         Choose Clip Manually
@@ -893,7 +912,7 @@ function StepHighlights({
             ))}
           </div>
           <p className="text-sm font-semibold text-foreground mb-1">Finding the best moments…</p>
-          <p className="text-xs text-muted-foreground">The AI is reading the transcript. This usually takes under a minute.</p>
+          <p className="text-xs text-muted-foreground">Preparing video frames, reading the transcript and checking candidate clips. Long videos take longer to download and inspect.</p>
         </div>
       )}
       {detect.isError && (
@@ -956,9 +975,9 @@ function StepHighlights({
           <div className="flex gap-3">
             <button onClick={() => detect.mutate(detectInput)}
               className="flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold text-muted-foreground bg-secondary/60 hover:text-foreground transition-colors">
-              <RefreshCw className="w-4 h-4" /> {generatedLanguage === titleLanguage ? "Re-analyze" : "Regenerate in selected language"}
+              <RefreshCw className="w-4 h-4" /> {found?.requestedType !== contentType ? "Re-analyze selected content" : generatedLanguage === titleLanguage ? "Re-analyze" : "Regenerate in selected language"}
             </button>
-            <button onClick={proceed} disabled={selected.size === 0 || generatedLanguage !== titleLanguage}
+            <button onClick={proceed} disabled={selected.size === 0 || generatedLanguage !== titleLanguage || (found?.requestedType ?? "auto") !== contentType}
               className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 glow-blue"
               style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
               Continue with {selected.size} clip{selected.size !== 1 ? "s" : ""} <ArrowRight className="w-4 h-4" />
@@ -1731,6 +1750,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
                     <button onClick={() => enqueue(h, clipId)} className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-bold text-white transition-all hover:opacity-80" style={{ background:"var(--cobalt)" }}><Zap className="w-3.5 h-3.5" /> {problem ? "Try again" : "Render"}</button>
                   )}
                 </div>
+                {file && clipId != null && <a href={`/dashboard/publish?clip=${clipId}`} className="mt-2 block rounded-lg bg-primary px-3 py-2 text-center text-xs font-bold text-primary-foreground">Publish to social media</a>}
                 {problem && !isRendering && <p role="alert" className="mt-2 text-xs text-destructive">{problem}</p>}
               </div>
             </div>

@@ -24,6 +24,7 @@ RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
     && python3 /tmp/darija_whisper.py \
     && python3 /tmp/darija_int8.py \
     && python3 -c 'from faster_whisper.utils import download_model; download_model("small")' \
+    && python3 -c 'from faster_whisper.utils import download_model; download_model("large-v3-turbo")' \
     && chown -R node:node /opt/clip-maker-cache
 
 COPY package.json package-lock.json ./
@@ -40,7 +41,7 @@ COPY vite.config.ts tsconfig.json drizzle.config.ts ./
 
 RUN npm run build && install -d -o node -g node /app/.data
 
-ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000 CLIP_MAKER_HOSTED_STT=0 WHISPER_MODEL_ARABIC=small
+ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000 CLIP_MAKER_HOSTED_STT=0 WHISPER_MODEL_ARABIC=large-v3-turbo
 EXPOSE 3000
 USER node
 CMD ["node", "dist/index.js"]

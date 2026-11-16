@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import {
   LayoutDashboard, Film, User,
   Zap, LogOut, Menu, List, Wand2,
-  Sun, Moon
+  Sun, Moon, Send
 } from "lucide-react";
 
 const NAV_ITEMS = [
@@ -15,6 +15,7 @@ const NAV_ITEMS = [
   { path: "/dashboard/create",       icon: Wand2,           label: "Create" },
   { path: "/dashboard/top5-reels",   icon: List,            label: "Top 5 Reels" },
   { path: "/dashboard/clips",        icon: Film,            label: "Clips" },
+  { path: "/dashboard/publish",      icon: Send,            label: "Publish" },
   { path: "/dashboard/profile",      icon: User,            label: "Profile" },
 ];
 

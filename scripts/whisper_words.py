@@ -9,9 +9,9 @@ model (see `pick_model`) because the small models are not usable for it.
 
 Environment:
   WHISPER_MODEL                 default model when none is passed (base)
-  WHISPER_MODEL_ARABIC          model for Arabic and Darija (default: by RAM)
-  WHISPER_MODEL_DARIJA          model for Darija only (default "darija-finetune",
-                                the small Darija fine-tune in darija_whisper.py)
+  WHISPER_MODEL_ARABIC          model for Arabic (does not override Darija)
+  WHISPER_MODEL_DARIJA          model for Darija only (default "large-v3-turbo";
+                                "darija-finetune" remains an explicit option)
   WHISPER_BEAM_SIZE             beam width on the CPU engine (default 5 for Arabic)
   WHISPER_THREADS               CPU threads (default 4 for hosted int8, else 2)
   CLIP_MAKER_WHISPER_CPU        "int8" enables faster-whisper on Linux
@@ -35,7 +35,7 @@ DARIJA_FINETUNE = "darija-finetune"
 # A short prompt in the target script keeps Whisper from drifting into Latin
 # transliteration or another language on code-switched speech.
 PROMPTS = {
-    "ar-ma": "هادي هضرة بالدارجة المغربية، مكتوبة بالحروف العربية.",
+    "ar-ma": "واش، ديال، بزاف، دابا، شنو، علاش، مزيان، كيفاش.",
     "ar": "هذا تسجيل باللغة العربية.",
 }
 
@@ -78,15 +78,12 @@ def pick_model(locale: str, language: str | None, default: str) -> str:
     if language != "ar":
         return default
     darija = locale == "ar-ma"
-    chosen = (darija and os.environ.get("WHISPER_MODEL_DARIJA")) or os.environ.get("WHISPER_MODEL_ARABIC")
+    # The container sets WHISPER_MODEL_ARABIC=small. It must not override an
+    # explicit choice of Darija, which has its own checkpoint and setting.
+    chosen = (os.environ.get("WHISPER_MODEL_DARIJA") or "large-v3-turbo") if darija else os.environ.get("WHISPER_MODEL_ARABIC")
     if not chosen:
         ram = total_ram_gb()
-        if darija:
-            # On real Moroccan speech the Darija fine-tune kept nearly twice
-            # the words large-v3-turbo did, and in Darija rather than
-            # rewritten into standard Arabic.
-            chosen = DARIJA_FINETUNE
-        elif ram >= 7.5:
+        if ram >= 7.5:
             chosen = "large-v3-turbo"
         elif ram >= 3.5 and default in {"tiny", "base"}:
             chosen = "small"
@@ -309,7 +306,7 @@ def is_hallucination(segment) -> bool:
     return segment.get("no_speech_prob", 0) > 0.8 and segment.get("avg_logprob", 0) < -1.0
 
 
-def collect_words(result, offset: float, limit: float, words: list) -> None:
+def collect_words(result, offset: float, limit: float, words: list, spans=None) -> None:
     """Appends clean timed words from one result. `limit` is the end of the
     audio this result covers; decoder timestamps past it are bogus."""
     for segment in result.get("segments", []):
@@ -321,6 +318,11 @@ def collect_words(result, offset: float, limit: float, words: list) -> None:
             token = raw.strip()
             start, end = float(word["start"]) + offset, float(word["end"]) + offset
             if not token or not (math.isfinite(start) and math.isfinite(end)) or end <= start or start >= limit:
+                continue
+            # Do not turn music or silent gaps into captions. VAD spans are
+            # already padded, so a word needs real overlap with one of them.
+            if spans is not None and not any(start < b and min(end, limit) > a for a, b in spans):
+                first = True
                 continue
             # Whisper marks a new word with a leading space. A piece without
             # one ("'hui" after "Aujourd") continues the previous word.
@@ -371,7 +373,10 @@ def main() -> None:
     log(f"whisper: model={model_name} language={language or 'auto'} engine={engine_name}")
 
     options = {
-        "language": language,
+        # Darija frequently switches to English/French within one sentence.
+        # Re-detect per short chunk rather than force those passages into
+        # Arabic. An explicitly requested monolingual fine-tune stays Arabic.
+        "language": None if locale in {"auto", "ar-ma"} and not engine.finetune else language,
         "task": "transcribe",
         # Feeding earlier text back in is what turns one mistake into a loop.
         "condition_on_previous_text": False,
@@ -384,18 +389,20 @@ def main() -> None:
         # the confidence rule re-decoded nearly every window up to six times
         # and made a 30-minute video take longer than it lasts.
         "logprob_threshold": None,
-        "temperature": (0.0, 0.4, 0.8),
+        # Sampling retries can invent fluent dialogue over unclear audio.
+        "temperature": 0.0,
     }
     if not engine.finetune:
         prompt = PROMPTS.get(locale) or PROMPTS.get(language or "")
         if prompt:
             options["initial_prompt"] = prompt
-    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("1" if engine.use_int8 else "5" if language == "ar" else "")
+    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("5" if language == "ar" else "1" if engine.use_int8 else "")
     if beam.isdigit() and int(beam) > 1:
         options["beam_size"] = int(beam)
 
-    if engine.finetune and spans:
-        pieces = speech_chunks(spans)
+    if spans:
+        # Apply speech gating to every model, not just the Darija checkpoint.
+        pieces = speech_chunks(spans, 12.0 if language == "ar" else BLOCK_SECONDS)
     else:
         points = split_points(duration, spans, BLOCK_SECONDS)
         pieces = list(zip(points, points[1:]))
@@ -407,7 +414,7 @@ def main() -> None:
         if len(chunk) >= SAMPLE_RATE // 5:
             result = engine.run(chunk, **options)
             before = len(words)
-            collect_words(result, start, end, words)
+            collect_words(result, start, end, words, spans)
             if len(words) > before:
                 texts.append(" ".join(w["word"] for w in words[before:]))
         if report:

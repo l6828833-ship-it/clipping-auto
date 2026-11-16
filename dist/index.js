@@ -7,15 +7,17 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { totalmem, tmpdir as systemTmpdir } from "os";
 
 import { registerMediaUpload } from "../server/media-upload.mjs";
+import { registerSocialPublishing } from "../server/social-publishing.mjs";
 import { facePanelCrop, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
 import { OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
-import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
+import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, filterSpeechHighlights, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
 import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
+import { readMediaEvidence, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile } from "../server/object-storage.mjs";
 import { pipeline as nodePipeline } from "node:stream/promises";
@@ -1584,8 +1586,10 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     }
     reportStage("transcribing");
     try {
-      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, language, signal, reportProgress);
-      if (language === "auto" && detectedLanguage) language = detectedLanguage;
+      // YouTube metadata is useful for finding captions, but "ar" must not
+      // turn the user's Auto choice into forced Arabic on English passages.
+      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, input.language, signal, reportProgress);
+      if (input.language === "auto" && detectedLanguage) language = detectedLanguage;
       if (text && words.length) return result("whisper", text, words);
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {
@@ -1772,6 +1776,8 @@ async function aiChat(opts) {
   const model = opts.model;
   const refused = aiRefused.get(model) ?? new Set();
   for (let attempt = 0; attempt < 4; attempt++) {
+    const requestBudget = opts.deadline ? Math.min(240000, opts.deadline - Date.now()) : 240000;
+    if (requestBudget < 1000) throw new Error("Analysis took too long. Retry to reuse the prepared video.");
     const body = {
       model,
       messages: opts.messages,
@@ -1784,7 +1790,7 @@ async function aiChat(opts) {
       method: "POST",
       headers: { "Authorization": `Bearer ${aiKey()}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(24e4)
+      signal: AbortSignal.timeout(Math.floor(requestBudget))
     });
     if (res.ok) {
       const response = await res.json();
@@ -1934,7 +1940,8 @@ var HighlightSchema = z2.object({
   montage: z2.string().optional(),
   hook: z2.string().optional(),
   payoff: z2.string().optional(),
-  reason: z2.string().catch("")
+  reason: z2.string().catch(""),
+  evidence: z2.enum(["speech", "visual"]).default("speech")
 });
 const titleLanguages = {
   "ar-ma": "Moroccan Darija in Arabic script",
@@ -1977,7 +1984,9 @@ var geminiRouter = router({
    * and returns the top 5 most viral/engaging clip suggestions.
    */
   detectHighlights: protectedProcedure.input(z2.object({
-    transcript: z2.string().min(10, "Transcript is too short"),
+    transcript: z2.string().max(300000).default(""),
+    videoId: z2.number().int().positive().optional(),
+    contentType: z2.enum(["auto", "interview", "sport", "music", "comedy", "mixed"]).default("auto"),
     transcriptWords: z2.array(z2.object({ word: z2.string(), start: z2.number().nonnegative(), end: z2.number().optional() })).optional(),
     /** YouTube's most-replayed curve and chapter list, when the source has them. */
     heatmap: z2.array(z2.object({ start: z2.number(), end: z2.number(), value: z2.number() })).max(2000).optional(),
@@ -1992,18 +2001,25 @@ var geminiRouter = router({
     /** The source video's own title and channel: where the names people search for are. */
     sourceTitle: z2.string().max(200).optional(),
     channel: z2.string().max(200).optional()
-  })).mutation(async ({ input }) => {
+  })).mutation(async ({ input, ctx }) => {
+    // Resolve only a video owned by the signed-in user. Never accept a local
+    // file or a third-party media URL from the analysis request.
+    const video = input.videoId ? await getVideoById(input.videoId, ctx.user.id) : null;
+    if (input.videoId && !video) throw new TRPCError3({ code: "NOT_FOUND", message: "Video not found" });
+    const deadline = Date.now() + 270000;
     const timedWords = (input.transcriptWords ?? []).filter((w) => w.word.trim());
     const lines = timedWords.length >= 5 ? transcriptLines(timedWords) : [];
     const transcript = lines.length ? formatTimedTranscript(lines) : input.transcript;
     const peaks = replayPeaks(input.heatmap);
+    const targetCount = input.rankingMode ? 3 : clipCountFor(video?.duration || input.videoDuration);
     const prompts = buildHighlightPrompts({
       transcript,
       timed: lines.length > 0,
       videoDuration: input.videoDuration,
       peaks,
       chapters: input.chapters ?? [],
-      count: clipCountFor(input.videoDuration),
+      // A few alternate candidates survive timing adjustments and deduping.
+      count: Math.min(12, targetCount + 3),
       videoTitle: input.sourceTitle ?? "",
       channel: input.channel ?? ""
     });
@@ -2039,12 +2055,50 @@ Return exactly this JSON:
 Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTime must be no more than 15 seconds after its startTime.`
       : prompts.user;
     try {
+      let media = null;
+      let visualWarning = "";
+      if (video && !rankingMode) {
+        try {
+          let file = video.hostedStatus === "ready" && !(video.hostedOffset > 0) ? await ensureLocalMedia(video.hostedUrl) : null;
+          let info = file ? await probeMedia(file) : null;
+          // A clip preview starting at zero may still cover only a small part
+          // of the source. Do not mistake it for the full video.
+          if (info && video.duration > info.duration + 2) file = null;
+          if (!file && video.sourceType === "url") {
+            const full = await withinBudget(hostVideoShared({ videoId: video.id, sourceUrl: video.sourceUrl, maxHeight: 360 }), 60000);
+            file = path5.join(VIDEOS_DIR, full.fileName);
+            info = full;
+          }
+          const ffmpeg = await findFfmpeg();
+          if (file && info?.duration > 0 && ffmpeg) {
+            const evidence = await readMediaEvidence({ file, duration: info.duration, ffmpeg, peaks,
+              deadline: Math.min(deadline - 90000, Date.now() + 60000) });
+            if (evidence.frames.length >= 2) media = { ...evidence, file, duration: info.duration, ffmpeg };
+          }
+          if (!media) visualWarning = "Visual analysis was unavailable. These suggestions use speech only.";
+        } catch (error) {
+          console.warn(`[AI] Visual evidence unavailable for video ${video.id}: ${String(error.message).slice(0, 160)}`);
+          visualWarning = "The video could not be opened for visual analysis. These suggestions use speech only.";
+        }
+      }
+      if (!media && transcript.trim().length < 10) {
+        throw new TRPCError3({ code: "BAD_REQUEST", message: "No usable speech or video frames were available. Try uploading the original video, or choose clip times manually." });
+      }
+      const languageRule = titleLanguageInstruction(input.titleLanguage, input.transcript);
+      const messages = media ? [
+        { role: "system", content: `${MEDIA_EDITOR_RULES}\n${languageRule}` },
+        { role: "user", content: [
+          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest up to ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nSampled frames follow; do not assume they show every event in the video.` },
+          ...frameContent(media.frames)
+        ] }
+      ] : [
+        { role: "system", content: `${systemPrompt}\n${languageRule}` },
+        { role: "user", content: `${userPrompt}\n\n${languageRule}` }
+      ];
       const { response, modelUsed } = await aiAnswer({
         model: aiModel(),
-        messages: [
-          { role: "system", content: `${systemPrompt}\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` },
-          { role: "user", content: `${userPrompt}\n\n${titleLanguageInstruction(input.titleLanguage, input.transcript)}` }
-        ],
+        messages,
+        deadline: media ? deadline - 60000 : deadline,
         // Low enough to keep timestamps faithful to the transcript lines.
         temperature: 0.4,
         // Headroom so the highlights are never cut off mid-object, and so a
@@ -2065,20 +2119,47 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         });
       }
       /* Land every clip on real speech boundaries and drop overlapping picks. */
-      const ordered = snapHighlights(highlights, timedWords, {
-        videoDuration: input.videoDuration,
+      const duration = media?.duration || video?.duration || input.videoDuration;
+      const bounded = highlights.filter(h => Number.isFinite(h.startTime) && Number.isFinite(h.endTime)
+        && h.startTime >= 0 && h.endTime > h.startTime && (!duration || h.endTime <= duration + 0.1)
+        && h.endTime - h.startTime <= 95);
+      const spoken = transcript.trim().length >= 10 ? filterSpeechHighlights(bounded.filter(h => h.evidence === "speech"), timedWords) : [];
+      const visual = media ? bounded.filter(h => h.evidence === "visual"
+        && media.frames.filter(f => f.time >= h.startTime && f.time <= h.endTime).length >= 2) : [];
+      const supported = [...spoken, ...visual];
+      const snapped = filterSpeechHighlights(snapHighlights(spoken, timedWords, {
+        videoDuration: duration,
         ...(rankingMode ? { minSeconds: 5, maxSeconds: 15, reach: 2, growTo: 0 } : {})
-      });
+      }), timedWords);
+      let verified = [];
+      if (media && visual.length) {
+        try {
+          verified = await verifyVisualHighlights({ highlights: visual, ...media, deadline,
+            ask: opts => aiAnswer({ ...opts, model: aiModel() }), parse: aiParseJSON });
+        } catch {
+          visualWarning = "Visual clip verification did not finish. Only supported spoken clips are shown; retry to check visual moments.";
+        }
+      }
+      // Deduplicate the combined list without moving visual events to speech.
+      const ordered = snapHighlights([...snapped, ...verified], [], {
+        videoDuration: duration, growTo: 0, maxSeconds: rankingMode ? 15 : 95
+      }).slice(0, targetCount);
+      console.log(`[AI] Highlight candidates=${highlights.length}, supported=${supported.length}, verifiedVisual=${verified.length}, selected=${ordered.length}, target=${targetCount}`);
       if (ordered.length === 0) {
         throw new TRPCError3({
           code: "INTERNAL_SERVER_ERROR",
-          message: "The model did not return any usable highlights. Try again or pick a different model."
+          message: media
+            ? "No clips could be verified from the sampled frames and speech. Try a shorter source around the action, or choose clip times manually."
+            : "No clear spoken highlights were found. For Moroccan speech, choose Moroccan Darija and transcribe again. For visual moments, retry visual analysis or choose clip times manually."
         });
       }
       return {
         hasWordTimings: lines.length > 0,
         heatPeaksUsed: countOnPeaks(ordered, peaks),
         highlights: ordered,
+        analysisMode: media ? "visual-and-speech" : "speech",
+        analysisNote: visualWarning || (media ? "Uses sampled video frames and speech. Fast action or audio-only musical changes can be missed; preview the selected clips." : ""),
+        contentType: typeof parsed.contentType === "string" ? parsed.contentType.slice(0, 80) : "interview",
         reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : ordered[0].title),
         modelUsed,
         modelSubstituted: false,
@@ -2778,7 +2859,7 @@ async function sectionFor(video, range) {
   return remember({ url: cached.url, offset: cached.offset ?? 0, duration: cached.duration, path: path5.join(VIDEOS_DIR, cached.fileName) });
 }
 function hostVideoShared(opts) {
-  const key = `${opts.videoId}:${opts.range ? `${opts.range.start}-${opts.range.end}` : "full"}`;
+  const key = `${opts.videoId}:${opts.range ? `${opts.range.start}-${opts.range.end}` : "full"}:h${opts.maxHeight ?? 2160}`;
   const running = hostJobs.get(key);
   if (running) return running;
   const job = hostVideo(opts).finally(() => hostJobs.delete(key));
@@ -5262,6 +5343,17 @@ async function startServer() {
   app.get(["/health", "/healthz"], (_req, res) => res.json({ status: "ok" }));
   registerSupabaseAuth(app, supabaseAuth, { linkUser: linkSupabaseUser, setSession: setWebSession });
   registerYouTubeWorker(app);
+  registerSocialPublishing(app, {
+    authenticate: req => sdk.authenticateRequest(req),
+    getClip: getClipById,
+    getClipPath: async clip => await ensureLocalMedia(clip.downloadUrl) ?? localPathFromUrl(clip.downloadUrl),
+    probeMedia,
+    getPublicClipUrl: async clip => {
+      const ref = mediaRef(clip.downloadUrl);
+      if (!ref || !storageEnabled() || !(await storeMedia(clip.downloadUrl))) return null;
+      return signedLink(ref.kind, ref.name);
+    }
+  });
   app.use("/api/native/youtube", express2.json({ limit: "2kb" }));
   registerNativeYouTube(app, { findYtDlp, findFfmpeg });
   app.use(express2.json({ limit: "50mb" }));

@@ -54,8 +54,7 @@ export function replayPeaks(heatmap, limit = 8) {
 /** How many clips to ask for, by source length. */
 export function clipCountFor(durationSeconds) {
   if (!durationSeconds || durationSeconds <= 0) return 5;
-  if (durationSeconds < 150) return 2;
-  if (durationSeconds < 360) return 3;
+  if (durationSeconds < 100) return Math.max(1, Math.floor(durationSeconds / 20));
   if (durationSeconds < 1500) return 5;
   if (durationSeconds < 3600) return 7;
   return 8;
@@ -70,6 +69,7 @@ A clip is worth making only if a stranger who has never seen the full video woul
 3. SELF-CONTAINED - one complete idea or story. No dependence on earlier context.
 4. DENSITY - cut the wind-up. Start as late as possible and end as early as possible.
 Skip intros, outros, sponsor reads, housekeeping ("like and subscribe") and rambling.
+EVIDENCE: You have a transcript, not the video or its sound. Do not invent actions, facial expressions, laughter or dialogue. A gap between transcript lines is missing evidence, not proof of a funny silence or a reaction. Choose spoken moments supported by the supplied lines. A title or replay peak alone cannot prove what happens in a clip. Ignore garbled, repetitive or incoherent passages instead of inventing a story to explain them.
 
 HUMOUR. Funny moments are often the best clips, and the easiest to ruin with a bad cut. Read for jokes the way a comedian would:
 - A joke is SETUP then PUNCHLINE then REACTION. Find the setup: the line that plants the expectation the punchline breaks. Start the clip there, not on the punchline - a punchline with no setup is not funny.
@@ -154,6 +154,30 @@ Sort highlights by engagementScore, highest first. Return fewer than ${count} ra
 }
 
 const wordEnd = (w) => (Number.isFinite(w.end) && w.end > w.start ? w.end : w.start + 0.3);
+
+/** Reject transcript-based candidates whose range contains almost no speech.
+ * Missing timings cannot be assessed here; the UI labels those approximate.
+ * Preserve original timestamps: removing silence must never shift a clip.
+ */
+export function filterSpeechHighlights(highlights, words) {
+  if (!words?.length) return highlights;
+  const usable = words.filter(w => String(w.word ?? "").trim() && Number.isFinite(w.start))
+    .sort((a, b) => a.start - b.start);
+  return highlights.filter(h => {
+    const duration = h.endTime - h.startTime;
+    if (!Number.isFinite(duration) || duration <= 0) return false;
+    let count = 0, covered = 0, cursor = h.startTime;
+    for (const w of usable) {
+      const start = Math.max(h.startTime, w.start);
+      const end = Math.min(h.endTime, wordEnd(w));
+      if (end <= start) continue;
+      count++;
+      covered += Math.max(0, end - Math.max(cursor, start));
+      cursor = Math.max(cursor, end);
+    }
+    return count >= 3 && covered >= Math.min(3, duration * 0.15);
+  });
+}
 
 /**
  * Moves each highlight onto real speech boundaries.
