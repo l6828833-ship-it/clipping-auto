@@ -14,6 +14,7 @@ import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, 
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
+import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile } from "../server/object-storage.mjs";
 import { pipeline as nodePipeline } from "node:stream/promises";
@@ -143,6 +144,7 @@ var ENV = {
 };
 
 // server/db.ts
+const supabaseAuth = readSupabaseAuthConfig(process.env);
 var _db = null;
 async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
@@ -224,6 +226,43 @@ async function getUserByOpenId(openId) {
   }
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result.length > 0 ? result[0] : void 0;
+}
+async function linkSupabaseUser(identity, loginMethod) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is unavailable");
+  const openId = `supabase:${identity.id}`;
+  const now = new Date();
+  return db.transaction(async (transaction) => {
+    // Serialize first sign-ins for a verified email before claiming an existing account.
+    await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`clip-maker-auth:${identity.email}`}))`);
+    const [linked] = await transaction.update(users)
+      .set({ lastSignedIn: now })
+      .where(eq(users.openId, openId)).returning();
+    if (linked) return linked;
+
+    const matches = await transaction.select().from(users)
+      .where(sql`lower(btrim(${users.email})) = ${identity.email}`).limit(2).for("update");
+    if (matches.length > 1 || matches[0]?.openId.startsWith("supabase:")) {
+      throw new Error("Email matches multiple identities");
+    }
+    if (matches.length === 1) {
+      // The numeric ID owns existing clips. Rotate the sign-in identity to retire old sessions.
+      const [account] = await transaction.update(users)
+        .set({ openId, loginMethod, passwordHash: null, updatedAt: now, lastSignedIn: now })
+        .where(eq(users.id, matches[0].id)).returning();
+      return account;
+    }
+
+    const displayName = identity.user_metadata?.full_name || identity.user_metadata?.name;
+    const [account] = await transaction.insert(users).values({
+      openId,
+      email: identity.email,
+      name: displayName?.trim().slice(0, 150) || identity.email.split("@")[0],
+      loginMethod,
+      lastSignedIn: now
+    }).onConflictDoUpdate({ target: users.openId, set: { lastSignedIn: now } }).returning();
+    return account;
+  });
 }
 async function getUserByEmail(email, { passwordOnly = false } = {}) {
   const db = await getDb();
@@ -654,6 +693,7 @@ function getQueryParam(req, key) {
 }
 function registerOAuthRoutes(app) {
   app.get("/api/oauth/callback", async (req, res) => {
+    if (supabaseAuth) return res.redirect(303, "/login");
     const code = getQueryParam(req, "code");
     const state = getQueryParam(req, "state");
     if (!code || !state) {
@@ -3954,6 +3994,7 @@ var appRouter = router({
       email: z4.string().email("Invalid email address"),
       password: z4.string().min(8, "Password must be at least 8 characters")
     })).mutation(async ({ input, ctx }) => {
+      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Use Google or an email sign-in link." });
       const existing = await getUserByEmail(input.email);
       if (existing) throw new TRPCError5({ code: "CONFLICT", message: "Email already in use" });
       const passwordHash = await bcrypt.hash(input.password, 12);
@@ -3979,6 +4020,7 @@ var appRouter = router({
       email: z4.string().email(),
       password: z4.string().min(1)
     })).mutation(async ({ input, ctx }) => {
+      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Use Google or an email sign-in link." });
       const user = await getUserByEmail(input.email, { passwordOnly: true });
       if (!user || !user.passwordHash) throw new TRPCError5({ code: "UNAUTHORIZED", message: "Invalid email or password" });
       const valid = await bcrypt.compare(input.password, user.passwordHash);
@@ -4006,7 +4048,7 @@ var appRouter = router({
     get: protectedProcedure.query(async ({ ctx }) => {
       const user = await getUserById(ctx.user.id);
       if (!user) throw new TRPCError5({ code: "NOT_FOUND" });
-      return { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt };
+      return { id: user.id, name: user.name, email: user.email, role: user.role, createdAt: user.createdAt, passwordless: Boolean(supabaseAuth) };
     }),
     /**
      * POST /api/trpc/profile.update
@@ -4017,6 +4059,7 @@ var appRouter = router({
       email: z4.string().email().optional()
     })).mutation(async ({ input, ctx }) => {
       if (input.email) {
+        if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Your email is managed by your sign-in provider." });
         const existing = await getUserByEmail(input.email);
         if (existing && existing.id !== ctx.user.id) throw new TRPCError5({ code: "CONFLICT", message: "Email already in use" });
       }
@@ -4031,6 +4074,7 @@ var appRouter = router({
       currentPassword: z4.string().min(1),
       newPassword: z4.string().min(8, "New password must be at least 8 characters")
     })).mutation(async ({ input, ctx }) => {
+      if (supabaseAuth) throw new TRPCError5({ code: "FORBIDDEN", message: "Your account uses passwordless sign-in." });
       const user = await getUserById(ctx.user.id);
       if (!user || !user.passwordHash) throw new TRPCError5({ code: "BAD_REQUEST", message: "No password set" });
       const valid = await bcrypt.compare(input.currentPassword, user.passwordHash);
@@ -5206,6 +5250,7 @@ async function startServer() {
   /* Cloud Run keeps /healthz for itself on the public URL (it answers 404
    * there), so /health is the path to give the host's health check. */
   app.get(["/health", "/healthz"], (_req, res) => res.json({ status: "ok" }));
+  registerSupabaseAuth(app, supabaseAuth, { linkUser: linkSupabaseUser, setSession: setWebSession });
   registerYouTubeWorker(app);
   app.use("/api/native/youtube", express2.json({ limit: "2kb" }));
   registerNativeYouTube(app, { findYtDlp, findFfmpeg });

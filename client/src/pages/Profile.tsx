@@ -42,7 +42,7 @@ export default function ProfilePage() {
 
   const handleProfileSave = (e: React.FormEvent) => {
     e.preventDefault();
-    updateProfile.mutate({ name: name || undefined, email: email || undefined });
+    updateProfile.mutate({ name: name || undefined, email: profile?.passwordless ? undefined : email || undefined });
   };
 
   const handlePasswordChange = (e: React.FormEvent) => {
@@ -122,6 +122,7 @@ export default function ProfilePage() {
                       id="prof-email"
                       type="email"
                       value={email}
+                      readOnly={Boolean(profile?.passwordless)}
                       onChange={e => setEmail(e.target.value)}
                       placeholder="your@email.com"
                       className="w-full pl-10 pr-4 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm"
@@ -139,60 +140,61 @@ export default function ProfilePage() {
               </form>
             </div>
 
-            {/* Change password */}
-            <div className="glass rounded-2xl p-6">
-              <div className="flex items-center gap-2 mb-5">
-                <Lock className="w-4 h-4" style={{ color: "var(--coral)" }} />
-                <span className="text-sm font-semibold text-foreground">Change Password</span>
+            {!profile?.passwordless && (
+              <div className="glass rounded-2xl p-6">
+                <div className="flex items-center gap-2 mb-5">
+                  <Lock className="w-4 h-4" style={{ color: "var(--coral)" }} />
+                  <span className="text-sm font-semibold text-foreground">Change Password</span>
+                </div>
+                <form onSubmit={handlePasswordChange} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-foreground" htmlFor="cur-pass">Current Password</label>
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                      <input
+                        id="cur-pass"
+                        type={showCurrent ? "text" : "password"}
+                        value={currentPassword}
+                        onChange={e => setCurrentPassword(e.target.value)}
+                        placeholder="Your current password"
+                        className="w-full pl-10 pr-12 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm"
+                      />
+                      <button type="button" onClick={() => setShowCurrent(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
+                        {showCurrent ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-foreground" htmlFor="new-pass">New Password</label>
+                    <div className="relative">
+                      <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                      <input
+                        id="new-pass"
+                        type={showNew ? "text" : "password"}
+                        value={newPassword}
+                        onChange={e => setNewPassword(e.target.value)}
+                        placeholder="Min. 8 characters"
+                        minLength={8}
+                        className="w-full pl-10 pr-12 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm"
+                      />
+                      <button type="button" onClick={() => setShowNew(v => !v)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
+                        {showNew ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={changePassword.isPending}
+                    className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{ background: "linear-gradient(135deg, var(--coral), oklch(0.65 0.20 300))" }}
+                  >
+                    {changePassword.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Shield className="w-4 h-4" /> Update Password</>}
+                  </button>
+                </form>
               </div>
-              <form onSubmit={handlePasswordChange} className="space-y-4">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-foreground" htmlFor="cur-pass">Current Password</label>
-                  <div className="relative">
-                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                    <input
-                      id="cur-pass"
-                      type={showCurrent ? "text" : "password"}
-                      value={currentPassword}
-                      onChange={e => setCurrentPassword(e.target.value)}
-                      placeholder="Your current password"
-                      className="w-full pl-10 pr-12 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm"
-                    />
-                    <button type="button" onClick={() => setShowCurrent(v => !v)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
-                      {showCurrent ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-foreground" htmlFor="new-pass">New Password</label>
-                  <div className="relative">
-                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                    <input
-                      id="new-pass"
-                      type={showNew ? "text" : "password"}
-                      value={newPassword}
-                      onChange={e => setNewPassword(e.target.value)}
-                      placeholder="Min. 8 characters"
-                      minLength={8}
-                      className="w-full pl-10 pr-12 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm"
-                    />
-                    <button type="button" onClick={() => setShowNew(v => !v)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
-                      {showNew ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-                </div>
-                <button
-                  type="submit"
-                  disabled={changePassword.isPending}
-                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{ background: "linear-gradient(135deg, var(--coral), oklch(0.65 0.20 300))" }}
-                >
-                  {changePassword.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Shield className="w-4 h-4" /> Update Password</>}
-                </button>
-              </form>
-            </div>
+            )}
           </div>
         )}
       </div>

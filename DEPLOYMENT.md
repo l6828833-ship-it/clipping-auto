@@ -16,6 +16,23 @@ The project root contains a Dockerfile that builds the Vite website and starts t
 5. For a fresh database, run `npm run db:migrate` once with `DATABASE_URL` set before creating web accounts. For an existing deployment, check its Drizzle migration history before running migrations.
 6. Open the assigned HTTPS URL and test web sign-in, video import, and clip export. Then set the Xcode target’s `CLIP_MAKER_SERVICE_URL` to that HTTPS origin. The iOS YouTube flow does not require a Clip Maker account.
 
+### Google sign-in and email links
+
+Use the Supabase Auth project `zmlrtyzrwmhbydcidpku` for sign-in. Continue using the existing `DATABASE_URL` to store Clip Maker accounts and media records. No SQL migration is needed.
+
+1. In Supabase Auth → URL Configuration, set the Site URL to `https://clip-maker.com`. Allow `https://clip-maker.com/api/auth/google/callback` and `https://clip-maker.com/api/auth/email/confirm` as redirect URLs.
+2. Create a Google OAuth **Web application** client with the authorized redirect URI `https://zmlrtyzrwmhbydcidpku.supabase.co/auth/v1/callback`. In Supabase Auth → Sign In / Providers → Google, save the client ID and client secret, then enable Google. Configure the Google client for the intended audience. [Supabase Google setup](https://supabase.com/docs/guides/auth/social-sign-in/auth-google)
+3. In Supabase Auth → Emails, configure a custom SMTP sender and keep the email provider, email confirmation, and new sign-ups enabled. Use the default confirmation and magic link templates with `{{ .ConfirmationURL }}`. [Supabase SMTP setup](https://supabase.com/docs/guides/auth/auth-smtp)
+4. After both providers are ready, add these three runtime variables together and redeploy. Use the **Publishable key** from Supabase and keep the existing `JWT_SECRET`.
+
+   | Variable | Value |
+   | --- | --- |
+   | `CLIP_MAKER_AUTH_SUPABASE_URL` | `https://zmlrtyzrwmhbydcidpku.supabase.co` |
+   | `CLIP_MAKER_AUTH_SUPABASE_KEY` | The project's `sb_publishable_…` key |
+   | `CLIP_MAKER_AUTH_SITE_URL` | `https://clip-maker.com` |
+
+5. Test Google and an email link to an inbox outside the Supabase team. Open the email link in the browser where it was requested. Existing users should use the email already on their Clip Maker account to keep access to their projects. Sign-in matches one verified identity to the existing account and retires that account's previous sessions.
+
 ### Cloudflare R2 media storage
 
 Create a private R2 bucket and an **Object Read & Write** token scoped to that bucket. Set these runtime variables in the app's deployment settings. Keep the access key and secret on the server.

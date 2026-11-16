@@ -1,3 +1,4 @@
+import { AuthOptions } from "@/components/PasswordlessAuth";
 import { useState } from "react";
 import { useLocation, Link } from "wouter";
 import { trpc } from "@/lib/trpc";
@@ -6,6 +7,10 @@ import { Eye, EyeOff, Zap, ArrowRight, Loader2, User, Mail, Lock } from "lucide-
 import { useRedirectIfAuth } from "@/hooks/useCustomAuth";
 
 export default function RegisterPage() {
+  return <AuthOptions><PasswordRegister /></AuthOptions>;
+}
+
+function PasswordRegister() {
   useRedirectIfAuth();
   const [, navigate] = useLocation();
   const [name, setName] = useState("");

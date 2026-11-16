@@ -1,3 +1,4 @@
+import { AuthOptions } from "@/components/PasswordlessAuth";
 import { useState } from "react";
 import { useLocation, Link } from "wouter";
 import { trpc } from "@/lib/trpc";
@@ -6,6 +7,10 @@ import { Eye, EyeOff, Zap, ArrowRight, Loader2 } from "lucide-react";
 import { useRedirectIfAuth } from "@/hooks/useCustomAuth";
 
 export default function LoginPage() {
+  return <AuthOptions><PasswordLogin /></AuthOptions>;
+}
+
+function PasswordLogin() {
   useRedirectIfAuth();
   const [, navigate] = useLocation();
   const [email, setEmail] = useState("");
