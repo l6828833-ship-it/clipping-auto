@@ -67,12 +67,10 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
   if (!config) return;
 
   const secure = config.site.startsWith("https:");
-  const host = new URL(config.site).host;
   const cookieOptions = { httpOnly: true, secure, sameSite: "lax", path: "/" };
   const cookieName = method => `${secure ? "__Host-" : ""}clip-maker-${method}-pkce`;
 
   app.get(`${prefix}/google`, (req, res) => {
-    if (req.get("host") !== host) return res.redirect(303, `${config.site}${prefix}/google`);
     const verifier = randomBytes(32).toString("base64url");
     const url = new URL(`${config.url}/auth/v1/authorize`);
     url.search = new URLSearchParams({
@@ -86,7 +84,8 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
   });
 
   app.post(`${prefix}/email`, express.json({ limit: "2kb" }), async (req, res) => {
-    if (req.get("host") !== host || req.get("origin") !== config.site) return res.sendStatus(403);
+    // The reverse proxy can rewrite Host. Origin identifies the browser page making this request.
+    if (req.get("origin") !== config.site) return res.sendStatus(403);
     const email = emailAddress.safeParse(req.body?.email);
     if (!email.success) return res.status(400).json({ message: "Enter a valid email address." });
 
@@ -113,7 +112,6 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
   function consumeCode(method) {
     return async (req, res) => {
       const failed = `/login?auth=${method}`;
-      if (req.get("host") !== host) return res.redirect(303, failed);
       const verifier = parse(req.headers.cookie ?? "")[cookieName(method)];
       const { code, error: providerError } = req.query;
       if (providerError || typeof code !== "string" || !code || code.length > 256 ||
