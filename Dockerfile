@@ -17,8 +17,9 @@ RUN python3 -m venv /opt/media-tools \
         'torch==2.8.0+cpu' 'yt-dlp[default,curl-cffi]==2026.10.26' -r /tmp/requirements-whisper.txt \
     && /opt/media-tools/bin/python -m pip check
 
-ENV PATH="/opt/media-tools/bin:${PATH}" XDG_CACHE_HOME=/opt/clip-maker-cache
+ENV PATH="/opt/media-tools/bin:${PATH}" XDG_CACHE_HOME=/opt/clip-maker-cache CLIP_MAKER_WHISPER_CPU=int8
 RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
+    && python3 -c 'from faster_whisper.utils import download_model; download_model("base")' \
     && python3 /tmp/darija_whisper.py \
     && chown -R node:node /opt/clip-maker-cache
 

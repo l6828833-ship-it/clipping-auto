@@ -13,7 +13,8 @@ Environment:
   WHISPER_MODEL_DARIJA          model for Darija only (default "darija-finetune",
                                 the small Darija fine-tune in darija_whisper.py)
   WHISPER_BEAM_SIZE             beam width on the CPU engine (default 5 for Arabic)
-  WHISPER_THREADS               CPU threads for PyTorch (default 2)
+  WHISPER_THREADS               CPU threads (default 4 for hosted int8, else 2)
+  CLIP_MAKER_WHISPER_CPU        "int8" enables faster-whisper on Linux
   CLIP_MAKER_WHISPER_ACCELERATE "0" disables Apple-GPU (MLX) transcription
   CLIP_MAKER_WHISPER_PROGRESS   "1" prints clip-maker-progress:<0..1> on stderr
 """
@@ -161,6 +162,15 @@ class Engine:
             self.source = model_name
         self.mlx_path = None
         self.torch_model = None
+        self.int8_model = None
+        self.use_int8 = (
+            sys.platform == "linux" and not self.finetune
+            and os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8"
+            and model_name in whisper._MODELS
+        )
+        self.threads = int(os.environ.get(
+            "WHISPER_THREADS", "4" if os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8" else "2"
+        ))
         if can_accelerate():
             try:
                 self.mlx_path = self._prepare_mlx()
@@ -197,15 +207,42 @@ class Engine:
             except Exception as exc:
                 log(f"Metal transcription failed; retrying with CPU: {exc}")
                 self.mlx_path = None
+        if self.use_int8:
+            try:
+                return self.run_int8(audio, **options)
+            except Exception as exc:
+                log(f"INT8 transcription failed; retrying with PyTorch: {exc}")
+                self.use_int8 = False
+                self.int8_model = None
         if self.torch_model is None:
             import torch
             import whisper
 
-            torch.set_num_threads(int(os.environ.get("WHISPER_THREADS", "2")))
+            torch.set_num_threads(self.threads)
             self.torch_model = whisper.load_model(self.source, device="cpu")
             if self.heads and self.finetune:
                 self.torch_model.set_alignment_heads(self.heads)
         return self.torch_model.transcribe(audio, fp16=False, **options)
+
+    def run_int8(self, audio, **options):
+        from dataclasses import asdict
+        from faster_whisper import WhisperModel
+
+        if self.int8_model is None:
+            self.int8_model = WhisperModel(
+                self.name, device="cpu", compute_type="int8", cpu_threads=self.threads,
+            )
+        options.pop("verbose", None)
+        if "logprob_threshold" in options:
+            options["log_prob_threshold"] = options.pop("logprob_threshold")
+        options.setdefault("beam_size", 1)
+        segments, info = self.int8_model.transcribe(audio, **options)
+        segments = [asdict(segment) for segment in segments]
+        return {
+            "language": info.language,
+            "text": "".join(segment["text"] for segment in segments),
+            "segments": segments,
+        }
 
 
 def mlx_checkpoint(checkpoint: Path) -> Path:
@@ -326,7 +363,8 @@ def main() -> None:
     model_name = pick_model(locale, language, default_model)
     if engine is None or engine.name != model_name:
         engine = Engine(model_name)
-    log(f"whisper: model={model_name} language={language or 'auto'} engine={'metal' if engine.mlx_path else 'cpu'}")
+    engine_name = "metal" if engine.mlx_path else "int8" if engine.use_int8 else "cpu"
+    log(f"whisper: model={model_name} language={language or 'auto'} engine={engine_name}")
 
     options = {
         "language": language,
