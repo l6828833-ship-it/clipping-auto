@@ -57,8 +57,11 @@ import { boolean, integer, jsonb, pgEnum, pgSchema, pgTable, real, serial, text,
  * another app whose tables have the same names. Unset: the default "public".
  */
 var DB_SCHEMA = (() => {
-  const name = process.env.CLIP_MAKER_DB_SCHEMA?.trim();
-  if (!name || name === "public") return null;
+  /* Default "clip_maker": the production database is shared with another app
+   * that owns public."users". Set CLIP_MAKER_DB_SCHEMA=public to use the
+   * public schema instead. */
+  const name = process.env.CLIP_MAKER_DB_SCHEMA?.trim() || "clip_maker";
+  if (name === "public") return null;
   if (!/^[a-z_][a-z0-9_]{0,62}$/.test(name)) throw new Error("CLIP_MAKER_DB_SCHEMA must be a lowercase name such as clip_maker.");
   return name;
 })();
@@ -163,29 +166,63 @@ var ENV = {
 // server/db.ts
 const supabaseAuth = readSupabaseAuthConfig(process.env);
 var _db = null;
+/**
+ * Clip Maker's tables, created when they are missing (every statement is
+ * "if not exists", so an existing database is left as it is). Only for a
+ * named schema: a database using "public" is set up with npm run db:migrate.
+ */
+function schemaSetupSql(schema) {
+  const q = `"${schema}"`;
+  const type = (name, values) => `DO $$ BEGIN CREATE TYPE ${q}."${name}" AS ENUM (${values.map((v) => `'${v}'`).join(", ")}); EXCEPTION WHEN duplicate_object THEN NULL; END $$;`;
+  const stamps = `"createdAt" timestamp with time zone DEFAULT now() NOT NULL, "updatedAt" timestamp with time zone DEFAULT now() NOT NULL`;
+  return [
+    `CREATE SCHEMA IF NOT EXISTS ${q}`,
+    type("clip_status", ["pending", "rendering", "done", "error"]),
+    type("hosted_status", ["none", "downloading", "ready", "error"]),
+    type("source_type", ["upload", "url"]),
+    type("user_role", ["user", "admin"]),
+    type("video_status", ["pending", "transcribing", "analyzing", "done", "error"]),
+    `CREATE TABLE IF NOT EXISTS ${q}."users" ("id" serial PRIMARY KEY NOT NULL, "openId" varchar(64) NOT NULL, "name" text, "email" varchar(320), "loginMethod" varchar(64), "passwordHash" varchar(255), "role" ${q}."user_role" DEFAULT 'user' NOT NULL, ${stamps}, "lastSignedIn" timestamp with time zone DEFAULT now() NOT NULL, CONSTRAINT "users_openId_unique" UNIQUE ("openId"))`,
+    `CREATE TABLE IF NOT EXISTS ${q}."videos" ("id" serial PRIMARY KEY NOT NULL, "userId" integer NOT NULL, "title" varchar(512), "sourceType" ${q}."source_type" NOT NULL, "sourceUrl" text, "status" ${q}."video_status" DEFAULT 'pending' NOT NULL, "duration" real, "transcript" text, "transcriptWords" jsonb, "captionLanguage" varchar(8) DEFAULT 'auto' NOT NULL, "transcriptionEnabled" boolean DEFAULT true NOT NULL, "sttCalls" integer DEFAULT 0 NOT NULL, "sttSeconds" real DEFAULT 0 NOT NULL, "hostedStatus" ${q}."hosted_status" DEFAULT 'none' NOT NULL, "hostedUrl" text, "hostProgress" integer DEFAULT 0 NOT NULL, "hostedOffset" real DEFAULT 0 NOT NULL, "width" integer, "height" integer, "hostError" text, ${stamps})`,
+    `CREATE TABLE IF NOT EXISTS ${q}."clips" ("id" serial PRIMARY KEY NOT NULL, "videoId" integer NOT NULL, "userId" integer NOT NULL, "title" varchar(512), "startTime" real, "endTime" real, "engagementScore" real, "status" ${q}."clip_status" DEFAULT 'pending' NOT NULL, "downloadUrl" text, "thumbnailUrl" text, "errorMessage" text, "zoom" real DEFAULT 1 NOT NULL, "offsetX" real DEFAULT 0 NOT NULL, "offsetY" real DEFAULT 0 NOT NULL, "captionsEnabled" boolean DEFAULT true NOT NULL, "framingSegments" jsonb, "music" jsonb, "scale" real DEFAULT 1 NOT NULL, "barColor" varchar(9) DEFAULT '#000000' NOT NULL, "textOverlays" jsonb, "cuts" jsonb, "layout" jsonb, ${stamps})`,
+    `CREATE TABLE IF NOT EXISTS ${q}."subtitles" ("id" serial PRIMARY KEY NOT NULL, "clipId" integer NOT NULL, "userId" integer NOT NULL, "words" jsonb, "style" jsonb, ${stamps})`
+  ];
+}
+var _dbReady = null;
 async function getDb() {
-  if (!_db && process.env.DATABASE_URL) {
-    try {
+  if (!process.env.DATABASE_URL) return null;
+  /* One shared start-up: every early caller waits for the tables to exist. */
+  if (!_dbReady) {
+    _dbReady = (async () => {
       /* CLIP_MAKER_DB_POOL_MAX caps the connection pool. Only needed for a
        * local test database that accepts one connection at a time. */
       const poolMax = Number(process.env.CLIP_MAKER_DB_POOL_MAX);
-      _db = Number.isInteger(poolMax) && poolMax > 0
+      const db = Number.isInteger(poolMax) && poolMax > 0
         ? drizzle({ connection: { connectionString: process.env.DATABASE_URL, max: poolMax } })
         : drizzle(process.env.DATABASE_URL);
-      /* Additive and idempotent, the same statement as migration 0002. Run
-       * here so a deploy that has not run migrations yet keeps serving clips. */
-      await _db.execute(sql`ALTER TABLE ${clips} ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
-        console.warn("[Database] Could not add clips.cuts; run `npm run db:migrate`:", String(error?.message ?? error));
+      if (DB_SCHEMA) {
+        for (const statement of schemaSetupSql(DB_SCHEMA)) {
+          await db.execute(sql.raw(statement));
+        }
+        console.log(`[Database] Using the "${DB_SCHEMA}" schema; its tables are ready.`);
+      }
+      /* Additive and idempotent, the same statements as migrations 0002 and
+       * 0003, for a database that predates them. */
+      await db.execute(sql`ALTER TABLE ${clips} ADD COLUMN IF NOT EXISTS "cuts" jsonb`).catch((error) => {
+        console.warn("[Database] Could not add clips.cuts:", String(error?.message ?? error));
       });
-      await _db.execute(sql`ALTER TABLE ${clips} ADD COLUMN IF NOT EXISTS "layout" jsonb`).catch((error) => {
-        console.warn("[Database] Could not add clips.layout; run `npm run db:migrate`:", String(error?.message ?? error));
+      await db.execute(sql`ALTER TABLE ${clips} ADD COLUMN IF NOT EXISTS "layout" jsonb`).catch((error) => {
+        console.warn("[Database] Could not add clips.layout:", String(error?.message ?? error));
       });
-    } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
-      _db = null;
-    }
+      return db;
+    })().catch((error) => {
+      console.warn("[Database] Could not set up the database:", String(error?.message ?? error));
+      /* Try again on the next request rather than staying broken. */
+      _dbReady = null;
+      return null;
+    });
   }
-  return _db;
+  return _dbReady;
 }
 async function upsertUser(user) {
   if (!user.openId) {

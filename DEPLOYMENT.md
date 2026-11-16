@@ -9,7 +9,7 @@ The project root contains a Dockerfile that builds the Vite website and starts t
    | Name | Value |
    | --- | --- |
    | `DATABASE_URL` | The existing production PostgreSQL connection string. For Supabase on an IPv4-only host, use the Session pooler string from **Connect**. Keep the database tables private to the server. |
-   | `CLIP_MAKER_DB_SCHEMA` | `clip_maker`. The app keeps its tables in this schema of the database. Needed for the Supabase project `zmlrtyzrwmhbydcidpku`, whose `public` schema belongs to another app with its own `users` table. The `clip_maker` schema and its four tables (users, videos, clips, subtitles) were created there on 16 Nov 2026. Leave unset for a database where Clip Maker's tables are in `public`. |
+   | `CLIP_MAKER_DB_SCHEMA` | Optional. The app keeps its tables in the `clip_maker` schema by default and creates them at start-up if they are missing, because the production Supabase database (`zmlrtyzrwmhbydcidpku`) is shared with another app that owns `public.users`. Set it to `public` only for a database where Clip Maker's tables are in `public` (then run `npm run db:migrate`). |
    | `JWT_SECRET` | The existing production signing secret to keep sessions valid, or a new value from `openssl rand -hex 32` for a fresh installation. |
    | `OPENAI_API_KEY` | An OpenAI API key, for AI highlights, titles and hooks (and transcription if switched on). |
    | `OPENAI_MODEL` | The OpenAI model for those AI steps, such as `gpt-5-mini` (the default) or `gpt-5`. |
