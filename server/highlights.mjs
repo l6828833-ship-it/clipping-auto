@@ -69,9 +69,9 @@ A clip is worth making only if a stranger who has never seen the full video woul
 3. SELF-CONTAINED - one complete idea or story. No dependence on earlier context.
 4. DENSITY - cut the wind-up. Start as late as possible and end as early as possible.
 Skip intros, outros, sponsor reads, housekeeping ("like and subscribe") and rambling.
-EVIDENCE: You have a transcript, not the video or its sound. Do not invent actions, facial expressions, laughter or dialogue. A gap between transcript lines is missing evidence, not proof of a funny silence or a reaction. Choose spoken moments supported by the supplied lines. A title or replay peak alone cannot prove what happens in a clip. Ignore garbled, repetitive or incoherent passages instead of inventing a story to explain them.
+EVIDENCE: You have a transcript, not the video. Do not invent dialogue or events. Laughter is rarely written down; it shows up as "ههه", "haha", "mdr", "[ضحك]", "[laughter]", a burst of short reaction lines ("واش بصح", "no way", "ewa"), people talking over each other, or a pause right after a line. Treat those as signs that something funny just happened. Transcripts of dialects such as Moroccan Darija are full of recognition mistakes and mixed French or Spanish: read the meaning through the mistakes, and never skip a passage only because some words look wrong or the speech is casual. Skip only passages that are clearly noise (the same few words looping, song lyrics, silence).
 
-HUMOUR. Funny moments are often the best clips, and the easiest to ruin with a bad cut. Read for jokes the way a comedian would:
+HUMOUR. Funny moments are the best clips. When the video has them, they come FIRST, before plain informative answers: teasing, banter, laughing together, absurd stories, embarrassing confessions, heated arguments, wild reactions. A clip does not need a clear "message" to work; it needs to make the viewer laugh or react. Read for jokes the way a comedian would:
 - A joke is SETUP then PUNCHLINE then REACTION. Find the setup: the line that plants the expectation the punchline breaks. Start the clip there, not on the punchline - a punchline with no setup is not funny.
 - End AFTER the reaction, never on the punchline itself. Include the line or two that follow it: the laugh, the comeback, the "no way", the tag that tops the joke. If people keep riffing and each line is funnier, keep going until the last topper lands, then stop before the talk returns to normal.
 - Recognise humour that is not announced: teasing and roasting between friends, sarcasm, exaggeration, wordplay, a deliberately wrong answer, an awkward silence, someone losing their composure, a running gag being called back. In Moroccan Darija and other dialects, expect mockery among friends, mixed French and Arabic wordplay, and proverbs twisted for effect.
@@ -87,6 +87,7 @@ TITLES. A title is the reason someone taps, so it must be about THIS clip and no
 - Name names. When the clip is told by or about someone a viewer could search for (the guest, the host, a celebrity they mention), write their name, spelled as in the video title, instead of "he", "she", "his brother" or "a man". "[GUEST NAME]'S BROTHER BROUGHT A CROCODILE HOME" beats "HIS BROTHER BROUGHT A CROCODILE HOME".
 - Tie every clip to its video. The video title (given with the transcript) holds the keywords people search for: the guest, the show, the topic. Use them in the titles of the clips that are about them, so each clip is recognisably from this video. Do not force a name into a clip that is not about that person.
 - Write it like the hook of a viral post: 3 to 8 words, concrete, with a curiosity gap, a contrast or a surprising number. A short quote from the clip often works best. No hashtags, no emojis, and nothing that is not true to the clip.
+- Do not just copy the clip's first sentence or turn it into a flat question ("What is in the 500 dirhams?"). Rewrite it as the caption a top page for that audience would post: a bold statement, the conflict, the outrageous line out of context, or the stakes. Bad: "شنو كاين فـ500 درهم ديال العرس؟". Good: "عطاوه 500 درهم فالعرس... وشوف شنو دار بيها". Write the way people of that audience type on social media, in their own dialect and spelling.
 - No two titles in the answer may share their main words, apart from the names. "reelTitle" follows the same rules for the video as a whole and names its guest or show.
 - "reason" is specific too: say what happens in the clip and why it holds attention, not that it is "engaging" or "relatable".
 
@@ -149,7 +150,7 @@ Return exactly this JSON shape:
 - "normal": none of the above clearly fits.
 Choose per clip; a set of clips from one video should not all get the same style unless they truly are alike.
 
-Sort highlights by engagementScore, highest first. Return fewer than ${count} rather than include a weak clip.`;
+Sort highlights by engagementScore, highest first. Return ${count} clips whenever the video is long enough to hold them without overlap: score the weaker ones honestly and they will be dropped later. Return fewer only when the video is too short.`;
   return { system, user };
 }
 

@@ -195,7 +195,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     onError: (err) => toast.error(err.message),
   });
 
-  const { transcribe: transcribeSource, skip: skipTranscription, progress: transcriptionProgress } = useSourceTranscription();
+  const { transcribe: transcribeSource, progress: transcriptionProgress } = useSourceTranscription();
 
   /** Set when transcription came back empty, so the person can go on without it. */
   const [noTranscript, setNoTranscript] = useState(false);
@@ -534,15 +534,6 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                 );
               })}
             </div></>}
-            {mode === "url" && analysisJobId && stage !== "saving" && (
-              <button type="button" disabled={skipTranscription.isPending}
-                onClick={() => skipTranscription.mutate({ id: analysisJobId }, {
-                  onError: (error: Error) => toast.error(error.message),
-                })}
-                className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold text-foreground hover:bg-secondary/60 disabled:opacity-40">
-                Choose a clip now
-              </button>
-            )}
           </div>
         )}
 
@@ -778,7 +769,8 @@ function StepHighlights({
   ));
   const [reelTitle, setReelTitle] = useState(detected?.reelTitle ?? "");
   const [manual, setManual] = useState(false);
-  const [contentType, setContentType] = useState(detected?.requestedType ?? "auto");
+  /* The kind of video is always detected automatically. */
+  const contentType = "auto";
   /** The title language the shown highlights were written in. */
   const generatedLanguage = found?.language ?? "";
 
@@ -885,20 +877,6 @@ function StepHighlights({
         </select>
       </label>
       {!apiKey && <NoKeyWarning />}
-      <label className="mb-4 block text-sm font-semibold">
-        Video content
-        <select value={contentType} disabled={analysing} onChange={e => setContentType(e.target.value)}
-          className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
-          <option value="auto">Detect automatically</option>
-          <option value="interview">Interview / conversation</option>
-          <option value="sport">Football / sport</option>
-          <option value="music">Music / performance</option>
-          <option value="comedy">Comedy / visual jokes</option>
-          <option value="mixed">Mixed content</option>
-        </select>
-      </label>
-      {found?.analysisNote && <p className="mb-4 text-xs text-muted-foreground">{found.analysisNote}</p>}
-      {found?.contentType && <p className="mb-3 text-xs text-muted-foreground">Detected content: {found.contentType}</p>}
       <button type="button" onClick={() => setManual(true)}
         className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
         Choose Clip Manually
@@ -975,9 +953,9 @@ function StepHighlights({
           <div className="flex gap-3">
             <button onClick={() => detect.mutate(detectInput)}
               className="flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-semibold text-muted-foreground bg-secondary/60 hover:text-foreground transition-colors">
-              <RefreshCw className="w-4 h-4" /> {found?.requestedType !== contentType ? "Re-analyze selected content" : generatedLanguage === titleLanguage ? "Re-analyze" : "Regenerate in selected language"}
+              <RefreshCw className="w-4 h-4" /> {generatedLanguage === titleLanguage ? "Re-analyze" : "Regenerate in selected language"}
             </button>
-            <button onClick={proceed} disabled={selected.size === 0 || generatedLanguage !== titleLanguage || (found?.requestedType ?? "auto") !== contentType}
+            <button onClick={proceed} disabled={selected.size === 0 || generatedLanguage !== titleLanguage}
               className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 glow-blue"
               style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
               Continue with {selected.size} clip{selected.size !== 1 ? "s" : ""} <ArrowRight className="w-4 h-4" />

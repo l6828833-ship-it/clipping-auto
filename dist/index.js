@@ -2107,7 +2107,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       const messages = media ? [
         { role: "system", content: `${MEDIA_EDITOR_RULES}\n${languageRule}` },
         { role: "user", content: [
-          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest up to ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nSampled frames follow; do not assume they show every event in the video.` },
+          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nSampled frames follow; do not assume they show every event in the video.` },
           ...frameContent(media.frames)
         ] }
       ] : [
@@ -2139,9 +2139,10 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       }
       /* Land every clip on real speech boundaries and drop overlapping picks. */
       const duration = media?.duration || video?.duration || input.videoDuration;
-      const bounded = highlights.filter(h => Number.isFinite(h.startTime) && Number.isFinite(h.endTime)
+      const inBounds = h => Number.isFinite(h.startTime) && Number.isFinite(h.endTime)
         && h.startTime >= 0 && h.endTime > h.startTime && (!duration || h.endTime <= duration + 0.1)
-        && h.endTime - h.startTime <= 95);
+        && h.endTime - h.startTime <= 95;
+      const bounded = highlights.filter(inBounds);
       const spoken = transcript.trim().length >= 10 ? filterSpeechHighlights(bounded.filter(h => h.evidence === "speech"), timedWords) : [];
       const visual = media ? bounded.filter(h => h.evidence === "visual"
         && media.frames.filter(f => f.time >= h.startTime && f.time <= h.endTime).length >= 2) : [];
@@ -2160,10 +2161,46 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         }
       }
       // Deduplicate the combined list without moving visual events to speech.
-      const ordered = snapHighlights([...snapped, ...verified], [], {
+      let ordered = snapHighlights([...snapped, ...verified], [], {
         videoDuration: duration, growTo: 0, maxSeconds: rankingMode ? 15 : 95
       }).slice(0, targetCount);
-      console.log(`[AI] Highlight candidates=${highlights.length}, supported=${supported.length}, verifiedVisual=${verified.length}, selected=${ordered.length}, target=${targetCount}`);
+      /* Models sometimes return far fewer clips than asked for. Ask once more
+       * for the missing ones, away from the clips already chosen. */
+      let added = 0;
+      if (!rankingMode && ordered.length < targetCount && transcript.trim().length >= 10 && deadline - Date.now() > 45000) {
+        try {
+          const missing = targetCount - ordered.length;
+          const taken = ordered.map(h => `${Math.floor(h.startTime)}s-${Math.ceil(h.endTime)}s`).join(", ") || "none";
+          const { response: more } = await aiAnswer({
+            model: aiModel(),
+            messages: [
+              { role: "system", content: `${prompts.system}\n${languageRule}` },
+              { role: "user", content: `${prompts.user}\n\nALREADY CHOSEN (do not reuse or overlap): ${taken}.\nFind ${missing + 2} MORE clips from the rest of the video. Funny parts first, then strong stories, arguments and reactions. Titles must not repeat the chosen ones.\n\n${languageRule}` }
+            ],
+            deadline,
+            temperature: 0.6,
+            max_tokens: 8192
+          });
+          const extra = [];
+          for (const item of aiParseJSON(more).highlights ?? []) {
+            const result = HighlightSchema.safeParse(item);
+            if (result.success && inBounds(result.data)) extra.push({ ...result.data, evidence: "speech" });
+          }
+          const fitted = filterSpeechHighlights(snapHighlights(filterSpeechHighlights(extra, timedWords), timedWords, { videoDuration: duration }), timedWords);
+          const clashes = (a, b) => Math.min(a.endTime, b.endTime) - Math.max(a.startTime, b.startTime)
+            > 0.4 * Math.min(a.endTime - a.startTime, b.endTime - b.startTime);
+          for (const h of fitted.sort((a, b) => b.engagementScore - a.engagementScore)) {
+            if (ordered.length >= targetCount) break;
+            if (ordered.some(k => clashes(k, h))) continue;
+            ordered.push(h);
+            added++;
+          }
+          ordered = ordered.map((h, i) => ({ ...h, id: i + 1 }));
+        } catch (error) {
+          console.warn(`[AI] Extra highlight pass failed: ${String(error?.message ?? error).slice(0, 160)}`);
+        }
+      }
+      console.log(`[AI] Highlight candidates=${highlights.length}, supported=${supported.length}, verifiedVisual=${verified.length}, extra=${added}, selected=${ordered.length}, target=${targetCount}`);
       if (ordered.length === 0) {
         throw new TRPCError3({
           code: "INTERNAL_SERVER_ERROR",
