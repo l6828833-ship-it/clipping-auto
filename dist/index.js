@@ -521,8 +521,10 @@ var GET_USER_INFO_WITH_JWT_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInf
 var OAuthService = class {
   constructor(client) {
     this.client = client;
-    console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
-    if (!ENV.oAuthServerUrl) {
+    /* Sign-in through Supabase does not use this server: say nothing then. */
+    const supabaseSignIn = Boolean(process.env.CLIP_MAKER_AUTH_SUPABASE_URL?.trim());
+    if (ENV.oAuthServerUrl) console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
+    else if (!supabaseSignIn) {
       console.error(
         "[OAuth] ERROR: OAUTH_SERVER_URL is not configured! Set OAUTH_SERVER_URL environment variable."
       );
@@ -1606,6 +1608,15 @@ var runningSourceTranscriptions = 0;
 /* A fixed 20-minute limit failed long videos that were transcribing fine,
  * just slowly. Instead a job fails when it stops moving for 10 minutes (no
  * progress report; waiting in the queue does not count), or after 2 hours. */
+/* Visual analysis looks at the whole video at 360p. Downloading that takes
+ * longer than analysis can wait for a long video, so it starts in the
+ * background while Whisper transcribes. Keyed by the address: the video
+ * record does not exist yet at that point. */
+const analysisVideoKey = (url) => `src${shortHash(url)}`;
+function prefetchAnalysisVideo(url) {
+  hostVideoShared({ videoId: analysisVideoKey(url), sourceUrl: url, maxHeight: 360 })
+    .catch((error) => console.warn(`[AI] Background download for visual analysis failed: ${String(error?.message ?? error).slice(0, 160)}`));
+}
 const SOURCE_IMPORT_STALL_MS = 10 * 60_000;
 const SOURCE_IMPORT_HARD_CAP_MS = 120 * 60_000;
 var extractRouter = router({
@@ -1669,7 +1680,16 @@ var extractRouter = router({
     watch();
     sourceTranscriptionJobs.set(id, job);
     runningSourceTranscriptions++;
-    const work = transcribeSource(input, (stage) => { job.stage = stage; watch(); }, {
+    /* Once the audio is in (so the two downloads do not compete), fetch the
+     * small copy of the video that visual analysis will need. */
+    let prefetched = false;
+    const onStage = (stage) => {
+      if (stage === "transcribing" && !prefetched) {
+        prefetched = true;
+        prefetchAnalysisVideo(input.url);
+      }
+    };
+    const work = transcribeSource(input, (stage) => { job.stage = stage; onStage(stage); watch(); }, {
       signal: controller.signal,
       reportMetadata: (value) => { metadata = value; },
       reportProgress: ({ stage, progress }) => { job.stage = stage; job.progress = progress; watch(); }
@@ -2084,7 +2104,8 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           // of the source. Do not mistake it for the full video.
           if (info && video.duration > info.duration + 2) file = null;
           if (!file && video.sourceType === "url") {
-            const full = await withinBudget(hostVideoShared({ videoId: video.id, sourceUrl: video.sourceUrl, maxHeight: 360 }), 60000);
+            /* Usually already downloaded, or nearly, while Whisper ran. */
+            const full = await withinBudget(hostVideoShared({ videoId: analysisVideoKey(video.sourceUrl), sourceUrl: video.sourceUrl, maxHeight: 360 }), 60000);
             file = path5.join(VIDEOS_DIR, full.fileName);
             info = full;
           }

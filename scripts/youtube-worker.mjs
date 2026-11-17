@@ -34,7 +34,7 @@ async function request(endpoint, options = {}) {
     method: "POST", ...options,
     redirect: "error",
     headers: { Authorization: `Bearer ${token}`, ...options.headers },
-    signal: AbortSignal.timeout(options.body ? 90_000 : 10_000),
+    signal: AbortSignal.timeout(options.timeout ?? (options.body ? 90_000 : 10_000)),
   });
 }
 
@@ -152,7 +152,8 @@ console.log(`Waiting for Clip Maker download jobs from ${origin.origin}.`);
 let waitingForServer = false;
 for (;;) {
   try {
-    const response = await request("claim");
+    /* The server holds the request until a job arrives, up to 20 seconds. */
+    const response = await request("claim", { headers: { "X-Clip-Maker-Wait": "20" }, timeout: 35_000 });
     if (response.status === 401 || response.status === 404) {
       if (!waitingForServer) console.warn("Waiting for the server to accept the worker token. Check the Rundploy runtime secret if this persists.");
       waitingForServer = true;

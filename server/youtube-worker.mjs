@@ -16,14 +16,21 @@ function workerToken() {
   return process.env.CLIP_MAKER_YOUTUBE_WORKER_TOKEN?.trim() || "";
 }
 
+/* Workers that ask for it are held open on /claim until a job arrives (up to
+ * LONG_POLL_MS), instead of polling every few seconds: the job still starts at
+ * once, and the host's request log gets one line per 20 seconds, not eight. */
+const LONG_POLL_MS = 20_000;
+const waiters = new Set();
+const polledRecently = () => waiters.size > 0 || Date.now() - lastPoll <= 20_000;
+
 /** True while the download worker is polling this server. */
 export function youtubeWorkerAlive() {
-  return Boolean(workerToken()) && Date.now() - lastPoll <= 20_000;
+  return Boolean(workerToken()) && polledRecently();
 }
 
 export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, language, onTranscribing, signal } = {}) {
   signal?.throwIfAborted();
-  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (Date.now() - lastPoll > 20_000 && !jobs.size)) return null;
+  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (!polledRecently() && !jobs.size)) return null;
   if (jobs.size >= 4) throw new Error("The YouTube download worker is busy. Try again shortly.");
 
   const id = randomUUID();
@@ -50,7 +57,26 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
     touch();
     jobs.set(id, { videoId, destination, kind, range, language, onTranscribing, finish, touch, state: "waiting" });
     signal?.addEventListener("abort", cancel, { once: true });
+    /* Hand it straight to a worker that is waiting on /claim. */
+    for (const waiter of waiters) if (waiter()) break;
   });
+}
+
+/** Claims the oldest waiting job; returns what the worker needs, or null. */
+function claimNextJob() {
+  for (const [id, job] of jobs) {
+    if (job.state !== "waiting") continue;
+    job.state = "claimed";
+    /* The 15 minutes count from the claim, not from when the job was
+     * queued. The worker takes one job at a time, so a job that waited
+     * behind others used to expire while it was still being downloaded,
+     * and its upload then got a 404. */
+    job.touch();
+    // The Mac worker only supplies blocked downloads. Self-hosted Whisper
+    // runs in the web container, regardless of paid API configuration.
+    return { id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: false };
+  }
+  return null;
 }
 
 /**
@@ -83,21 +109,27 @@ export function registerYouTubeWorker(app) {
     next();
   });
 
-  app.post(`${prefix}/claim`, (_req, res) => {
+  app.post(`${prefix}/claim`, (req, res) => {
     lastPoll = Date.now();
-    for (const [id, job] of jobs) {
-      if (job.state !== "waiting") continue;
-      job.state = "claimed";
-      /* The 15 minutes count from the claim, not from when the job was
-       * queued. The worker takes one job at a time, so a job that waited
-       * behind others used to expire while it was still being downloaded,
-       * and its upload then got a 404. */
-      job.touch();
-      // The Mac worker only supplies blocked downloads. Self-hosted Whisper
-      // runs in the web container, regardless of paid API configuration.
-      return res.json({ id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: false });
-    }
-    return res.sendStatus(204);
+    const job = claimNextJob();
+    if (job) return res.json(job);
+    /* Older workers give up on a request after 10 seconds, so only hold the
+     * ones that say how long they will wait. */
+    const wait = Math.min(LONG_POLL_MS, Math.max(0, Number(req.get("x-clip-maker-wait")) * 1000 || 0));
+    if (wait < 1000) return res.sendStatus(204);
+    let timer;
+    const done = () => { clearTimeout(timer); waiters.delete(waiter); lastPoll = Date.now(); };
+    const waiter = () => {
+      if (res.writableEnded || res.destroyed) { done(); return false; }
+      const next = claimNextJob();
+      if (!next) return false;
+      done();
+      res.json(next);
+      return true;
+    };
+    timer = setTimeout(() => { done(); if (!res.writableEnded && !res.destroyed) res.sendStatus(204); }, wait);
+    res.on("close", done);
+    waiters.add(waiter);
   });
 
   app.post(`${prefix}/:id/failed`, (req, res) => {
