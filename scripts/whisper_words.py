@@ -368,6 +368,31 @@ def collect_words(result, offset: float, limit: float, words: list, spans=None) 
             words.append({"word": token, "start": round(start, 3), "end": round(min(end, limit), 3)})
 
 
+def drop_loops(words: list, keep: int = 2) -> list:
+    """Removes a phrase the decoder repeated more than `keep` times in a row
+    ("لا يوجد صراحة. لا يوجد صراحة. لا يوجد صراحة..."), a known Whisper
+    failure on unclear audio. Natural repetition rarely goes past twice."""
+    norm = [re.sub(r"[^\w]", "", w["word"]) for w in words]
+    out_idx = list(range(len(words)))
+    for size in range(8, 0, -1):
+        result, i = [], 0
+        seq = [norm[k] for k in out_idx]
+        while i < len(out_idx):
+            phrase = seq[i:i + size]
+            if len(phrase) == size and any(phrase):
+                runs = 1
+                while seq[i + runs * size:i + (runs + 1) * size] == phrase:
+                    runs += 1
+                if runs > keep:
+                    result.extend(out_idx[i:i + keep * size])
+                    i += runs * size
+                    continue
+            result.append(out_idx[i])
+            i += 1
+        out_idx = result
+    return [words[k] for k in out_idx]
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise ValueError("usage: whisper_words.py <audio-path> [language] [model]")
@@ -467,6 +492,11 @@ def main() -> None:
         if report:
             log(f"clip-maker-progress:{end / duration:.4f}")
 
+    cleaned = drop_loops(words)
+    if len(cleaned) < len(words):
+        log(f"whisper: dropped {len(words) - len(cleaned)} repeated words")
+        words = cleaned
+        texts = [" ".join(w["word"] for w in words)]
     json.dump({"text": " ".join(texts).strip(), "words": words, "language": language, "model": model_name},
               sys.stdout, ensure_ascii=False)
 
