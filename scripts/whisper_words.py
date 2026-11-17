@@ -18,7 +18,10 @@ Environment:
   WHISPER_DETECT_EACH           "1" re-detects the language in every piece
                                 (slower; for heavily code-switched speech)
   WHISPER_BATCH                 on the int8 CPU engine, pieces decoded together
-                                per encoder pass (default 0: one at a time)
+                                per encoder pass (default 8 for the Darija
+                                fine-tune, 0 = one at a time for other models)
+  WHISPER_DETECT_DARIJA         "0" stops auto-detect from checking whether
+                                Arabic speech is Moroccan Darija
   WHISPER_THREADS               CPU threads (default 4 for hosted int8, else 2)
   CLIP_MAKER_WHISPER_CPU        "int8" enables faster-whisper on Linux
   CLIP_MAKER_WHISPER_ACCELERATE "0" disables Apple-GPU (MLX) transcription
@@ -328,6 +331,62 @@ def detect_language(engine: Engine, audio, spans) -> str | None:
     return max(votes, key=votes.get) if votes else None
 
 
+# Everyday Moroccan words that other Arabic (formal, Egyptian, Gulf, Levantine)
+# rarely uses. Words shared with those, such as كنت, شي or اخويا, are left out.
+DARIJA_WORDS = set("""
+بزاف واش دابا غادي غادين غادية كاين كاينة كاينين كاينش مكاينش ماكاينش شنو شنوا علاش
+مزيان مزيانة مزيانين هادشي هاداك هاديك هادوك كيفاش بغيت بغيتي بغا بغات بغينا بغيتو
+صافي والو خاصك خصك خصني خاصني خاصو خصو نتا نتوما حيت عافاك بلاصة زعما واخا
+شحال بشحال شكون فوقاش دغيا ديما هنايا تما كاع باش خايب خايبة سيمانة سيمان
+كندير كيدير كتدير كنقول كيقول كتقول كنشوف كيشوف كتشوف كنعرف كيعرف كتعرف
+""".split())
+# Darija forms its future with غ- (غنمشي، غيدير، غتقول). غير and words such
+# as غياب or غناء are ordinary Arabic and do not count.
+DARIJA_FUTURE = re.compile(r"^غ[نيت][؀-ۿ]{2,}$")
+NOT_FUTURE = ("غير", "غيا", "غيب", "غيو", "غيم", "غيث", "غيظ", "غين", "غنا", "غني", "غنم", "غتي")
+
+
+def darija_hits(text: str) -> int:
+    """How many words of `text` only Moroccan Darija would use."""
+    hits = 0
+    for token in re.findall(r"[؀-ۿ]+", text):
+        # و (and), ف (so), ب (with), ل (to) are written onto the next word.
+        # The غ- future only follows و or ف: لغتنا is "our language".
+        forms = [(token, True)]
+        if len(token) > 3 and token[0] in "وفبل":
+            forms.append((token[1:], token[0] in "وف"))
+        for form, verb in forms:
+            if (form in DARIJA_WORDS or form.startswith("ديال")
+                    or (verb and DARIJA_FUTURE.match(form) and not form.startswith(NOT_FUTURE))):
+                hits += 1
+                break
+    return hits
+
+
+def sounds_darija(engine: "Engine", audio, spans) -> bool:
+    """Whether Arabic speech is Moroccan Darija. Whisper only reports "Arabic",
+    and the general models rewrite Darija as formal Arabic, so this listens to
+    up to three 30-second samples with the Darija model and counts words that
+    only Darija uses. It stops as soon as it has heard two."""
+    duration = len(audio) / SAMPLE_RATE
+    starts = [spans[0][0] if spans else 0.0]
+    if duration > 90:
+        starts += [duration * 0.4, duration * 0.7]
+    found, total = 0, 0
+    for start in starts:
+        window = audio[int(start * SAMPLE_RATE): int((start + 30) * SAMPLE_RATE)]
+        if len(window) < SAMPLE_RATE:
+            continue
+        text = engine.run(window, language="ar", task="transcribe", word_timestamps=False,
+                          condition_on_previous_text=False, verbose=None, temperature=0.0).get("text", "")
+        found += darija_hits(text)
+        total += len(text.split())
+        if found >= 2:
+            break
+    log(f"whisper: {found} Darija words in {total} sampled words")
+    return found >= 2
+
+
 def is_hallucination(segment) -> bool:
     text = segment.get("text", "")
     if ALWAYS_HALLUCINATED.search(text):
@@ -423,6 +482,15 @@ def main() -> None:
     if language is None:
         engine = Engine(pick_model(locale, None, default_model))
         language = detect_language(engine, audio, spans)
+        # "Auto-detect" on Moroccan speech: Whisper says only "Arabic", which
+        # picked the slow general model and turned Darija into formal Arabic.
+        if language == "ar" and locale == "auto" and os.environ.get("WHISPER_DETECT_DARIJA", "1") != "0":
+            try:
+                darija_engine = Engine(DARIJA_FINETUNE)
+                if sounds_darija(darija_engine, audio, spans):
+                    locale, engine = "ar-ma", darija_engine
+            except Exception as exc:
+                log(f"whisper: Darija check failed, keeping Arabic: {exc}")
     model_name = pick_model(locale, language, default_model)
     if engine is None or engine.name != model_name:
         engine = Engine(model_name)
@@ -476,7 +544,10 @@ def main() -> None:
 
     words, texts = [], []
     report = os.environ.get("CLIP_MAKER_WHISPER_PROGRESS") == "1"
-    batch = int(os.environ.get("WHISPER_BATCH") or 0)
+    # The small Darija model batches by default: on 4 CPU threads, 5 minutes
+    # of Darija took 102 s batched against 176 s one piece at a time, with
+    # the same beam.
+    batch = int(os.environ.get("WHISPER_BATCH") or (8 if engine.finetune else 0))
     if engine.use_int8 and batch > 1 and pieces:
         # Batched: one encoder pass for several pieces. Same model and
         # settings; the windows go through together instead of one by one.
@@ -502,7 +573,9 @@ def main() -> None:
         log(f"whisper: dropped {len(words) - len(cleaned)} repeated words")
         words = cleaned
         texts = [" ".join(w["word"] for w in words)]
-    json.dump({"text": " ".join(texts).strip(), "words": words, "language": language, "model": model_name},
+    # "ar-ma" when the speech is Darija, so titles and later captions follow it.
+    json.dump({"text": " ".join(texts).strip(), "words": words,
+               "language": "ar-ma" if locale == "ar-ma" else language, "model": model_name},
               sys.stdout, ensure_ascii=False)
 
 

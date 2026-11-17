@@ -11,7 +11,7 @@ import { registerSocialPublishing } from "../server/social-publishing.mjs";
 import { facePanelCrop, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
 import { OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
-import { buildHighlightPrompts, clipCountFor, countOnPeaks, detectTextLanguage, filterSpeechHighlights, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines } from "../server/highlights.mjs";
+import { buildHighlightPrompts, buildJudgePrompt, clipCountFor, countOnPeaks, detectTextLanguage, filterSpeechHighlights, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines, transcriptWindows } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
@@ -1230,7 +1230,11 @@ async function localWhisperWords(audioPath, language = "auto", signal, onProgres
     console.log(`[Whisper] Starting self-hosted transcription, language=${language}`);
     const execution = promisify(execFile)(
       WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
-      { timeout: 20 * 60_000, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL",
+      /* A source import passes `signal` and has its own watchdog (no
+       * progress for 10 minutes, or 2 hours in all), so a long video is not
+       * cut off at 20 minutes while it is still moving. Calls without one
+       * keep the fixed limit, since Whisper runs one job at a time. */
+      { timeout: signal ? 125 * 60_000 : 20 * 60_000, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL",
         env: { ...process.env, CLIP_MAKER_WHISPER_PROGRESS: "1" } }
     );
     let pending = "";
@@ -2135,7 +2139,44 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         { role: "system", content: `${systemPrompt}\n${languageRule}` },
         { role: "user", content: `${userPrompt}\n\n${languageRule}` }
       ];
-      const { response, modelUsed } = await aiAnswer({
+      /* A long video is also searched part by part, all parts at once, so
+       * moments deep in the video get the same attention as the start. */
+      const parts = rankingMode ? [] : transcriptWindows(lines, { duration: video?.duration || input.videoDuration });
+      const perPart = parts.length ? Math.min(6, Math.max(3, Math.ceil(targetCount * 2 / parts.length) + 1)) : 0;
+      const searchPart = async (part) => {
+        const from = part[0].start, to = part[part.length - 1].end;
+        const p = buildHighlightPrompts({
+          transcript: formatTimedTranscript(part),
+          timed: true,
+          videoDuration: input.videoDuration,
+          peaks: peaks.filter(pk => pk.end > from && pk.start < to),
+          chapters: (input.chapters ?? []).filter(c => c.start >= from && c.start < to),
+          count: perPart,
+          videoTitle: input.sourceTitle ?? "",
+          channel: input.channel ?? ""
+        });
+        const { response: answer } = await aiAnswer({
+          model: aiModel(),
+          messages: [
+            { role: "system", content: `${p.system}\n${languageRule}` },
+            { role: "user", content: `This is one part of a longer video, from ${Math.floor(from)}s to ${Math.ceil(to)}s. Choose only from this part.\n\n${p.user}\n\n${languageRule}` }
+          ],
+          deadline: deadline - 70000,
+          temperature: 0.4,
+          max_tokens: 8192
+        });
+        const found = [];
+        for (const item of aiParseJSON(answer).highlights ?? []) {
+          const result = HighlightSchema.safeParse(item);
+          if (result.success) found.push({ ...result.data, evidence: "speech" });
+        }
+        return found;
+      };
+      const partsJob = Promise.all(parts.map(part => searchPart(part).catch(error => {
+        console.warn(`[AI] Part ${Math.floor(part[0].start)}s: ${String(error?.message ?? error).slice(0, 160)}`);
+        return [];
+      })));
+      const mainJob = aiAnswer({
         model: aiModel(),
         messages,
         deadline: media ? deadline - 60000 : deadline,
@@ -2145,13 +2186,25 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         // model that reasons first still has room left to write them.
         max_tokens: 8192
       });
-      console.log(`[AI] Highlights analysed by ${modelUsed}.`);
+      /* With parts to fall back on, a failed whole-video pass is not fatal. */
+      const [main, partFound] = await Promise.all([
+        parts.length ? mainJob.catch(error => {
+          console.warn(`[AI] Whole-video pass failed, using the parts: ${String(error?.message ?? error).slice(0, 160)}`);
+          return null;
+        }) : mainJob,
+        partsJob
+      ]);
+      const response = main?.response ?? { choices: [{ message: { content: "{}" } }] };
+      const modelUsed = main?.modelUsed ?? aiModel();
+      console.log(`[AI] Highlights analysed by ${modelUsed}${parts.length ? ` (and ${parts.length} parts)` : ""}.`);
       const parsed = aiParseJSON(response);
       const highlights = [];
       for (const item of parsed.highlights ?? []) {
         const result = HighlightSchema.safeParse(item);
         if (result.success) highlights.push(result.data);
       }
+      const fromParts = partFound.flat();
+      highlights.push(...fromParts);
       if (highlights.length === 0) {
         throw new TRPCError3({
           code: "INTERNAL_SERVER_ERROR",
@@ -2182,9 +2235,46 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         }
       }
       // Deduplicate the combined list without moving visual events to speech.
-      let ordered = snapHighlights([...snapped, ...verified], [], {
+      const pool = snapHighlights([...snapped, ...verified], [], {
         videoDuration: duration, growTo: 0, maxSeconds: rankingMode ? 15 : 95
-      }).slice(0, targetCount);
+      });
+      let ordered = pool.slice(0, targetCount);
+      /* Candidates found part by part were each the best of their own part.
+       * One more look compares them side by side, keeps the best of the whole
+       * video and sharpens their titles. */
+      let judged = false;
+      if (fromParts.length && pool.length > targetCount && deadline - Date.now() > 40000) {
+        try {
+          const candidates = pool.slice(0, 18);
+          const judge = buildJudgePrompt({ candidates, lines, count: targetCount,
+            videoTitle: input.sourceTitle || video?.title || "", languageInstruction: languageRule });
+          const { response: verdict } = await aiAnswer({
+            model: aiModel(),
+            messages: [{ role: "system", content: judge.system }, { role: "user", content: judge.user }],
+            deadline,
+            temperature: 0.3,
+            max_tokens: 6000
+          });
+          const picks = [];
+          for (const pick of aiParseJSON(verdict).picks ?? []) {
+            const h = candidates.find(c => c.id === Number(pick?.id));
+            if (!h || picks.some(p => p.id === h.id)) continue;
+            const title = typeof pick.title === "string" ? pick.title.trim().slice(0, 120) : "";
+            const score = Number(pick.engagementScore);
+            picks.push({ ...h,
+              title: title || h.title,
+              engagementScore: Number.isFinite(score) ? Math.max(1, Math.min(99, score)) : h.engagementScore,
+              reason: typeof pick.reason === "string" && pick.reason.trim() ? pick.reason.trim() : h.reason });
+          }
+          if (picks.length) {
+            ordered = [...picks, ...pool.filter(h => !picks.some(p => p.id === h.id))]
+              .slice(0, targetCount).map((h, i) => ({ ...h, id: i + 1 }));
+            judged = true;
+          }
+        } catch (error) {
+          console.warn(`[AI] Final comparison failed, keeping the scores: ${String(error?.message ?? error).slice(0, 160)}`);
+        }
+      }
       /* Models sometimes return far fewer clips than asked for. Ask once more
        * for the missing ones, away from the clips already chosen. */
       let added = 0;
@@ -2221,7 +2311,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           console.warn(`[AI] Extra highlight pass failed: ${String(error?.message ?? error).slice(0, 160)}`);
         }
       }
-      console.log(`[AI] Highlight candidates=${highlights.length}, supported=${supported.length}, verifiedVisual=${verified.length}, extra=${added}, selected=${ordered.length}, target=${targetCount}`);
+      console.log(`[AI] Highlight candidates=${highlights.length} (parts=${parts.length}, fromParts=${fromParts.length}), supported=${supported.length}, verifiedVisual=${verified.length}, judged=${judged}, extra=${added}, selected=${ordered.length}, target=${targetCount}`);
       if (ordered.length === 0) {
         throw new TRPCError3({
           code: "INTERNAL_SERVER_ERROR",

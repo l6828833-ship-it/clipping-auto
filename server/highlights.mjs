@@ -321,6 +321,47 @@ export function snapHighlights(highlights, words, { videoDuration, minSeconds = 
   return kept.map((h, i) => ({ ...h, id: i + 1 }));
 }
 
+/**
+ * Long transcripts in parts of about ten minutes (at most `maxParts`, so a
+ * two-hour video still means a handful of requests), overlapping a little so
+ * a story that crosses a border is whole in one of them. Read in one go, a
+ * long transcript gets skimmed: the model picks from the start and the most
+ * obvious passages and misses the rest. Returns [] for a short video.
+ */
+export function transcriptWindows(lines, { duration, minSeconds = 1200, partSeconds = 600, maxParts = 8, overlap = 45 } = {}) {
+  const total = duration || lines.at(-1)?.end || 0;
+  if (!lines.length || total < minSeconds) return [];
+  const size = Math.max(partSeconds, total / maxParts + overlap);
+  const parts = [];
+  for (let from = 0; from < total; from += size - overlap) {
+    const part = lines.filter((l) => l.start >= from && l.start < from + size);
+    if (part.length >= 8) parts.push(part);
+    if (from + size >= total) break;
+  }
+  return parts.length >= 2 ? parts : [];
+}
+
+/**
+ * The final choice among candidates found part by part: the model sees every
+ * candidate's own words side by side and keeps the strongest. Candidates found
+ * in separate parts were each "the best of their part"; only a comparison
+ * says which are the best of the video.
+ */
+export function buildJudgePrompt({ candidates, lines, count, videoTitle = "", languageInstruction = "" }) {
+  const textOf = (h) => {
+    const text = lines.filter((l) => l.end > h.startTime && l.start < h.endTime).map((l) => l.text).join(" ");
+    return text.length > 900 ? `${text.slice(0, 600)} … ${text.slice(-280)}` : text;
+  };
+  const list = candidates.map((h) => `#${h.id} [${fmt(h.startTime)}-${fmt(h.endTime)}s, ${Math.round(h.endTime - h.startTime)}s, ${h.kind || "other"}] ${h.title}\n${textOf(h)}`).join("\n\n");
+  const system = `You are the senior editor choosing which short clips get published from one video. Each candidate below was found in its own part of the video. Compare them all and keep the ${count} that a stranger scrolling TikTok or Reels is most likely to watch to the end and share.
+Judge on: a hook in the first seconds, a complete payoff (punchline with its reaction, answer, reveal), no need for outside context, and energy. Funny parts, banter, heated arguments, surprising confessions and strong stories beat calm explanations. Transcripts of dialects such as Moroccan Darija have recognition mistakes: judge the meaning, not the spelling. Do not keep two clips about the same thing.
+Then write each kept clip's final title: 3 to 8 words, specific to that clip, a hook that makes people need the payoff without giving it away, in the language and dialect the instructions ask for, the way a big page for that audience would caption it. Never a generic label such as "funny moment" or "interesting discussion".
+Return ONLY JSON: {"picks":[{"id":<candidate number>,"title":"...","engagementScore":<60-99>,"reason":"one sentence on why it works"}]} with the best first.
+${languageInstruction}`;
+  const user = `${videoTitle ? `VIDEO TITLE: ${String(videoTitle).slice(0, 200)}\n\n` : ""}CANDIDATES:\n\n${list}\n\nKeep the best ${count}.`;
+  return { system, user };
+}
+
 /** How many highlights sit on a most-replayed peak. */
 export function countOnPeaks(highlights, peaks) {
   return highlights.filter((h) => peaks.some((p) => Math.min(p.end, h.endTime) - Math.max(p.start, h.startTime) > 2)).length;
