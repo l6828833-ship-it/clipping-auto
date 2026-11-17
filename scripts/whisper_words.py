@@ -10,10 +10,10 @@ model (see `pick_model`) because the small models are not usable for it.
 Environment:
   WHISPER_MODEL                 default model when none is passed (base)
   WHISPER_MODEL_ARABIC          model for Arabic (does not override Darija)
-  WHISPER_MODEL_DARIJA          model for Darija only (default "large-v3-turbo";
-                                "darija-finetune" remains an explicit option)
-  WHISPER_BEAM_SIZE             beam width (default 1 on the int8 CPU engine,
-                                5 for Arabic elsewhere)
+  WHISPER_MODEL_DARIJA          model for Darija only (default "darija-finetune",
+                                a Whisper small trained on Moroccan speech)
+  WHISPER_BEAM_SIZE             beam width (default 5 for Arabic and the Darija
+                                fine-tune; 1 for large models on the int8 CPU engine)
   WHISPER_CHUNK_SECONDS         longest speech piece sent at once (default 28)
   WHISPER_DETECT_EACH           "1" re-detects the language in every piece
                                 (slower; for heavily code-switched speech)
@@ -86,7 +86,10 @@ def pick_model(locale: str, language: str | None, default: str) -> str:
     darija = locale == "ar-ma"
     # The container sets WHISPER_MODEL_ARABIC=small. It must not override an
     # explicit choice of Darija, which has its own checkpoint and setting.
-    chosen = (os.environ.get("WHISPER_MODEL_DARIJA") or "large-v3-turbo") if darija else os.environ.get("WHISPER_MODEL_ARABIC")
+    # Darija defaults to the Darija fine-tune. On a real Darija recording,
+    # large-v3-turbo rewrote the speech as formal Arabic (another wording,
+    # not what was said) and took 3-4 times as long on the server's CPU.
+    chosen = (os.environ.get("WHISPER_MODEL_DARIJA") or DARIJA_FINETUNE) if darija else os.environ.get("WHISPER_MODEL_ARABIC")
     if not chosen:
         ram = total_ram_gb()
         if ram >= 7.5:
@@ -455,8 +458,10 @@ def main() -> None:
             options["initial_prompt"] = prompt
     # On the server's CPU engine a 5-wide beam cost several times the time of
     # greedy decoding for little gain with large-v3-turbo; GPU/Metal runs keep
-    # the wider beam for Arabic.
-    beam = os.environ.get("WHISPER_BEAM_SIZE") or ("1" if engine.use_int8 else "5" if language == "ar" else "")
+    # the wider beam for Arabic. The small Darija fine-tune keeps it everywhere:
+    # it got noticeably more words right for about a third more time.
+    beam = os.environ.get("WHISPER_BEAM_SIZE") or (
+        "5" if engine.finetune else "1" if engine.use_int8 else "5" if language == "ar" else "")
     if beam.isdigit() and int(beam) > 1:
         options["beam_size"] = int(beam)
 
