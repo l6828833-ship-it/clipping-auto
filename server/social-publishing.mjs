@@ -70,7 +70,10 @@ export function registerSocialPublishing(app, dependencies, env = process.env) {
 
   async function checkPost(post) {
     const user = post.user_id;
-    const { account, token } = await connection(user, post.platform);
+    const { account, token } = await connection(user, post.platform).catch(async (error) => {
+      await store.touchPost?.(post.id, user).catch(() => {});
+      throw error;
+    });
     if (account.external_id !== post.account_id) throw new PublishingError("Reconnect the account used for this post.", 409);
     if (!(await store.claimPost(post.id, user))) return;
     try {

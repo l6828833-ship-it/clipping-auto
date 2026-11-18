@@ -114,7 +114,8 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
    *
    * - `?token_hash=…`: from an email template that links straight to this
    *   address. The hash alone proves the click, so the link works in any
-   *   browser or device, like other "email me a link" sign-ins.
+   *   browser or device, like other "email me a link" sign-ins. It arrives
+   *   posted from the page the link opens (see `confirmPage`).
    * - `?code=…`: from Supabase's default template, which goes through
    *   Supabase first. That code is only good together with the cookie set when
    *   the link was requested, so it works only in the browser that asked.
@@ -122,7 +123,7 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
   function finishSignIn(method) {
     return async (req, res) => {
       const failed = `/login?auth=${method}`;
-      const { code, token_hash: tokenHash, error: providerError } = req.query;
+      const { code, token_hash: tokenHash, error: providerError } = req.method === "POST" ? req.body ?? {} : req.query;
       if (providerError) return res.redirect(303, failed);
       try {
         let session;
@@ -152,6 +153,49 @@ export function registerSupabaseAuth(app, config, { linkUser, setSession }) {
     };
   }
 
-  app.get(emailCallback, finishSignIn("email"));
+  /* A `token_hash` link no longer signs in when it is opened. Mail scanners
+   * (Outlook Safe Links and the like) open every link in new mail, which used
+   * up the one-time link before the person clicked it. And anyone could send
+   * a link of their own and silently sign the reader into the sender's
+   * account, where connecting YouTube or TikTok would hand the sender those
+   * channels. Opening the link shows a page; its button signs in with a POST,
+   * which the Origin check confines to this site. `?code=` links need this
+   * browser's cookie, so they still finish on the GET. */
+  app.get(emailCallback, (req, res, next) => {
+    const tokenHash = req.query.token_hash;
+    if (tokenHash === undefined) return next();
+    if (typeof tokenHash !== "string" || !/^[A-Za-z0-9_-]{16,256}$/.test(tokenHash)) {
+      return res.redirect(303, "/login?auth=email");
+    }
+    res.set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    return res.type("html").send(confirmPage(tokenHash));
+  }, finishSignIn("email"));
+  app.post(emailCallback, express.urlencoded({ extended: false, limit: "2kb" }), (req, res, next) => {
+    if (req.get("origin") !== config.site) return res.sendStatus(403);
+    return next();
+  }, finishSignIn("email"));
   app.get(googleCallback, finishSignIn("google"));
+}
+
+/** The page an emailed sign-in link opens. `tokenHash` is already checked to
+ * be URL-safe base64, so it needs no escaping. */
+function confirmPage(tokenHash) {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Sign in to Clip Maker</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d12;color:#e8eaf0;font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:22rem;padding:2rem;text-align:center}
+h1{font-size:1.4rem;margin:0 0 .5rem}
+p{color:#a3a9b8;margin:0 0 1.5rem}
+button{width:100%;padding:.8rem 1rem;border:0;border-radius:.6rem;background:#3b82f6;color:#fff;font:600 1rem system-ui,sans-serif;cursor:pointer}
+</style></head>
+<body><main>
+<h1>Sign in to Clip Maker</h1>
+<p>Continue only if you asked for this sign-in link.</p>
+<form method="post" action="${emailCallback}">
+<input type="hidden" name="token_hash" value="${tokenHash}">
+<button type="submit">Sign in</button>
+</form>
+</main></body></html>`;
 }

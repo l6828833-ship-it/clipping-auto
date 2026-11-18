@@ -1,22 +1,27 @@
 /**
- * Hosted speech-to-text with word timings, through the OpenAI API.
+ * Hosted speech-to-text through the OpenAI API.
  *
  * Off unless the server has both OPENAI_API_KEY and
  * CLIP_MAKER_TRANSCRIBE=openai: an AI key alone must never quietly send every
  * upload to a paid speech service. When on, it replaces local Whisper and
- * takes seconds instead of minutes, with no load on the server.
+ * takes seconds instead of minutes.
  *
- * The audio is cut into short MP3 pieces (the API takes 25 MB per request),
- * the pieces are transcribed a few at a time, and the word times are shifted
- * back onto the full recording.
+ * Two ways, by model:
  *
- * Returns null when the API cannot give word timings, so the caller falls back
- * to local Whisper; captions need a start and an end for every word.
+ * - gpt-transcribe (the default): OpenAI's current model, which writes much
+ *   better Arabic and Darija than Whisper, gives no word timings. So
+ *   scripts/whisper_words.py sends each speech piece (up to 28 seconds) and
+ *   places the returned words on the audio with the small local Whisper "base"
+ *   model (see scripts/hosted_transcribe.py). $0.0045 a minute of audio.
+ * - whisper-1 (OPENAI_TRANSCRIBE_MODEL=whisper-1): the API gives word timings
+ *   itself; `hostedWords` below cuts the audio into 5-minute MP3 pieces and
+ *   shifts the times back. OpenAI retires whisper-1 on 26 February 2027.
+ *
+ * Either way, a failure falls back to local Whisper.
  *
  *   OPENAI_API_KEY             the API key
  *   CLIP_MAKER_TRANSCRIBE      "openai" to use it
- *   OPENAI_TRANSCRIBE_MODEL    optional, default "whisper-1" (it must support
- *                              word timestamps)
+ *   OPENAI_TRANSCRIBE_MODEL    optional, default "gpt-transcribe"
  *   OPENAI_BASE_URL            optional, for a compatible endpoint or a test stand-in
  */
 import { execFile } from "node:child_process";
@@ -29,11 +34,42 @@ const PARALLEL = 4;
 let retryAfterCredits = 0;
 
 const baseUrl = () => (process.env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
-const modelId = () => process.env.OPENAI_TRANSCRIBE_MODEL?.trim() || "whisper-1";
+const modelId = () => process.env.OPENAI_TRANSCRIBE_MODEL?.trim() || "gpt-transcribe";
 
 export function hostedSttAvailable() {
   return Boolean(process.env.OPENAI_API_KEY?.trim())
-    && process.env.CLIP_MAKER_TRANSCRIBE?.trim().toLowerCase() === "openai";
+    && process.env.CLIP_MAKER_TRANSCRIBE?.trim().toLowerCase() === "openai"
+    && Date.now() >= retryAfterCredits;
+}
+
+/** True when the model returns word timings itself (whisper-1). Other models
+ * give text only, and the words are timed locally. */
+export function hostedWordTimings() {
+  return modelId() === "whisper-1";
+}
+
+/** After the API refused for lack of credit, a bad key or the rate limit,
+ * stop sending it work for a few minutes. */
+export function noteHostedFailure(status) {
+  if ([401, 402, 403, 429].includes(Number(status))) retryAfterCredits = Date.now() + 5 * 60_000;
+}
+
+/** Names and phrases from the video's title and channel, which the speakers
+ * are likely to say and the model should spell the same way. */
+export function transcriptionKeywords(...sources) {
+  const phrases = new Set();
+  for (const source of sources) {
+    /* The API refuses a whole request whose keywords hold "<", ">" or a line
+     * break, so those split phrases too. */
+    for (const part of String(source ?? "").split(/[|•·–—:\/#،,؛!?؟()\[\]"“”«»<>\r\n]+|\s-\s/)) {
+      const phrase = part.replace(/\s+/g, " ").trim();
+      const words = phrase.split(" ").length;
+      /* yt-dlp fills in "Unknown" or "NA" when a source has no channel. */
+      if (/^(unknown|n\/?a|untitled( video)?)$/i.test(phrase)) continue;
+      if (phrase.length >= 3 && phrase.length <= 40 && words <= 5 && /\p{L}/u.test(phrase)) phrases.add(phrase);
+    }
+  }
+  return [...phrases].slice(0, 10);
 }
 
 /*

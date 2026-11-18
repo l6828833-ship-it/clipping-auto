@@ -22,10 +22,21 @@ export function tokenVault(secret) {
   };
 }
 
+// A post the platform has not confirmed after a day will not be: it was
+// deleted on the platform, or access was revoked. Ending it stops the checks
+// and lets the user reconnect or disconnect that platform again.
+const EXPIRE_PROCESSING = `UPDATE clip_maker_social.posts SET status='unknown',updated_at=now(),
+  error='The platform has not confirmed this post after a day. Check your account before posting it again.'
+  WHERE status='processing' AND created_at<now()-interval '24 hours'`;
+
 // Separate from application tables so installations using either public or
 // clip_maker retain the same connections. Never exposed through Supabase's API.
 export function createSocialStore(env = process.env, databasePool) {
   const pool = databasePool || new pg.Pool({ connectionString: env.DATABASE_URL, max: 3, connectionTimeoutMillis: 10_000 });
+  /* pg re-emits an idle connection's error (a pooler restart, a dropped
+   * network) on the pool, and an "error" event nobody listens to ends the
+   * process. The pool replaces the connection by itself. */
+  if (!databasePool) pool.on("error", (error) => console.warn("[Publish] Database connection dropped:", error.message));
   let ready;
   async function init() {
     if (!env.DATABASE_URL) throw new Error("Publishing storage is not configured.");
@@ -83,6 +94,7 @@ export function createSocialStore(env = process.env, databasePool) {
       // Never retry an ambiguous upload: the platform may already have it.
       await query(`UPDATE clip_maker_social.posts SET status='unknown',error='The connection was interrupted. Check your social account before posting again.'
         WHERE user_id=$1 AND status IN ('uploading','checking') AND updated_at<now()-interval '15 minutes'`, [user]);
+      await query(`${EXPIRE_PROCESSING} AND user_id=$1`, [user]);
       return (await query("SELECT * FROM clip_maker_social.posts WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50", [user])).rows;
     },
     async updatePost(id, user, state) {
@@ -94,7 +106,18 @@ export function createSocialStore(env = process.env, databasePool) {
         WHERE id=$1 AND user_id=$2 AND status='processing' RETURNING *`, [id,user])).rows[0];
     },
     async pendingPosts() {
-      return (await query("SELECT * FROM clip_maker_social.posts WHERE status='processing' ORDER BY updated_at LIMIT 10")).rows;
+      await query(EXPIRE_PROCESSING);
+      // Every 15 seconds for a new post, every 5 minutes once it is 10
+      // minutes old: a video YouTube never confirms (deleted in Studio, for
+      // one) cost a quota unit every 15 seconds, all day.
+      return (await query(`SELECT * FROM clip_maker_social.posts WHERE status='processing'
+        AND (created_at>now()-interval '10 minutes' OR updated_at<now()-interval '5 minutes')
+        ORDER BY updated_at LIMIT 10`)).rows;
+    },
+    // A check that could not even start (the account's access was revoked)
+    // moves the post to the back of the queue instead of blocking the rest.
+    async touchPost(id, user) {
+      await query("UPDATE clip_maker_social.posts SET updated_at=now() WHERE id=$1 AND user_id=$2 AND status='processing'", [id, user]);
     },
     // Serialise token refresh with a cross-instance database advisory lock.
     async withAccountLock(user, platform, fn) {

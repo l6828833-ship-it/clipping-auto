@@ -17,7 +17,7 @@ import { MAX_ANALYSIS_RANGE_SECONDS, wordsWithinRange } from "../shared/analysis
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
-import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
+import { hostedSttAvailable, hostedWords, hostedWordTimings, noteHostedFailure, transcriptionKeywords } from "../server/hosted-stt.mjs";
 import { readMediaEvidence, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile, streamStoredMedia } from "../server/object-storage.mjs";
@@ -203,6 +203,10 @@ async function getDb() {
       const db = Number.isInteger(poolMax) && poolMax > 0
         ? drizzle({ connection: { connectionString: process.env.DATABASE_URL, max: poolMax } })
         : drizzle(process.env.DATABASE_URL);
+      /* An idle connection that drops (a pooler restart, a network blip) is
+       * reported as an "error" event on the pool; with no listener Node
+       * exits, losing every running import and render. */
+      db.$client?.on?.("error", (error) => console.warn("[Database] Connection dropped:", error.message));
       if (DB_SCHEMA) {
         for (const statement of schemaSetupSql(DB_SCHEMA)) {
           await db.execute(sql.raw(statement));
@@ -1241,12 +1245,16 @@ var WHISPER_PYTHON = process.env.WHISPER_PYTHON ?? "python3";
 var WHISPER_SCRIPT = process.env.WHISPER_SCRIPT ?? path3.join(process.cwd(), "scripts", "whisper_words.py");
 var WHISPER_MODEL = process.env.WHISPER_MODEL ?? "base";
 var whisperQueue = Promise.resolve();
-async function localWhisperWords(audioPath, language = "auto", signal, onProgress = () => {}) {
+/* `hosted`: the text comes from the OpenAI API and the script only places the
+ * words with the small "base" model (scripts/hosted_transcribe.py). That is
+ * light, so it neither waits behind a long local transcription nor holds one
+ * up. `keywords`: names from the title, for the API to spell right. */
+async function localWhisperWords(audioPath, language = "auto", signal, onProgress = () => {}, { hosted = false, keywords = [] } = {}) {
   onProgress({ stage: "queued", progress: 0 });
-  const transcription = whisperQueue.then(async () => {
+  const run = async () => {
     signal?.throwIfAborted();
     onProgress({ stage: "transcribing", progress: 0 });
-    console.log(`[Whisper] Starting self-hosted transcription, language=${language}`);
+    console.log(`[Whisper] Starting ${hosted ? "OpenAI" : "self-hosted"} transcription, language=${language}`);
     const execution = promisify(execFile)(
       WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
       /* A source import passes `signal` and has its own watchdog (no
@@ -1254,7 +1262,10 @@ async function localWhisperWords(audioPath, language = "auto", signal, onProgres
        * cut off at 20 minutes while it is still moving. Calls without one
        * keep the fixed limit, since Whisper runs one job at a time. */
       { timeout: signal ? 125 * 60_000 : 20 * 60_000, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL",
-        env: { ...process.env, CLIP_MAKER_WHISPER_PROGRESS: "1" } }
+        env: {
+          ...process.env, CLIP_MAKER_WHISPER_PROGRESS: "1",
+          ...(hosted ? { CLIP_MAKER_HOSTED_TEXT: "openai", CLIP_MAKER_STT_KEYWORDS: keywords.join("\n") } : {})
+        } }
     );
     let pending = "";
     execution.child.stderr.on("data", chunk => {
@@ -1268,22 +1279,32 @@ async function localWhisperWords(audioPath, language = "auto", signal, onProgres
       }
     });
     return execution;
-  });
-  whisperQueue = transcription.then(() => {}, () => {});
+  };
+  const transcription = hosted ? run() : whisperQueue.then(run);
+  if (!hosted) whisperQueue = transcription.then(() => {}, () => {});
   const { stdout } = await transcription;
   const parsed = JSON.parse(stdout);
   const words = (Array.isArray(parsed.words) ? parsed.words : []).filter(
     (w) => w && typeof w.word === "string" && w.word.trim() && Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start
   ).map((w) => ({ word: w.word.trim(), start: w.start, end: w.end }));
-  console.log(`[Whisper] Finished self-hosted transcription, ${words.length} timed words`);
+  console.log(`[Whisper] Finished ${hosted ? "OpenAI" : "self-hosted"} transcription (${parsed.model ?? WHISPER_MODEL}), ${words.length} timed words`);
   return { text: typeof parsed.text === "string" ? parsed.text.trim() : "", words, language: parsed.language };
 }
-async function transcribeWords(audioPath, language = "auto", signal, onProgress) {
+async function transcribeWords(audioPath, language = "auto", signal, onProgress, { keywords = [] } = {}) {
   signal?.throwIfAborted();
   /* Only when CLIP_MAKER_TRANSCRIBE=openai is set (and OPENAI_API_KEY):
    * seconds instead of minutes, paid per minute of audio. Anything that goes
    * wrong falls back to the local Whisper below. */
-  if (hostedSttAvailable()) {
+  if (hostedSttAvailable() && !hostedWordTimings()) {
+    try {
+      return await localWhisperWords(audioPath, language, signal, onProgress, { hosted: true, keywords });
+    } catch (error) {
+      signal?.throwIfAborted();
+      const detail = String(error.stderr || error.message || error);
+      noteHostedFailure(/clip-maker-hosted-error:(\d+)/.exec(detail)?.[1]);
+      console.warn("[STT] OpenAI transcription failed, using local Whisper:", detail.replace(/clip-maker-hosted-error:\d+\s*/, "").slice(-300));
+    }
+  } else if (hostedSttAvailable()) {
     try {
       const hosted = await hostedWords({
         audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir(), signal,
@@ -1660,7 +1681,8 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     try {
       // YouTube metadata is useful for finding captions, but "ar" must not
       // turn the user's Auto choice into forced Arabic on English passages.
-      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, input.language, signal, reportProgress);
+      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, input.language, signal, reportProgress,
+        { keywords: transcriptionKeywords(meta.title, meta.uploader) });
       if (input.language === "auto" && detectedLanguage) language = detectedLanguage;
       if (text && words.length) {
         if (!analysisRange) return result("whisper", text, words);
@@ -1689,7 +1711,7 @@ var runningSourceTranscriptions = 0;
  * record does not exist yet at that point. */
 const analysisVideoKey = (url) => `src${shortHash(url)}`;
 function prefetchAnalysisVideo(url) {
-  hostVideoShared({ videoId: analysisVideoKey(url), sourceUrl: url, maxHeight: 360 })
+  hostVideoShared({ videoId: analysisVideoKey(url), sourceUrl: url, maxHeight: 360, noWorker: true })
     .catch((error) => console.warn(`[AI] Background download for visual analysis failed: ${String(error?.message ?? error).slice(0, 160)}`));
 }
 const SOURCE_IMPORT_STALL_MS = 10 * 60_000;
@@ -2204,7 +2226,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
             offset = selected.offset;
           } else if (!range && !file && video.sourceType === "url") {
             /* Usually already downloaded, or nearly, while Whisper ran. */
-            const full = await withinBudget(hostVideoShared({ videoId: analysisVideoKey(video.sourceUrl), sourceUrl: video.sourceUrl, maxHeight: 360 }), 60000);
+            const full = await withinBudget(hostVideoShared({ videoId: analysisVideoKey(video.sourceUrl), sourceUrl: video.sourceUrl, maxHeight: 360, noWorker: true }), 60000);
             file = path5.join(VIDEOS_DIR, full.fileName);
             info = full;
           }
@@ -2532,14 +2554,16 @@ Return: { "summary": "2-3 sentence summary", "category": "education|entertainmen
    * POST /api/trpc/gemini.testConnection
    * Checks the server's OpenAI key and that it can use OPENAI_MODEL.
    */
-  testConnection: publicProcedure.input(z2.object({ apiKey: z2.string().optional() }).optional()).mutation(async () => {
+  /* Admins only: each call spends a request on the server's key, and a
+   * refused key comes back from OpenAI with part of the key in the text. */
+  testConnection: adminProcedure.input(z2.object({ apiKey: z2.string().optional() }).optional()).mutation(async () => {
     try {
       const models = await aiListModels();
       const model = aiModel();
       const found = models.some((m) => m.id === model);
       return { success: found, modelCount: models.length, message: found ? `Connected. Using ${model}.` : `Connected, but this key cannot use the model "${model}". Check OPENAI_MODEL.` };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = (err instanceof Error ? err.message : String(err)).replace(/sk-[\w*-]+/g, "sk-…");
       return { success: false, modelCount: 0, message: msg };
     }
   })
@@ -3397,6 +3421,11 @@ async function hostVideo(opts) {
       if (!/403|429|forbidden|sign in|not a bot|timed out/i.test(error.message)) throw error;
       if (/timed out/i.test(error.message) && !(youtubeSourceId(sourceUrl) && youtubeWorkerAlive())) throw error;
       if (youtubeSourceId(sourceUrl)) youtubeBlockedUntil = Date.now() + 10 * 60e3;
+      /* A whole-video copy for visual analysis is optional. Through the
+       * worker it was re-encoded in full under a 90-second limit and then
+       * refused for size (HTTP 413), while the user's clip downloads waited
+       * behind it. Highlights go without frames instead. */
+      if (opts.noWorker) throw error;
       const workerVideo = path5.join(tmpDir, "worker.mp4");
       const metadata = await downloadWithYouTubeWorker(youtubeSourceId(sourceUrl), workerVideo, {
         kind: "video",
@@ -5708,6 +5737,23 @@ async function startServer() {
         if (videos2 > 0 || clips2 > 0) console.log(`[Jobs] Released ${videos2} abandoned import(s) and ${clips2} abandoned render(s)`);
       }).catch(() => {});
     }, 12e4).unref();
+    setInterval(() => { void sweepAnalysisCopies(); }, 30 * 6e4).unref();
   });
+}
+/* The 360p copies made for visual analysis (video-src…) are a cache that no
+ * record points at, so nothing else deletes them. On Cloud Run the disk is
+ * memory: left alone they pile up until the instance runs out and restarts.
+ * Four hours covers the longest transcription (two hours) and the highlight
+ * search that follows it. */
+async function sweepAnalysisCopies(maxAgeMs = 4 * 60 * 60_000) {
+  const names = await fs.readdir(VIDEOS_DIR).catch(() => []);
+  let removed = 0;
+  for (const name of names) {
+    if (!/^video-src[a-f0-9]{10}-[a-f0-9]{10}\.mp4$/.test(name)) continue;
+    const file = path.join(VIDEOS_DIR, name);
+    const stat = await fs.stat(file).catch(() => null);
+    if (stat && Date.now() - stat.mtimeMs > maxAgeMs && await fs.rm(file, { force: true }).then(() => true, () => false)) removed++;
+  }
+  if (removed) console.log(`[Media] Removed ${removed} old visual-analysis cop${removed === 1 ? "y" : "ies"}`);
 }
 startServer().catch(console.error);

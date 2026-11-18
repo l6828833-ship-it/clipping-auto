@@ -17,6 +17,10 @@ Environment:
   WHISPER_BEAM_SIZE             beam width (default 5 for Arabic and the small
                                 Darija model; 1 for large models on the int8 engine)
   WHISPER_CHUNK_SECONDS         longest speech piece sent at once (default 28)
+  WHISPER_CHUNK_GAP             longest pause kept inside one piece, in seconds
+                                (default 3); a longer one starts a new piece
+  WHISPER_VAD_THRESHOLD         speech probability that counts as speech
+                                (default 0.25)
   WHISPER_DETECT_EACH           "1" re-detects the language in every piece
                                 (slower; for heavily code-switched speech)
   WHISPER_BATCH                 on the int8 CPU engine, pieces decoded together
@@ -24,12 +28,17 @@ Environment:
                                 models, 0 = one at a time for other models)
   WHISPER_DETECT_DARIJA         "0" stops auto-detect from checking whether
                                 Arabic speech is Moroccan Darija
-  WHISPER_THREADS               CPU threads (default 4 for hosted int8, else 2)
+  WHISPER_THREADS               CPU threads (default: the CPUs this container may
+                                use, up to 8)
   CLIP_MAKER_WHISPER_CPU        "int8" enables faster-whisper on Linux
-  CLIP_MAKER_WHISPER_ACCELERATE "0" disables Apple-GPU (MLX) transcription
+  CLIP_MAKER_WHISPER_ACCELERATE "0" disables Apple-GPU (MLX and Metal) transcription
   CLIP_MAKER_WHISPER_PROGRESS   "1" prints clip-maker-progress:<0..1> on stderr
+  CLIP_MAKER_HOSTED_TEXT        "openai": the text comes from OpenAI and only the
+                                word timings are worked out here (see
+                                hosted_transcribe.py). The server sets it.
 """
 
+import bisect
 import json
 import math
 import os
@@ -38,6 +47,9 @@ import platform
 import re
 import sys
 import tempfile
+import zlib
+
+import numpy as np
 
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 30
@@ -69,6 +81,46 @@ def total_ram_gb() -> float:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
     except (ValueError, OSError, AttributeError):
         return 0.0
+
+
+def available_cpus() -> int:
+    """CPUs this process may use: a container's CPU quota rather than the
+    host's core count. Too many threads on two vCPUs is slower than two."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            return max(1, int(int(quota) / int(period)))
+    except (OSError, ValueError):
+        pass
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 2
+
+
+def ct2_device() -> tuple[str, str]:
+    """Device and number format for the CTranslate2 engine (faster-whisper).
+    CTranslate2 has no fast int8 kernels for Apple CPUs: on an M3 the large
+    Darija model took 40 s per 30 seconds of audio in int8, 8 s in float32 and
+    3 s on the GPU (Metal), with the same text."""
+    if sys.platform != "darwin":
+        return "cpu", "int8"
+    if os.environ.get("CLIP_MAKER_WHISPER_ACCELERATE") != "0":
+        try:
+            import ctranslate2
+
+            if ctranslate2.get_mps_device_count() > 0:
+                return "mps", "float16"
+        except Exception:
+            pass
+    return "cpu", "float32"
 
 
 def can_accelerate() -> bool:
@@ -113,13 +165,20 @@ def pick_model(locale: str, language: str | None, default: str) -> str:
 
 
 def speech_spans(audio):
-    """Speech regions in seconds from Silero VAD, or None when it isn't installed."""
+    """Speech regions in seconds from Silero VAD, or None when it isn't installed.
+
+    Silero's usual threshold (0.5) misses speech it is unsure of: telephone
+    audio, speech under music, heavy compression. On Moroccan radio call-ins
+    it kept 8 to 57% of clips that were speech from end to end, and the words
+    in the rest were never transcribed. 0.25 keeps them; music and silence
+    still fall well below it."""
     try:
         from faster_whisper.vad import VadOptions, get_speech_timestamps
     except Exception:
         return None
     try:
-        options = VadOptions(min_silence_duration_ms=500, speech_pad_ms=200)
+        threshold = float(os.environ.get("WHISPER_VAD_THRESHOLD") or 0.25)
+        options = VadOptions(threshold=threshold, min_silence_duration_ms=500, speech_pad_ms=200)
         return [(s["start"] / SAMPLE_RATE, s["end"] / SAMPLE_RATE) for s in get_speech_timestamps(audio, options)]
     except Exception as exc:
         log(f"VAD failed; transcribing without it: {exc}")
@@ -144,25 +203,68 @@ def split_points(duration: float, spans, block: float):
     return points
 
 
-def speech_chunks(spans, limit: float = 18.0):
-    """Merges VAD spans into chunks no longer than `limit` seconds. Fine-tuned
-    checkpoints are trained on short utterances and drop text on long windows."""
+def quiet_point(audio, start: float, end: float) -> float:
+    """The quietest moment between `start` and `end` (seconds), where a cut is
+    least likely to split a word."""
+    window, hop = int(0.2 * SAMPLE_RATE), int(0.02 * SAMPLE_RATE)
+    segment = audio[int(start * SAMPLE_RATE): int(end * SAMPLE_RATE)]
+    if len(segment) <= window:
+        return end
+    total = np.concatenate([[0.0], np.cumsum(segment.astype(np.float64) ** 2)])
+    energy = (total[window:] - total[:-window])[::hop]  # sum over each 0.2-s window
+    return start + (int(np.argmin(energy)) * hop + window / 2) / SAMPLE_RATE
+
+
+def speech_chunks(spans, limit: float = 28.0, gap: float | None = None, audio=None):
+    """Packs VAD spans into pieces of at most `limit` seconds.
+
+    Every piece costs one full 30-second encoder pass however short it is, so
+    spans are joined across pauses shorter than `gap`. Joining only across
+    pauses under 0.6 s left a third of the pieces under 5 seconds: 77 encoder
+    passes for 16 minutes of Darija instead of 53, and the extra cuts lost
+    words (WER 41.1% against 38.6% packed). A longer pause (music, an intro)
+    still starts a new piece, so it is not sent to the model. Speech longer
+    than `limit` is cut at its quietest moment near the limit when `audio` is
+    given."""
+    gap = float(os.environ.get("WHISPER_CHUNK_GAP") or 3.0) if gap is None else gap
     chunks = []
     for start, end in spans:
         while end - start > limit:
-            chunks.append((start, start + limit))
-            start += limit
-        if chunks and end - chunks[-1][0] <= limit and start - chunks[-1][1] < 0.6:
+            cut = start + limit
+            if audio is not None:
+                cut = quiet_point(audio, start + limit * 0.75, start + limit)
+            chunks.append((start, cut))
+            start = cut
+        if chunks and end - chunks[-1][0] <= limit and start - chunks[-1][1] < gap:
             chunks[-1] = (chunks[-1][0], end)
         else:
             chunks.append((start, end))
     return chunks
 
 
+def speech_within(spans, start: float, end: float) -> float:
+    """Seconds of VAD speech between `start` and `end`."""
+    return sum(max(0.0, min(b, end) - max(a, start)) for a, b in spans or [])
+
+
+def split_piece(piece, spans, audio, target: float = 10.0):
+    """Cuts one piece into parts of about `target` seconds, in its pauses where
+    it has them, else at quiet moments."""
+    start, end = piece
+    inner = [(max(a, start), min(b, end)) for a, b in spans or [] if b > start and a < end]
+    parts = speech_chunks(inner or [piece], limit=target, gap=0.6, audio=audio)
+    return [p for p in parts if p[1] - p[0] >= 0.3] or [piece]
+
+
+def compression_ratio(text: str) -> float:
+    data = text.encode("utf-8")
+    return len(data) / max(1, len(zlib.compress(data)))
+
+
 class Engine:
     """One loaded model. `run(audio, **options)` returns Whisper's result dict."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, accelerate: bool = True):
         import whisper
 
         self.name = model_name
@@ -186,17 +288,16 @@ class Engine:
         self.mlx_path = None
         self.torch_model = None
         self.int8_model = None
-        # The large Darija model exists only in the INT8 format, which
-        # faster-whisper also runs on a Mac's CPU.
+        self.device = "cpu"
+        # The large Darija model exists only in the CTranslate2 format, which
+        # faster-whisper also runs on a Mac (on its GPU, see ct2_device).
         self.use_int8 = self.turbo_darija or (
             sys.platform == "linux"
             and os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8"
             and (self.finetune or model_name in whisper._MODELS)
         )
-        self.threads = int(os.environ.get(
-            "WHISPER_THREADS", "4" if os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8" else "2"
-        ))
-        if can_accelerate() and not self.turbo_darija:
+        self.threads = int(os.environ.get("WHISPER_THREADS") or min(8, available_cpus()))
+        if accelerate and can_accelerate() and not self.turbo_darija:
             try:
                 self.mlx_path = self._prepare_mlx()
             except Exception as exc:
@@ -251,54 +352,93 @@ class Engine:
                 self.torch_model.set_alignment_heads(self.heads)
         return self.torch_model.transcribe(audio, fp16=False, **options)
 
-    def run_int8(self, audio, **options):
-        from dataclasses import asdict
-        from faster_whisper import WhisperModel
-
+    def ct2(self):
+        """The model in faster-whisper (CTranslate2), loaded on first use."""
         if self.int8_model is None:
+            from faster_whisper import WhisperModel
+
             source = self.name
             if self.finetune:
                 from darija_int8 import model_path
                 source = str(model_path())
             elif self.turbo_darija:
                 source = self.source
-            self.int8_model = WhisperModel(
-                source, device="cpu", compute_type="int8", cpu_threads=self.threads,
-            )
+            device, compute = ct2_device()
+            try:
+                self.int8_model = WhisperModel(source, device=device, compute_type=compute, cpu_threads=self.threads)
+            except Exception as exc:
+                if device == "cpu":
+                    raise
+                log(f"whisper: Metal unavailable for {self.name}, using the CPU: {exc}")
+                device, compute = "cpu", "float32"
+                self.int8_model = WhisperModel(source, device=device, compute_type=compute, cpu_threads=self.threads)
+            self.device = device
+        return self.int8_model
+
+    def on_cpu_after(self, exc) -> bool:
+        """After a failure on the Mac GPU, reloads the model on the CPU. True
+        when there is a CPU copy to retry with."""
+        if self.device == "cpu":
+            return False
+        log(f"whisper: Metal transcription failed, retrying on the CPU: {exc}")
+        os.environ["CLIP_MAKER_WHISPER_ACCELERATE"] = "0"
+        self.int8_model = None
+        self.ct2()
+        return True
+
+    @staticmethod
+    def ct2_options(options: dict) -> dict:
+        options = dict(options)
         options.pop("verbose", None)
         if "logprob_threshold" in options:
             options["log_prob_threshold"] = options.pop("logprob_threshold")
         options.setdefault("beam_size", 1)
-        segments, info = self.int8_model.transcribe(audio, **options)
-        segments = [asdict(segment) for segment in segments]
+        return options
+
+    def run_int8(self, audio, **options):
+        from dataclasses import asdict
+
+        options = self.ct2_options(options)
+        try:
+            segments, info = self.ct2().transcribe(audio, **options)
+            segments = [asdict(segment) for segment in segments]
+        except Exception as exc:
+            if not self.on_cpu_after(exc):
+                raise
+            segments, info = self.ct2().transcribe(audio, **options)
+            segments = [asdict(segment) for segment in segments]
         return {
             "language": info.language,
             "text": "".join(segment["text"] for segment in segments),
             "segments": segments,
         }
 
-
     def run_batched(self, audio, pieces, batch_size, report=None, **options):
-        """All pieces through the int8 model at once, `batch_size` windows per
-        encoder call. Yields segment dicts with times on the whole recording."""
+        """All pieces through the CTranslate2 model, `batch_size` windows per
+        encoder call. Returns segment dicts with times on the whole recording."""
+        try:
+            return self._run_batched(audio, pieces, batch_size, report, options)
+        except Exception as exc:
+            if not self.on_cpu_after(exc):
+                raise
+            return self._run_batched(audio, pieces, batch_size, report, options)
+
+    def _run_batched(self, audio, pieces, batch_size, report, options):
         from dataclasses import asdict
         from faster_whisper import BatchedInferencePipeline
 
-        self.run_int8(audio[:SAMPLE_RATE], **dict(options))  # loads the model
-        pipeline = BatchedInferencePipeline(model=self.int8_model)
-        options.pop("verbose", None)
-        if "logprob_threshold" in options:
-            options["log_prob_threshold"] = options.pop("logprob_threshold")
-        options.setdefault("beam_size", 1)
+        pipeline = BatchedInferencePipeline(model=self.ct2())
         segments, _ = pipeline.transcribe(
             audio, batch_size=batch_size, vad_filter=False,
-            clip_timestamps=[{"start": a, "end": b} for a, b in pieces], **options,
+            clip_timestamps=[{"start": a, "end": b} for a, b in pieces], **self.ct2_options(options),
         )
+        items = []
         for segment in segments:
             item = asdict(segment)
             if report:
                 report(item["end"])
-            yield item
+            items.append(item)
+        return items
 
 
 def mlx_checkpoint(checkpoint: Path) -> Path:
@@ -475,6 +615,119 @@ def drop_loops(words: list, keep: int = 2) -> list:
     return [words[k] for k in out_idx]
 
 
+def words_by_piece(segments, pieces, spans) -> list[tuple[list, bool]]:
+    """Clean timed words of batched segments, grouped by the piece each came from."""
+    starts = [a for a, _ in pieces]
+    grouped = [[] for _ in pieces]
+    for segment in segments:
+        middle = (segment["start"] + segment["end"]) / 2
+        grouped[min(len(pieces) - 1, max(0, bisect.bisect_right(starts, middle) - 1))].append(segment)
+    out = []
+    for (start, end), group in zip(pieces, grouped):
+        words = []
+        collect_words({"segments": group}, 0.0, end, words, spans)
+        # Arabic text compresses well: sound 25-second pieces of Darija
+        # scored 2.0 to 2.5, so only far above that is a loop.
+        looped = any(compression_ratio(s.get("text", "")) > 3.0 for s in group)
+        out.append((words, looped))
+    return out
+
+
+def needs_reread(words, looped: bool, speech: float) -> bool:
+    """A piece the decoder gave up on: it wrote far fewer words than its
+    speech holds, or looped badly. Sound Darija pieces ran at 1.3 to 2.7
+    words per second of speech; one that lost its second half after a loop
+    had 0.7."""
+    kept = len(drop_loops(words))
+    return speech >= 6 and (looped or kept / speech < 0.8 or (len(words) - kept >= 3 and kept / speech < 1.2))
+
+
+def decode_batched(engine, audio, pieces, batch, spans, options, progress=None) -> list:
+    """Words of all pieces, decoded `batch` windows at a time.
+
+    Without timestamps the decoder writes a whole piece in one go. When it
+    falls into a loop ("يبقوا يبقوا يبقوا ...") the rest of that piece is
+    lost: the repeats are removed later, but the speech after them never
+    comes back (14 of 19 seconds in one Darija test clip). Such pieces are
+    read again in parts of about 10 seconds, and the second reading is kept
+    when it has more words."""
+    segments = engine.run_batched(audio, pieces, batch, progress, **options)
+    results = words_by_piece(segments, pieces, spans)
+    suspects = [i for i, ((words, looped), (a, b)) in enumerate(zip(results, pieces))
+                if needs_reread(words, looped, speech_within(spans, a, b) if spans else b - a)]
+    if suspects:
+        parts, owners = [], []
+        for i in suspects:
+            for part in split_piece(pieces[i], spans, audio):
+                parts.append(part)
+                owners.append(i)
+        log(f"whisper: reading {len(suspects)} of {len(pieces)} pieces again in {len(parts)} shorter parts")
+        reread = words_by_piece(engine.run_batched(audio, parts, batch, None, **options), parts, spans)
+        replaced = 0
+        for i in suspects:
+            words = [w for (part_words, _), owner in zip(reread, owners) if owner == i for w in part_words]
+            if len(drop_loops(words)) > len(drop_loops(results[i][0])):
+                results[i] = (words, False)
+                replaced += 1
+        log(f"whisper: kept the second reading for {replaced} of them")
+    return [w for words, _ in results for w in words]
+
+
+def transcribe_hosted(audio, spans, locale: str, language: str | None) -> dict:
+    """Text from OpenAI, word timings from a small local model (see
+    hosted_transcribe.py)."""
+    import hosted_transcribe as hosted
+
+    duration = len(audio) / SAMPLE_RATE
+    limit = float(os.environ.get("WHISPER_CHUNK_SECONDS") or 28)
+    if spans:
+        pieces = speech_chunks(spans, limit, audio=audio)
+    else:
+        points = split_points(duration, spans, limit)
+        pieces = list(zip(points, points[1:]))
+    aligner = Engine(os.environ.get("WHISPER_ALIGN_MODEL") or "base", accelerate=False)
+    aligner.use_int8 = True  # alignment needs the faster-whisper engine
+    if language is None:
+        language = detect_language(aligner, audio, spans) or "en"
+    darija = locale == "ar-ma"
+    check = None
+    if locale == "auto" and language == "ar" and os.environ.get("WHISPER_DETECT_DARIJA", "1") != "0":
+        check = lambda text: darija_hits(text) >= 2  # noqa: E731
+    keywords = [k.strip() for k in os.environ.get("CLIP_MAKER_STT_KEYWORDS", "").splitlines() if k.strip()][:20]
+    show = os.environ.get("CLIP_MAKER_WHISPER_PROGRESS") == "1"
+
+    def progress(fraction: float) -> None:
+        if show:
+            log(f"clip-maker-progress:{min(1.0, fraction):.4f}")
+
+    log(f"whisper: text from {hosted.model_name()} in {len(pieces)} pieces, timings from {aligner.name} "
+        f"language={language}")
+    texts, darija = hosted.hosted_texts(audio, pieces, language if len(language) == 2 else None, darija,
+                                        keywords, report=lambda f: progress(0.8 * f), sounds_darija=check)
+    segments = hosted.align_segments(aligner.ct2(), audio, pieces, texts, language,
+                                     report=lambda f: progress(0.8 + 0.2 * f))
+    if spans:
+        # Alignment can stretch a word over the pause next to it ("كاين"
+        # lasting 1.5 s), which shows its caption early or holds it late.
+        # Keep each word inside the speech it overlaps.
+        # When it straddles a pause, it belongs with the side it overlaps most.
+        starts = [a for a, _ in spans]
+        for segment in segments:
+            for word in segment["words"]:
+                first = max(0, bisect.bisect_right(starts, word["start"]) - 1)
+                last = bisect.bisect_left(starts, word["end"])
+                near = spans[first:max(first + 1, last)]
+                best = max(near, key=lambda s: min(s[1], word["end"]) - max(s[0], word["start"]))
+                start, end = max(word["start"], best[0]), min(word["end"], best[1])
+                if end - start >= 0.05:
+                    word["start"], word["end"] = start, end
+    words = []
+    collect_words({"segments": segments}, 0.0, duration, words)
+    words = drop_loops(words)
+    return {"text": " ".join(w["word"] for w in words), "words": words,
+            "language": "ar-ma" if darija else language, "model": f"openai:{hosted.model_name()}"}
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise ValueError("usage: whisper_words.py <audio-path> [language] [model]")
@@ -498,6 +751,9 @@ def main() -> None:
 
     language = locale.split("-", 1)[0]
     language = language if language in LANGUAGES else None
+    if os.environ.get("CLIP_MAKER_HOSTED_TEXT") == "openai":
+        json.dump(transcribe_hosted(audio, spans, locale, language), sys.stdout, ensure_ascii=False)
+        return
     engine = None
     if language is None:
         engine = Engine(pick_model(locale, None, default_model))
@@ -524,8 +780,8 @@ def main() -> None:
             model_name = DARIJA_FINETUNE
             if engine is None or engine.name != model_name:
                 engine = Engine(model_name)
-    engine_name = "metal" if engine.mlx_path else "int8" if engine.use_int8 else "cpu"
-    log(f"whisper: model={model_name} language={language or 'auto'} engine={engine_name}")
+    engine_name = "metal" if engine.mlx_path else ("ctranslate2-" + "-".join(ct2_device())) if engine.use_int8 else "cpu"
+    log(f"whisper: model={model_name} language={language or 'auto'} engine={engine_name} threads={engine.threads}")
 
     options = {
         # Darija frequently switches to English/French within one sentence.
@@ -568,7 +824,7 @@ def main() -> None:
         # Apply speech gating to every model, not just the Darija checkpoint.
         # Every piece is padded to Whisper's 30-second window, so a 12-second
         # piece costs as much as a full one. Fill each window instead.
-        pieces = speech_chunks(spans, float(os.environ.get("WHISPER_CHUNK_SECONDS") or 28))
+        pieces = speech_chunks(spans, float(os.environ.get("WHISPER_CHUNK_SECONDS") or 28), audio=audio)
     else:
         points = split_points(duration, spans, BLOCK_SECONDS)
         pieces = list(zip(points, points[1:]))
@@ -583,10 +839,8 @@ def main() -> None:
         # Batched: one encoder pass for several pieces. Same model and
         # settings; the windows go through together instead of one by one.
         progress = (lambda t: log(f"clip-maker-progress:{min(1.0, t / duration):.4f}")) if report else None
-        segments = list(engine.run_batched(audio, pieces, batch, progress, **options))
-        before = len(words)
-        collect_words({"segments": segments}, 0.0, duration, words, spans)
-        texts.append(" ".join(w["word"] for w in words[before:]))
+        words = decode_batched(engine, audio, pieces, batch, spans, options, progress)
+        texts.append(" ".join(w["word"] for w in words))
         pieces = []
     for start, end in pieces:
         chunk = audio[int(start * SAMPLE_RATE): int(end * SAMPLE_RATE)]
@@ -614,5 +868,11 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
+        status = getattr(exc, "status", None)
+        if type(exc).__name__ == "HostedError":
+            # The server falls back to local transcription on exit code 3.
+            print(f"clip-maker-hosted-error:{status or 0}", file=sys.stderr)
+            print(f"{exc}", file=sys.stderr)
+            sys.exit(3)
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         sys.exit(1)
