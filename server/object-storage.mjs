@@ -148,6 +148,16 @@ export async function signedLink(kind, name) {
   }), { expiresIn: 6 * 3600 });
 }
 
+/** Stream a private object through the app after the caller verifies ownership. */
+export async function streamStoredMedia(kind, name, { range, signal } = {}) {
+  const object = await bucketClient().send(new GetObjectCommand({
+    Bucket: settings().bucket,
+    Key: keyFor(kind, name),
+    Range: range,
+  }), { abortSignal: signal });
+  return object.Body;
+}
+
 const fetching = new Map();
 /**
  * Brings a stored file back to `filePath` on this instance's disk, for work

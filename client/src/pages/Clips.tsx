@@ -244,7 +244,7 @@ function ClipEditorModal({
   const host = trpc.videos.host.useMutation({
     onSuccess: async () => {
       await utils.videos.list.invalidate();
-      toast.info("Importing the video to the server…");
+      await utils.videos.sections.invalidate({ id: clip.videoId });
     },
     onError: err => toast.error(err.message),
   });
@@ -344,10 +344,39 @@ function ClipEditorModal({
     return captionWords.length > 0 ? { words: captionWords, activeIndex: 0, wordIndex: -1 } : null;
   }, [effectiveWords, playhead, captionWords, shownCaptionStyle.preset, shownCaptionStyle.fontSize, shownCaptionStyle.uppercase]);
 
-  const hostedStatus = (video?.hostedStatus ?? "none") as "none" | "downloading" | "ready" | "error";
-  const hostedUrl = video?.hostedUrl ?? null;
-  // Partial imports shift the hosted timeline; clip times are absolute.
-  const hostedOffset = video?.hostedOffset ?? 0;
+  const validRange = previewRange.end > previewRange.start;
+  const sectionInput = {
+    id: clip.videoId,
+    ranges: [{ startTime: previewRange.start, endTime: previewRange.end }],
+  };
+  const sectionQuery = trpc.videos.sections.useQuery(sectionInput, {
+    enabled: validRange,
+    refetchInterval: query => video?.hostedStatus === "downloading" && !query.state.data?.sections?.[0] ? 3000 : false,
+  });
+  const section = validRange ? sectionQuery.data?.sections?.[0] : null;
+  useEffect(() => {
+    if (validRange && video?.hostedStatus === "ready" && !section) void sectionQuery.refetch();
+  }, [validRange, video?.hostedStatus, video?.hostedUrl]);
+  const hostedUrl = section?.url ?? null;
+  const hostedOffset = section?.offset ?? 0;
+  const [failedPreview, setFailedPreview] = useState<string | null>(null);
+  const hostedStatus = section
+    ? "ready"
+    : host.isPending || video?.hostedStatus === "downloading"
+      ? "downloading"
+      : video?.hostedStatus === "error" || sectionQuery.isError || host.isError ? "error" : "none";
+  const canImport = !!video?.sourceUrl && validRange;
+  const importPreview = () => {
+    if (canImport) host.mutate({ id: clip.videoId, startTime: previewRange.start, endTime: previewRange.end });
+  };
+  const attemptedImport = useRef("");
+  useEffect(() => {
+    if (!canImport || sectionQuery.isPending || hostedStatus !== "none") return;
+    const key = `${clip.videoId}:${previewRange.start}:${previewRange.end}`;
+    if (attemptedImport.current === key) return;
+    attemptedImport.current = key;
+    importPreview();
+  }, [canImport, clip.videoId, hostedStatus, previewRange, sectionQuery.isPending]);
   /* Cuts are measured from the saved clip start; the player runs on the
    * imported file's clock. */
   const playerCuts = useMemo(
@@ -543,7 +572,9 @@ function ClipEditorModal({
               <>
                 {/* The exported result at full size. */}
                 <CropView
+                  key={hostedUrl}
                   src={hostedUrl}
+                  onPreviewError={() => setFailedPreview(hostedUrl)}
                   framing={planSegment && !planSegment.dual ? framingAt(planSegment, playhead) : activeFraming}
                   onChange={applyFraming}
                   startTime={previewSpan.start - hostedOffset}
@@ -643,7 +674,7 @@ function ClipEditorModal({
                 url={hostedStatus === "error" ? null : (video?.sourceUrl ?? null)}
                 hostingStatus={hostedStatus}
                 hostingProgress={video?.hostProgress ?? 0}
-                onHost={video ? () => host.mutate({ id: video.id, startTime: start, endTime: end }) : undefined}
+                onHost={canImport ? importPreview : undefined}
                 className="rounded-2xl shadow-2xl w-full"
                 style={{ aspectRatio: "9/16" }}
               />
@@ -664,9 +695,9 @@ function ClipEditorModal({
             </p>
 
             {/* Offer the import without an empty player taking up the space. */}
-            {hostedStatus !== "ready" && hostedStatus !== "downloading" && isRendered && video && (
+            {hostedStatus !== "downloading" && isRendered && canImport && !section && (
               <button
-                onClick={() => host.mutate({ id: video.id, startTime: start, endTime: end })}
+                onClick={importPreview}
                 disabled={host.isPending}
                 className="mt-2 w-full flex items-center justify-center gap-2 py-2 rounded-xl text-[11px] font-bold transition-colors disabled:opacity-40"
                 style={{ background: "rgba(49, 94, 245, 0.08)", color: "var(--cobalt)" }}
@@ -675,6 +706,17 @@ function ClipEditorModal({
                   ? <><Loader2 className="w-3 h-3 animate-spin" /> Importing…</>
                   : <><Download className="w-3 h-3" /> Import source to edit</>}
               </button>
+            )}
+
+            {hostedUrl && failedPreview === hostedUrl && isRendered && (
+              <div className="mt-3">
+                <p className="mb-1 text-xs text-white/70">Last export</p>
+                <ClipPreview url={clip.downloadUrl} style={{ aspectRatio: "9/16" }} />
+              </div>
+            )}
+
+            {!section && !canImport && !sectionQuery.isPending && !isRendered && (
+              <p className="mt-2 text-center text-xs text-white/70">The source file is unavailable. Upload the original video again to edit this range.</p>
             )}
 
             {hostedStatus === "error" && video?.hostError && (

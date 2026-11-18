@@ -34,9 +34,27 @@ export function useSourceTranscription() {
     setProgress(0);
     const { id } = await start.mutateAsync(input);
     onJob?.(id);
-    const deadline = Date.now() + 30 * 60_000;
+    // The server owns job timeouts. Leave polling active through its two-hour
+    // limit so longer sources can return progress or the actual failure.
+    const deadline = Date.now() + 125 * 60_000;
+    let retries = 0;
     while (Date.now() < deadline) {
-      const status = await client.extract.transcriptionStatus.query({ id, wait: true });
+      let status;
+      try {
+        status = await client.extract.transcriptionStatus.query({ id, wait: true });
+        retries = 0;
+      } catch (error) {
+        const failure = error as { cause?: { status?: number }; data?: { httpStatus?: number } };
+        const httpStatus = failure?.data?.httpStatus ?? failure?.cause?.status;
+        if ((httpStatus === 404 || httpStatus === 502 || httpStatus === 503 || httpStatus === 504) && retries < 3) {
+          // A poll can land on a different instance or catch a brief restart.
+          // Retry this job ID so the user is never charged for a second job.
+          retries++;
+          await new Promise(resolve => window.setTimeout(resolve, retries * 1500));
+          continue;
+        }
+        throw error;
+      }
       if (status.error) throw new Error(status.error);
       if (status.result) return status.result;
       setProgress(Number(status.progress) || 0);

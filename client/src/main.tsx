@@ -68,11 +68,19 @@ const trpcClient = trpc.createClient({
         }
         return {};
       },
-      fetch(input, init) {
-        return globalThis.fetch(input, {
+      async fetch(input, init) {
+        const response = await globalThis.fetch(input, {
           ...(init ?? {}),
           credentials: "include",
         });
+        if (!response.headers.get("content-type")?.includes("application/json")) {
+          await response.body?.cancel().catch(() => {});
+          const message = response.status >= 500
+            ? "Clip Maker is temporarily unavailable. Try again in a moment."
+            : "Clip Maker received an unexpected response. Refresh the page and try again.";
+          throw Object.assign(new Error(message), { status: response.status });
+        }
+        return response;
       },
     }),
   ],

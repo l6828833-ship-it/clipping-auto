@@ -145,7 +145,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     videoId: number; title: string; url: string;
     /** The source's own title and channel, for titles that name its people. */
     sourceTitle: string; channel: string;
-    transcript: string; duration: number; subtitlesOn: boolean;
+    transcript: string; duration: number; subtitlesOn: boolean; chooseManually?: boolean;
     words: { word: string; start: number; end: number }[];
     heatmap: { start: number; end: number; value: number }[];
     chapters: { start: number; end: number; title: string }[];
@@ -195,7 +195,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     onError: (err) => toast.error(err.message),
   });
 
-  const { transcribe: transcribeSource, progress: transcriptionProgress } = useSourceTranscription();
+  const { transcribe: transcribeSource, skip: skipTranscription, progress: transcriptionProgress } = useSourceTranscription();
+  const [chooseManually, setChooseManually] = useState(false);
 
   /** Set when transcription came back empty, so the person can go on without it. */
   const [noTranscript, setNoTranscript] = useState(false);
@@ -207,6 +208,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     language: string;
     heatmap: { start: number; end: number; value: number }[];
     chapters: { start: number; end: number; title: string }[];
+    chooseManually?: boolean;
   };
 
   /**
@@ -234,12 +236,14 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         // Real viewer rewatch data, when YouTube published it for this video.
         heatmap: result.heatmap ?? [],
         chapters: result.chapters ?? [],
+        chooseManually: result.skipped === true,
       };
       setTranscript(found.transcript);
       setTimedWords(found.words);
       setDetectedLanguage(found.language);
       setHeatmap(found.heatmap);
       setChapters(found.chapters);
+      setChooseManually(found.chooseManually === true);
       setVideoMeta(found.meta);
       if (!title.trim()) setTitle(result.title);
       if (result.skipped && result.note) toast.info(result.note);
@@ -297,12 +301,13 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       // Measured engagement signals, when the platform exposed them.
       heatmap: found.heatmap,
       chapters: found.chapters,
+      chooseManually: found.chooseManually,
     });
   };
 
   /* What has been found so far, for going on without a transcript. */
   const foundSoFar = (): Found => ({
-    transcript, words: timedWords, meta: videoMeta, language: detectedLanguage, heatmap, chapters,
+    transcript, words: timedWords, meta: videoMeta, language: detectedLanguage, heatmap, chapters, chooseManually,
   });
 
   const selectFile = (selected: File | null) => {
@@ -534,6 +539,13 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                 );
               })}
             </div></>}
+            {analysisJobId && (stage === "downloading" || stage === "queued" || stage === "transcribing") && (
+              <button type="button" disabled={skipTranscription.isPending}
+                onClick={() => skipTranscription.mutate({ id: analysisJobId }, { onError: error => toast.error(error.message) })}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold disabled:opacity-40">
+                Choose clip times without waiting
+              </button>
+            )}
           </div>
         )}
 
@@ -740,7 +752,7 @@ function ManualClipPicker({ videoTitle, videoDuration, onNext }: {
 function StepHighlights({
   videoId, layout, videoTitle, sourceTitle, channel, transcript, apiKey, model, videoDuration,
   transcriptWords, heatmap, chapters, titleLanguage, onTitleLanguageChange,
-  detected, onDetected, pickedIds, onNext
+  detected, onDetected, pickedIds, onNext, chooseManually
 }: {
   videoId: number | null;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
@@ -761,6 +773,7 @@ function StepHighlights({
   onDetected: (detected: Detected) => void;
   /** Ids picked last time, when coming back to this step. */
   pickedIds: number[];
+  chooseManually: boolean;
   onNext: (clips: Highlight[], reelTitle: string) => void
 }) {
   const [found, setFound] = useState<Detected | null>(detected);
@@ -768,7 +781,7 @@ function StepHighlights({
     pickedIds.length > 0 ? pickedIds : detected?.highlights.map(h => h.id) ?? [],
   ));
   const [reelTitle, setReelTitle] = useState(detected?.reelTitle ?? "");
-  const [manual, setManual] = useState(false);
+  const [manual, setManual] = useState(chooseManually);
   /* The kind of video is always detected automatically. */
   const contentType = "auto";
   /** The title language the shown highlights were written in. */
@@ -827,7 +840,7 @@ function StepHighlights({
   /* Runs by itself: pressing Continue on the first step already asked for it. */
   const autoStarted = useRef(false);
   useEffect(() => {
-    if (autoStarted.current || found || (!transcript.trim() && !videoId)) return;
+    if (manual || autoStarted.current || found || (!transcript.trim() && !videoId)) return;
     autoStarted.current = true;
     detect.mutate(detectInput);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1816,6 +1829,7 @@ export default function CreatePage() {
   // Kept so later steps can actually show and render the video.
   const [videoId, setVideoId] = useState<number | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
+  const [chooseManually, setChooseManually] = useState(false);
   const [selectedClips, setSelectedClips] = useState<Highlight[]>([]);
   /** Highlights found for this video, kept so going back to step 2 shows them again. */
   const [detected, setDetected] = useState<Detected | null>(null);
@@ -1835,6 +1849,7 @@ export default function CreatePage() {
         {step === 1 && (
           <StepInput apiKey={apiKey} layout={videoLayout} onLayoutChange={setVideoLayout} onNext={v => {
             setVideoId(v.videoId); setVideoUrl(v.url);
+            setChooseManually(v.chooseManually === true);
             setVideoTitle(v.title); setTranscript(v.transcript); setVideoDuration(v.duration);
             setSourceTitle(v.sourceTitle); setChannel(v.channel);
             setTranscriptWords(v.words);
@@ -1847,7 +1862,7 @@ export default function CreatePage() {
           }} />
         )}
         {step === 2 && (
-          <StepHighlights videoId={videoId} layout={videoLayout}
+          <StepHighlights videoId={videoId} layout={videoLayout} chooseManually={chooseManually}
             videoTitle={videoTitle} sourceTitle={sourceTitle} channel={channel}
             transcript={transcript} apiKey={apiKey} model={model} videoDuration={videoDuration}
             transcriptWords={transcriptWords}

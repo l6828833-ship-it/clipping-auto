@@ -27,6 +27,13 @@ RUN python3 -c 'import whisper; whisper.load_model("base", device="cpu")' \
     && python3 -c 'from faster_whisper.utils import download_model; download_model("large-v3-turbo")' \
     && chown -R node:node /opt/clip-maker-cache
 
+# The default Darija model: Whisper large-v3-turbo with a Moroccan Darija
+# adapter, merged and converted to INT8 here (about 820 MB kept) so no
+# instance has to download and build it while a video waits.
+COPY scripts/darija_turbo_int8.py /tmp/darija_turbo_int8.py
+RUN HF_HUB_DISABLE_PROGRESS_BARS=1 python3 /tmp/darija_turbo_int8.py \
+    && chown -R node:node /opt/clip-maker-cache
+
 COPY package.json package-lock.json ./
 RUN npm ci --include=dev --legacy-peer-deps
 

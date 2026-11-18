@@ -19,7 +19,7 @@ import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase
 import { hostedSttAvailable, hostedWords } from "../server/hosted-stt.mjs";
 import { readMediaEvidence, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
-import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile } from "../server/object-storage.mjs";
+import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile, streamStoredMedia } from "../server/object-storage.mjs";
 import { pipeline as nodePipeline } from "node:stream/promises";
 
 // shared/const.ts
@@ -996,12 +996,35 @@ function registerMediaRoutes(app) {
     /* With a storage bucket, the browser fetches the file from there through
      * a signed link: that works on any instance, after a restart, and for
      * files over the host's 32 MiB limit on one response. */
+    const inlinePreview = req.query.preview === "1" && !download && !checking;
     if (storageEnabled()) {
       let stored = await storedInfo(kind, req.params.name);
       if (!stored && kind === "clip" && await fs2.stat(filePath).then(s => s.size > 0, () => false)) {
         if (await storeMedia(mediaUrl)) stored = await storedInfo(kind, req.params.name);
       }
-      const link = stored ? await signedLink(kind, req.params.name).catch(() => null) : null;
+      if (inlinePreview && stored?.size) {
+        const range = mediaByteRange(req.headers.range, stored.size);
+        if (range === false) return res.status(416).set("Content-Range", `bytes */${stored.size}`).end();
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        res.once("close", abort);
+        try {
+          const body = await streamStoredMedia(kind, req.params.name, {
+            range: range ? `bytes=${range.start}-${range.end}` : undefined,
+            signal: controller.signal,
+          });
+          writeMediaHeaders(res, stored.size, range);
+          await nodePipeline(body, res);
+          return;
+        } catch (error) {
+          if (res.headersSent || res.destroyed) return;
+          console.warn("[Media] Preview storage read failed:", error?.name);
+          // A recent import may still be on this instance's disk.
+        } finally {
+          res.removeListener("close", abort);
+        }
+      }
+      const link = stored && !inlinePreview ? await signedLink(kind, req.params.name).catch(() => null) : null;
       if (link) {
         res.setHeader("Cache-Control", "private, no-store, max-age=0");
         if (checking) return res.json({ size: stored.size, url: link });
@@ -1020,50 +1043,45 @@ function registerMediaRoutes(app) {
       res.setHeader("Cache-Control", "private, no-store, max-age=0");
       return res.json({ size: total });
     }
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Accept-Ranges", "bytes");
-    /* Render URLs can be reused after a retry. Never let a browser retain a
-     * cached partial MP4 under the same URL. */
-    res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("X-Content-Type-Options", "nosniff");
+    const range = mediaByteRange(req.headers.range, total);
+    if (range === false) return res.status(416).set("Content-Range", `bytes */${total}`).end();
+    writeMediaHeaders(res, total, range);
     if (download) {
       res.setHeader("Content-Disposition", `attachment; filename="${req.params.name}"`);
     }
-    const range = req.headers.range;
-    if (!range) {
-      // Let Cloud Run stream large legacy files without a fixed response size.
-      if (total <= MEDIA_PIECE) res.setHeader("Content-Length", String(total));
-      await nodePipeline(createReadStream(filePath), res).catch(() => {});
-      return;
-    }
-    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-    if (!match) {
-      res.status(416).setHeader("Content-Range", `bytes */${total}`).end();
-      return;
-    }
-    const [, startRaw, endRaw] = match;
-    let start = startRaw ? Number(startRaw) : 0;
-    let end = endRaw ? Number(endRaw) : total - 1;
-    if (!startRaw && endRaw) {
-      start = Math.max(0, total - Number(endRaw));
-      end = total - 1;
-    }
-    if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
-      res.status(416).setHeader("Content-Range", `bytes */${total}`).end();
-      return;
-    }
-    /* At most 8 MiB per answer. The host refuses any response over 32 MiB,
-     * and a player's first request ("bytes=0-") asks for the whole file, so a
-     * long clip used to fail to play ("Response size was too large"). A
-     * shorter answer is allowed by HTTP; the player asks for the rest. */
-    end = Math.min(end, total - 1, start + MEDIA_PIECE - 1);
-    res.status(206);
-    res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
-    res.setHeader("Content-Length", String(end - start + 1));
-    await nodePipeline(createReadStream(filePath, { start, end }), res).catch(() => {});
+    await nodePipeline(createReadStream(filePath, range ?? undefined), res).catch(() => {});
   });
 }
-var MEDIA_PIECE = 8 * 1024 * 1024;
+const MEDIA_PIECE = 8 * 1024 * 1024;
+
+function mediaByteRange(header, total) {
+  if (!header) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header);
+  if (!match || (!match[1] && !match[2])) return false;
+  const [, startRaw, endRaw] = match;
+  const start = startRaw ? Number(startRaw) : Math.max(0, total - Number(endRaw));
+  const end = startRaw && endRaw ? Number(endRaw) : total - 1;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= total) return false;
+  // Cap each range to stay below the host's per-response size limit.
+  return { start, end: Math.min(end, total - 1, start + MEDIA_PIECE - 1) };
+}
+
+function writeMediaHeaders(res, total, range) {
+  res.set({
+    "Content-Type": "video/mp4",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, no-store, max-age=0",
+    "X-Content-Type-Options": "nosniff",
+  });
+  if (range) {
+    res.status(206).set({
+      "Content-Range": `bytes ${range.start}-${range.end}/${total}`,
+      "Content-Length": String(range.end - range.start + 1),
+    });
+  } else if (total <= MEDIA_PIECE) {
+    res.set("Content-Length", String(total));
+  }
+}
 
 // server/routers/extract.ts
 import { z } from "zod";
@@ -4451,10 +4469,20 @@ var appRouter = router({
       if (video.hostedStatus === "downloading") {
         return { success: true, hostedStatus: "downloading", hostedUrl: null };
       }
+      const wanted = input.startTime != null && input.endTime != null ? { start: input.startTime, end: input.endTime } : null;
+      if (wanted && !(wanted.end > wanted.start)) {
+        throw new TRPCError5({ code: "BAD_REQUEST", message: "Choose a clip end after its start." });
+      }
       const currentPath = localPathFromUrl(video.hostedUrl);
-      const existingFile = video.hostedStatus === "ready" && currentPath && await fs2.stat(currentPath).catch(() => null);
-      if (existingFile?.size && !input.force) {
+      const existingFile = !wanted && video.hostedStatus === "ready" && currentPath && await fs2.stat(currentPath).catch(() => null);
+      if (existingFile?.size && !input.force && !(video.hostedOffset > 0)) {
         return { success: true, hostedStatus: "ready", hostedUrl: video.hostedUrl };
+      }
+      if (wanted && !input.force) {
+        const section = await sectionFor(video, wanted).catch(() => null);
+        if (section?.url === video.hostedUrl) {
+          return { success: true, hostedStatus: "ready", hostedUrl: section.url };
+        }
       }
       const sourceUrl = video.sourceUrl;
       if (!sourceUrl || !/^https?:\/\//i.test(sourceUrl)) {
@@ -4465,7 +4493,6 @@ var appRouter = router({
       }
       /* A range that is already on disk (this clip was opened before, or the
        * background prefetch got to it) switches over at once. */
-      const wanted = input.startTime != null && input.endTime != null ? { start: input.startTime, end: input.endTime } : null;
       const cached = wanted ? await hostVideo({ videoId: video.id, sourceUrl, range: wanted, cacheOnly: true }).catch(() => null) : null;
       if (cached) {
         await updateVideo(video.id, {

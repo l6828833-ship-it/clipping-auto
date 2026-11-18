@@ -10,16 +10,18 @@ model (see `pick_model`) because the small models are not usable for it.
 Environment:
   WHISPER_MODEL                 default model when none is passed (base)
   WHISPER_MODEL_ARABIC          model for Arabic (does not override Darija)
-  WHISPER_MODEL_DARIJA          model for Darija only (default "darija-finetune",
-                                a Whisper small trained on Moroccan speech)
-  WHISPER_BEAM_SIZE             beam width (default 5 for Arabic and the Darija
-                                fine-tune; 1 for large models on the int8 CPU engine)
+  WHISPER_MODEL_DARIJA          model for Darija only (default "darija-turbo",
+                                large-v3-turbo with a Darija adapter; about real
+                                time on 4 CPU threads). "darija-finetune" is the
+                                small Darija model: 3x faster, far less accurate
+  WHISPER_BEAM_SIZE             beam width (default 5 for Arabic and the small
+                                Darija model; 1 for large models on the int8 engine)
   WHISPER_CHUNK_SECONDS         longest speech piece sent at once (default 28)
   WHISPER_DETECT_EACH           "1" re-detects the language in every piece
                                 (slower; for heavily code-switched speech)
   WHISPER_BATCH                 on the int8 CPU engine, pieces decoded together
-                                per encoder pass (default 8 for the Darija
-                                fine-tune, 0 = one at a time for other models)
+                                per encoder pass (default 8 for both Darija
+                                models, 0 = one at a time for other models)
   WHISPER_DETECT_DARIJA         "0" stops auto-detect from checking whether
                                 Arabic speech is Moroccan Darija
   WHISPER_THREADS               CPU threads (default 4 for hosted int8, else 2)
@@ -40,6 +42,10 @@ import tempfile
 SAMPLE_RATE = 16000
 BLOCK_SECONDS = 30
 DARIJA_FINETUNE = "darija-finetune"
+# whisper-large-v3-turbo with a Moroccan Darija adapter merged in, built into
+# the image by scripts/darija_turbo_int8.py. INT8 (faster-whisper) only.
+DARIJA_TURBO = "darija-turbo"
+DARIJA_MODELS = (DARIJA_FINETUNE, DARIJA_TURBO)
 
 # A short prompt in the target script keeps Whisper from drifting into Latin
 # transliteration or another language on code-switched speech.
@@ -89,10 +95,10 @@ def pick_model(locale: str, language: str | None, default: str) -> str:
     darija = locale == "ar-ma"
     # The container sets WHISPER_MODEL_ARABIC=small. It must not override an
     # explicit choice of Darija, which has its own checkpoint and setting.
-    # Darija defaults to the Darija fine-tune. On a real Darija recording,
-    # large-v3-turbo rewrote the speech as formal Arabic (another wording,
-    # not what was said) and took 3-4 times as long on the server's CPU.
-    chosen = (os.environ.get("WHISPER_MODEL_DARIJA") or DARIJA_FINETUNE) if darija else os.environ.get("WHISPER_MODEL_ARABIC")
+    # Darija defaults to the large Darija model. Plain large-v3-turbo rewrote
+    # Darija as formal Arabic (another wording, not what was said); the small
+    # Darija fine-tune is three times faster but garbled real conversation.
+    chosen = (os.environ.get("WHISPER_MODEL_DARIJA") or DARIJA_TURBO) if darija else os.environ.get("WHISPER_MODEL_ARABIC")
     if not chosen:
         ram = total_ram_gb()
         if ram >= 7.5:
@@ -101,7 +107,7 @@ def pick_model(locale: str, language: str | None, default: str) -> str:
             chosen = "small"
         else:
             chosen = default
-    if chosen == DARIJA_FINETUNE and not darija:
+    if chosen in DARIJA_MODELS and not darija:
         chosen = default
     return chosen
 
@@ -161,10 +167,18 @@ class Engine:
 
         self.name = model_name
         self.finetune = model_name == DARIJA_FINETUNE
+        self.turbo_darija = model_name == DARIJA_TURBO
+        # Either Darija model: trained on Darija without prompts.
+        self.darija = self.finetune or self.turbo_darija
         heads_key = "small" if self.finetune else model_name
         self.heads = whisper._ALIGNMENT_HEADS.get(heads_key)
         if self.finetune:
             from darija_whisper import model_path
+
+            self.source = str(model_path())
+        elif self.turbo_darija:
+            # Built into the image; elsewhere this downloads and builds it once.
+            from darija_turbo_int8 import model_path
 
             self.source = str(model_path())
         else:
@@ -172,7 +186,9 @@ class Engine:
         self.mlx_path = None
         self.torch_model = None
         self.int8_model = None
-        self.use_int8 = (
+        # The large Darija model exists only in the INT8 format, which
+        # faster-whisper also runs on a Mac's CPU.
+        self.use_int8 = self.turbo_darija or (
             sys.platform == "linux"
             and os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8"
             and (self.finetune or model_name in whisper._MODELS)
@@ -180,7 +196,7 @@ class Engine:
         self.threads = int(os.environ.get(
             "WHISPER_THREADS", "4" if os.environ.get("CLIP_MAKER_WHISPER_CPU") == "int8" else "2"
         ))
-        if can_accelerate():
+        if can_accelerate() and not self.turbo_darija:
             try:
                 self.mlx_path = self._prepare_mlx()
             except Exception as exc:
@@ -220,6 +236,8 @@ class Engine:
             try:
                 return self.run_int8(audio, **options)
             except Exception as exc:
+                if self.turbo_darija:
+                    raise  # There is no PyTorch copy of this model.
                 log(f"INT8 transcription failed; retrying with PyTorch: {exc}")
                 self.use_int8 = False
                 self.int8_model = None
@@ -242,6 +260,8 @@ class Engine:
             if self.finetune:
                 from darija_int8 import model_path
                 source = str(model_path())
+            elif self.turbo_darija:
+                source = self.source
             self.int8_model = WhisperModel(
                 source, device="cpu", compute_type="int8", cpu_threads=self.threads,
             )
@@ -493,7 +513,17 @@ def main() -> None:
                 log(f"whisper: Darija check failed, keeping Arabic: {exc}")
     model_name = pick_model(locale, language, default_model)
     if engine is None or engine.name != model_name:
-        engine = Engine(model_name)
+        try:
+            engine = Engine(model_name)
+        except Exception as exc:
+            if model_name != DARIJA_TURBO:
+                raise
+            # The large Darija model could not be built here: keep going
+            # with the small one rather than fail the video.
+            log(f"whisper: large Darija model unavailable, using the small one: {exc}")
+            model_name = DARIJA_FINETUNE
+            if engine is None or engine.name != model_name:
+                engine = Engine(model_name)
     engine_name = "metal" if engine.mlx_path else "int8" if engine.use_int8 else "cpu"
     log(f"whisper: model={model_name} language={language or 'auto'} engine={engine_name}")
 
@@ -504,7 +534,7 @@ def main() -> None:
         # The language is known by now (asked for, or detected once above).
         # Re-detecting it in every piece ran the model twice per piece; only
         # WHISPER_DETECT_EACH=1 does that, for heavily code-switched speech.
-        "language": None if os.environ.get("WHISPER_DETECT_EACH") == "1" and locale in {"auto", "ar-ma"} and not engine.finetune else language,
+        "language": None if os.environ.get("WHISPER_DETECT_EACH") == "1" and locale in {"auto", "ar-ma"} and not engine.darija else language,
         "task": "transcribe",
         # Feeding earlier text back in is what turns one mistake into a loop.
         "condition_on_previous_text": False,
@@ -520,14 +550,15 @@ def main() -> None:
         # Sampling retries can invent fluent dialogue over unclear audio.
         "temperature": 0.0,
     }
-    if not engine.finetune:
+    if not engine.darija:
         prompt = PROMPTS.get(locale) or PROMPTS.get(language or "")
         if prompt:
             options["initial_prompt"] = prompt
     # On the server's CPU engine a 5-wide beam cost several times the time of
     # greedy decoding for little gain with large-v3-turbo; GPU/Metal runs keep
     # the wider beam for Arabic. The small Darija fine-tune keeps it everywhere:
-    # it got noticeably more words right for about a third more time.
+    # it got noticeably more words right for about a third more time. The
+    # large Darija model gave nearly the same text with beam 1, 17% faster.
     beam = os.environ.get("WHISPER_BEAM_SIZE") or (
         "5" if engine.finetune else "1" if engine.use_int8 else "5" if language == "ar" else "")
     if beam.isdigit() and int(beam) > 1:
@@ -544,10 +575,10 @@ def main() -> None:
 
     words, texts = [], []
     report = os.environ.get("CLIP_MAKER_WHISPER_PROGRESS") == "1"
-    # The small Darija model batches by default: on 4 CPU threads, 5 minutes
-    # of Darija took 102 s batched against 176 s one piece at a time, with
-    # the same beam.
-    batch = int(os.environ.get("WHISPER_BATCH") or (8 if engine.finetune else 0))
+    # The Darija models batch by default: on 4 CPU threads, 5 minutes of
+    # Darija took the small model 102 s batched against 176 s one piece at a
+    # time, with the same beam.
+    batch = int(os.environ.get("WHISPER_BATCH") or (8 if engine.darija else 0))
     if engine.use_int8 and batch > 1 and pieces:
         # Batched: one encoder pass for several pieces. Same model and
         # settings; the windows go through together instead of one by one.

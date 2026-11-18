@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Maximize2, RotateCcw, ZoomIn, Play, Pause, Volume2, VolumeX } from "lucide-react";
 import { VIDEO_STYLES } from "@shared/video-styles.mjs";
+import { previewMediaUrl } from "@/lib/previewMedia";
 
 /**
  * Reframing control.
@@ -274,7 +275,7 @@ export function VideoFramer({
       >
         <video
           ref={videoRef}
-          src={src}
+          src={previewMediaUrl(src)}
           className="absolute inset-0 w-full h-full object-contain pointer-events-none"
           onLoadedMetadata={e => {
             const v = e.currentTarget;
@@ -420,6 +421,7 @@ export function CropView({
   onTime,
   seekTo,
   onPlayingChange,
+  onPreviewError,
   children,
   scale: videoScale = 1,
   barColor = "#000000",
@@ -448,6 +450,7 @@ export function CropView({
   seekTo?: { time: number; nonce: number } | null;
   /** Reports play/pause so another player can be kept in step. */
   onPlayingChange?: (playing: boolean) => void;
+  onPreviewError?: () => void;
   children?: React.ReactNode;
   /** How much of the frame the video fills. 1 = full, <1 shows bars. */
   scale?: number;
@@ -494,6 +497,18 @@ export function CropView({
   // Start muted because browsers require it for autoplay. The button below
   // lets the user turn audio on once they interact with the page.
   const [muted, setMuted] = useState(true);
+  const [mediaState, setMediaState] = useState<"loading" | "ready" | "error">("loading");
+  const previewErrorRef = useRef(onPreviewError);
+  useEffect(() => { previewErrorRef.current = onPreviewError; }, [onPreviewError]);
+  useEffect(() => setMediaState("loading"), [src]);
+  useEffect(() => {
+    if (mediaState !== "loading") return;
+    const timer = setTimeout(() => {
+      setMediaState("error");
+      previewErrorRef.current?.();
+    }, 20_000);
+    return () => clearTimeout(timer);
+  }, [mediaState, src]);
 
   const start = Math.max(0, startTime ?? 0);
   const end = endTime ?? null;
@@ -721,7 +736,7 @@ export function CropView({
       <div className="absolute left-0 top-0 w-full overflow-hidden" style={{ height: splitKind ? "50%" : "100%" }}>
       <video
         ref={videoRef}
-        src={src}
+        src={previewMediaUrl(src)}
         className="absolute max-w-none pointer-events-none"
         style={{
           width: `${layout.widthFrac * 100}%`,
@@ -740,6 +755,13 @@ export function CropView({
         onLoadedMetadata={e => {
           const v = e.currentTarget;
           if (v.videoWidth && v.videoHeight) setNatural({ w: v.videoWidth, h: v.videoHeight });
+          if (Number.isFinite(v.duration) && start < v.duration) v.currentTime = start;
+        }}
+        onLoadedData={() => setMediaState("ready")}
+        onError={() => {
+          setMediaState("error");
+          setPlaying(false);
+          previewErrorRef.current?.();
         }}
         onTimeUpdate={onTimeUpdate}
         onPlaying={() => setPlaying(true)}
@@ -773,12 +795,12 @@ export function CropView({
            * sight, so the next split appears at once and in step. */
           style={splitKind ? undefined : { visibility: "hidden" }}>
           {splitKind === "background" && look?.backgroundUrl ? (
-            <video src={look.backgroundUrl} className="w-full h-full object-cover" muted autoPlay loop playsInline />
+            <video src={previewMediaUrl(look.backgroundUrl)} className="w-full h-full object-cover" muted autoPlay loop playsInline />
           ) : splitKind === "reaction" || styleSplit === "dual" ? (
             /* The same video again, kept in step with the main player: the
              * whole picture for a reaction split, the second person for Dual
              * Speaker. */
-            <video ref={lowerRef} src={src} muted playsInline
+            <video ref={lowerRef} src={previewMediaUrl(src)} muted playsInline
               className={lowerLayout ? "absolute max-w-none" : "w-full h-full object-cover"}
               style={lowerLayout ? {
                 width: `${lowerLayout.widthFrac * 100}%`,
@@ -805,7 +827,21 @@ export function CropView({
       </div>
 
       {/* Unmute banner — shown until the user explicitly turns on sound */}
-      {muted && (
+      {mediaState !== "ready" && (
+        <div role="status" className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-3 bg-black/70 px-4 text-center text-sm text-white">
+          {mediaState === "loading" ? "Loading preview…" : "This preview couldn’t be played."}
+          {mediaState === "error" && (
+            <button type="button" onPointerDown={e => e.stopPropagation()} onClick={() => {
+              setMediaState("loading");
+              videoRef.current?.load();
+              lowerRef.current?.load();
+            }} className="rounded-lg border border-white/50 px-3 py-1.5">
+              Reload preview
+            </button>
+          )}
+        </div>
+      )}
+      {mediaState === "ready" && muted && (
         <button
           onClick={e => { e.stopPropagation(); setMuted(false); }}
           onPointerDown={e => e.stopPropagation()}
@@ -817,7 +853,7 @@ export function CropView({
       )}
 
       {/* Audio & play controls */}
-      <div className="absolute bottom-2 right-2 z-40 flex items-center gap-1">
+      <div hidden={mediaState !== "ready"} className={mediaState === "ready" ? "absolute bottom-2 right-2 z-40 flex items-center gap-1" : "hidden"}>
         <button
           onClick={e => { e.stopPropagation(); setMuted(m => !m); }}
           onPointerDown={e => e.stopPropagation()}
