@@ -8,15 +8,16 @@ import SubtitleOverlay, {
   CAPTION_FONTS, CaptionPresetPicker, captionAnchor, previewWordsFor,
 } from "@/components/SubtitleOverlay";
 import { captionAt, groupCaptionWords, type CaptionPresetId } from "@shared/captions.mjs";
+import { MAX_ANALYSIS_RANGE_SECONDS, parseAnalysisTime } from "@shared/analysis-range.mjs";
 import {
   AI_VIDEO_STYLES, VIDEO_STYLES, montageCaptionStyle,
-  type OwnableCaptionField, type VideoLayout, type VideoStyleId,
+  type GamingSplit, type OwnableCaptionField, type VideoLayout, type VideoStyleId,
 } from "@shared/video-styles.mjs";
 import VideoStylePicker from "@/components/VideoStylePicker";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { downloadMedia } from "@/lib/download";
 import { trpc } from "@/lib/trpc";
-import { useSourceTranscription, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
+import { useSourceTranscription, type AnalysisRange, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
 import { toast } from "sonner";
 import {
   Upload, Link2, Sparkles, Type, Download, CheckCircle2,
@@ -145,7 +146,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     videoId: number; title: string; url: string;
     /** The source's own title and channel, for titles that name its people. */
     sourceTitle: string; channel: string;
-    transcript: string; duration: number; subtitlesOn: boolean; chooseManually?: boolean;
+    transcript: string; duration: number; subtitlesOn: boolean; analysisRange?: AnalysisRange;
     words: { word: string; start: number; end: number }[];
     heatmap: { start: number; end: number; value: number }[];
     chapters: { start: number; end: number; title: string }[];
@@ -184,7 +185,20 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   const [stage, setStage] = useState<Stage>("idle");
   const [videoMeta, setVideoMeta] = useState<{ title: string; duration: number; uploader: string } | null>(null);
   const [stageError, setStageError] = useState("");
-  const [analysisJobId, setAnalysisJobId] = useState<string | null>(null);
+  const [limitAnalysis, setLimitAnalysis] = useState(true);
+  const [rangeStart, setRangeStart] = useState("0:00");
+  const [rangeEnd, setRangeEnd] = useState("5:00");
+  const rangeFrom = parseAnalysisTime(rangeStart);
+  const rangeTo = parseAnalysisTime(rangeEnd);
+  const requestedRange = rangeFrom != null && rangeTo != null && rangeTo > rangeFrom
+    && rangeTo - rangeFrom <= MAX_ANALYSIS_RANGE_SECONDS ? { start: rangeFrom, end: rangeTo } : undefined;
+  const resetRangeResult = () => {
+    if (stage === "done") {
+      setTranscript("");
+      setTimedWords([]);
+    }
+    setStage("idle");
+  };
   const fileRef = useRef<HTMLInputElement>(null);
   const utils = trpc.useUtils();
 
@@ -195,8 +209,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     onError: (err) => toast.error(err.message),
   });
 
-  const { transcribe: transcribeSource, skip: skipTranscription, progress: transcriptionProgress } = useSourceTranscription();
-  const [chooseManually, setChooseManually] = useState(false);
+  const { transcribe: transcribeSource, progress: transcriptionProgress } = useSourceTranscription();
+  const [analysisRange, setAnalysisRange] = useState<AnalysisRange>();
 
   /** Set when transcription came back empty, so the person can go on without it. */
   const [noTranscript, setNoTranscript] = useState(false);
@@ -208,7 +222,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     language: string;
     heatmap: { start: number; end: number; value: number }[];
     chapters: { start: number; end: number; title: string }[];
-    chooseManually?: boolean;
+    analysisRange?: AnalysisRange;
   };
 
   /**
@@ -227,7 +241,8 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         language,
         allowSpeechToText: subtitlesOn && !pasted,
         quickImport: true,
-      }, setStage, setAnalysisJobId);
+        analysisRange: limitAnalysis ? requestedRange : undefined,
+      }, setStage);
       const found: Found = {
         transcript: pasted || result.transcript,
         words: pasted ? [] : result.words ?? [],
@@ -236,14 +251,14 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         // Real viewer rewatch data, when YouTube published it for this video.
         heatmap: result.heatmap ?? [],
         chapters: result.chapters ?? [],
-        chooseManually: result.skipped === true,
+        analysisRange: result.analysisRange,
       };
       setTranscript(found.transcript);
       setTimedWords(found.words);
       setDetectedLanguage(found.language);
       setHeatmap(found.heatmap);
       setChapters(found.chapters);
-      setChooseManually(found.chooseManually === true);
+      setAnalysisRange(found.analysisRange);
       setVideoMeta(found.meta);
       if (!title.trim()) setTitle(result.title);
       if (result.skipped && result.note) toast.info(result.note);
@@ -260,8 +275,6 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       setStageError(message);
       toast.error(message);
       return null;
-    } finally {
-      setAnalysisJobId(null);
     }
   };
 
@@ -301,13 +314,13 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       // Measured engagement signals, when the platform exposed them.
       heatmap: found.heatmap,
       chapters: found.chapters,
-      chooseManually: found.chooseManually,
+      analysisRange: found.analysisRange,
     });
   };
 
   /* What has been found so far, for going on without a transcript. */
   const foundSoFar = (): Found => ({
-    transcript, words: timedWords, meta: videoMeta, language: detectedLanguage, heatmap, chapters, chooseManually,
+    transcript, words: timedWords, meta: videoMeta, language: detectedLanguage, heatmap, chapters, analysisRange,
   });
 
   const selectFile = (selected: File | null) => {
@@ -328,6 +341,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   const handleProceed = async () => {
     if (mode === "url") {
       if (!url.trim()) { toast.error("Please enter a video URL"); return; }
+      if (limitAnalysis && !requestedRange) return;
       /* Already read (a save that failed is simply tried again). */
       const found = stage === "done" ? foundSoFar() : await extract();
       if (found) await saveAndContinue(found);
@@ -462,6 +476,38 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
             </div>
             <p className="text-xs text-muted-foreground">Supports YouTube, Vimeo, Twitter/X, TikTok, direct MP4 links, and 1000+ sites via yt-dlp.</p>
             <p className="text-xs text-muted-foreground">For Moroccan videos, select Moroccan Darija. Auto-detect identifies Arabic but cannot reliably identify the dialect.</p>
+            <fieldset disabled={isExtracting} className="space-y-2 rounded-xl border border-border px-3 py-3">
+              <legend className="px-1 text-sm font-semibold">Analyze</legend>
+              <div className="flex flex-wrap gap-4 text-sm">
+                <label className="flex items-center gap-2">
+                  <input type="radio" name="analysis-scope" checked={limitAnalysis}
+                    onChange={() => { setLimitAnalysis(true); resetRangeResult(); }} />
+                  Part of the video
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="radio" name="analysis-scope" checked={!limitAnalysis}
+                    onChange={() => { setLimitAnalysis(false); resetRangeResult(); }} />
+                  Full video
+                </label>
+              </div>
+              {limitAnalysis && (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="text-xs font-semibold">Start time
+                      <input value={rangeStart} onChange={e => { setRangeStart(e.target.value); resetRangeResult(); }}
+                        className="mt-1 w-full rounded-lg border border-border bg-input px-3 py-2 text-sm" placeholder="0:00" />
+                    </label>
+                    <label className="text-xs font-semibold">End time
+                      <input value={rangeEnd} onChange={e => { setRangeEnd(e.target.value); resetRangeResult(); }}
+                        className="mt-1 w-full rounded-lg border border-border bg-input px-3 py-2 text-sm" placeholder="5:00" />
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {requestedRange ? "Find automatic highlights in this range. Times use minutes:seconds." : "Enter a valid start and end time up to 15 minutes apart."}
+                  </p>
+                </>
+              )}
+            </fieldset>
           </div>
         )}
 
@@ -512,7 +558,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
           <div className="glass rounded-2xl p-5 space-y-3">
             <div className="flex items-center gap-3">
               <Loader2 className="w-4 h-4 animate-spin shrink-0" style={{ color: "var(--cobalt)" }} />
-              <span className="text-sm font-semibold text-foreground">{STAGE_LABELS[stage]}{stage === "transcribing" && transcriptionProgress > 0 ? ` ${Math.round(transcriptionProgress * 100)}%` : ""}</span>
+              <span className="text-sm font-semibold text-foreground">{stage === "downloading" && mode === "url" && limitAnalysis ? "Downloading selected time range…" : STAGE_LABELS[stage]}{stage === "transcribing" && transcriptionProgress > 0 ? ` ${Math.round(transcriptionProgress * 100)}%` : ""}</span>
             </div>
             {stage !== "uploading" && <><div className="h-2 rounded-full bg-secondary overflow-hidden">
               <div className="h-full rounded-full transition-all duration-700"
@@ -539,13 +585,6 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                 );
               })}
             </div></>}
-            {analysisJobId && (stage === "downloading" || stage === "queued" || stage === "transcribing") && (
-              <button type="button" disabled={skipTranscription.isPending}
-                onClick={() => skipTranscription.mutate({ id: analysisJobId }, { onError: error => toast.error(error.message) })}
-                className="rounded-lg border border-border px-3 py-1.5 text-xs font-semibold disabled:opacity-40">
-                Choose clip times without waiting
-              </button>
-            )}
           </div>
         )}
 
@@ -629,7 +668,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         {/* The one button: read, transcribe and save, then on to the highlights. */}
         <button
           onClick={handleProceed}
-          disabled={isExtracting || createVideo.isPending || (mode === "upload" ? !file || !title.trim() : !url.trim())}
+          disabled={isExtracting || createVideo.isPending || (mode === "upload" ? !file || !title.trim() : !url.trim() || (limitAnalysis && !requestedRange))}
           className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed glow-blue"
           style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
           {isExtracting || createVideo.isPending
@@ -752,7 +791,7 @@ function ManualClipPicker({ videoTitle, videoDuration, onNext }: {
 function StepHighlights({
   videoId, layout, videoTitle, sourceTitle, channel, transcript, apiKey, model, videoDuration,
   transcriptWords, heatmap, chapters, titleLanguage, onTitleLanguageChange,
-  detected, onDetected, pickedIds, onNext, chooseManually
+  detected, onDetected, pickedIds, onNext, analysisRange
 }: {
   videoId: number | null;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
@@ -773,7 +812,7 @@ function StepHighlights({
   onDetected: (detected: Detected) => void;
   /** Ids picked last time, when coming back to this step. */
   pickedIds: number[];
-  chooseManually: boolean;
+  analysisRange?: AnalysisRange;
   onNext: (clips: Highlight[], reelTitle: string) => void
 }) {
   const [found, setFound] = useState<Detected | null>(detected);
@@ -781,7 +820,7 @@ function StepHighlights({
     pickedIds.length > 0 ? pickedIds : detected?.highlights.map(h => h.id) ?? [],
   ));
   const [reelTitle, setReelTitle] = useState(detected?.reelTitle ?? "");
-  const [manual, setManual] = useState(chooseManually);
+  const [manual, setManual] = useState(false);
   /* The kind of video is always detected automatically. */
   const contentType = "auto";
   /** The title language the shown highlights were written in. */
@@ -828,7 +867,7 @@ function StepHighlights({
 
   /** Everything the detector needs, including whichever signals this source had. */
   const detectInput = {
-    transcript, model, apiKey, videoDuration, titleLanguage, contentType, videoId: videoId ?? undefined,
+    transcript, model, apiKey, videoDuration, titleLanguage, contentType, analysisRange, videoId: videoId ?? undefined,
     /* The names people search for are in the video's title, rarely in what is said. */
     sourceTitle: (sourceTitle || videoTitle).slice(0, 200) || undefined,
     channel: channel.slice(0, 200) || undefined,
@@ -1149,10 +1188,11 @@ function StepSubtitles({
   const { data: autoFraming } = trpc.videos.previewFraming.useQuery(
     {
       id: videoId ?? 0, startTime: clip?.startTime ?? 0, endTime: clip?.endTime ?? 0,
-      ...(clipStyle === "dual" ? { style: "dual" as const } : {}),
+      ...(clipStyle === "dual" || clipStyle === "gaming" ? { style: clipStyle } : {}),
     },
     { enabled: videoId != null && !!clip && hostedStatus === "ready", staleTime: Infinity },
   );
+  const gaming = clipStyle === "gaming" ? (autoFraming as { gaming?: GamingSplit } | undefined)?.gaming : undefined;
   /** Playback position in the clip, in steps coarse enough not to re-render every frame. */
   const [previewTime, setPreviewTime] = useState(0);
   useEffect(() => { setPreviewTime(0); }, [clip?.id]);
@@ -1364,7 +1404,7 @@ function StepSubtitles({
                 endTime={(clip?.endTime ?? 0) - hostedOffset}
                 className="w-full shadow-2xl"
                 style={{ maxWidth: "300px" }}
-                look={{ style: clipStyle, backgroundUrl, dual: pair, hasDual: plan.some(seg => seg.dual) }}
+                look={{ style: clipStyle, backgroundUrl, dual: pair, hasDual: plan.some(seg => seg.dual), gaming }}
                 onTime={t => setPreviewTime(Math.max(0, Math.round((t + hostedOffset - (clip?.startTime ?? 0)) * 20) / 20))}
                 onPlayingChange={setPlaying}
               >
@@ -1829,7 +1869,7 @@ export default function CreatePage() {
   // Kept so later steps can actually show and render the video.
   const [videoId, setVideoId] = useState<number | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
-  const [chooseManually, setChooseManually] = useState(false);
+  const [analysisRange, setAnalysisRange] = useState<AnalysisRange>();
   const [selectedClips, setSelectedClips] = useState<Highlight[]>([]);
   /** Highlights found for this video, kept so going back to step 2 shows them again. */
   const [detected, setDetected] = useState<Detected | null>(null);
@@ -1849,7 +1889,7 @@ export default function CreatePage() {
         {step === 1 && (
           <StepInput apiKey={apiKey} layout={videoLayout} onLayoutChange={setVideoLayout} onNext={v => {
             setVideoId(v.videoId); setVideoUrl(v.url);
-            setChooseManually(v.chooseManually === true);
+            setAnalysisRange(v.analysisRange);
             setVideoTitle(v.title); setTranscript(v.transcript); setVideoDuration(v.duration);
             setSourceTitle(v.sourceTitle); setChannel(v.channel);
             setTranscriptWords(v.words);
@@ -1862,7 +1902,7 @@ export default function CreatePage() {
           }} />
         )}
         {step === 2 && (
-          <StepHighlights videoId={videoId} layout={videoLayout} chooseManually={chooseManually}
+          <StepHighlights videoId={videoId} layout={videoLayout} analysisRange={analysisRange}
             videoTitle={videoTitle} sourceTitle={sourceTitle} channel={channel}
             transcript={transcript} apiKey={apiKey} model={model} videoDuration={videoDuration}
             transcriptWords={transcriptWords}

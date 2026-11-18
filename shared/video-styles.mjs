@@ -12,13 +12,14 @@ export const VIDEO_STYLES = {
   cinematic: { label: "Cinematic Talk", hint: "Dark grade, slow push-in, elegant captions", group: "Single speaker" },
   viral: { label: "Viral Captions", hint: "Big bold captions, spoken word pops", group: "Single speaker" },
   gameplay: { label: "Speaker + Gameplay", hint: "Speaker on top, your gameplay video below", group: "Split screen", split: "background" },
+  gaming: { label: "Facecam + Gameplay", hint: "Crop the streamer above the gameplay from the same video", group: "Split screen", split: "gaming" },
   satisfying: { label: "Speaker + Satisfying", hint: "Speaker on top, your satisfying video below", group: "Split screen", split: "background" },
   dual: { label: "Dual Speaker", hint: "Two people: one per half. One person: full screen", group: "Split screen", split: "dual" },
   reaction: { label: "Reaction Split", hint: "Creator's face on top, full picture below", group: "Split screen", split: "reaction" },
 };
 export const VIDEO_STYLE_IDS = Object.keys(VIDEO_STYLES);
 /** Styles the AI may suggest: the ones that need nothing but the clip itself. */
-export const AI_VIDEO_STYLES = ["normal", "dynamic", "podcast", "cinematic", "viral"];
+export const AI_VIDEO_STYLES = ["normal", "dynamic", "podcast", "cinematic", "viral", "gaming"];
 
 /**
  * Caption settings a person can choose. The video styles below change some of
@@ -53,7 +54,7 @@ function styleDefaults(styleId, style) {
       return { ...s, preset: "karaoke", uppercase: false, fontSize: Math.min(s.fontSize ?? 72, 56), color: "#F4EFE6", highlightColor: "#E8C98A" };
     case "viral":
       return { ...s, preset: "impact", uppercase: true, fontSize: Math.max(s.fontSize ?? 72, 96), outline: true };
-    case "gameplay": case "satisfying": case "reaction":
+    case "gameplay": case "gaming": case "satisfying": case "reaction":
       centre();
       return s.preset && s.preset !== "pop" ? s : { ...s, preset: "karaoke" };
     case "dual":

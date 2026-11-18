@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Maximize2, RotateCcw, ZoomIn, Play, Pause, Volume2, VolumeX } from "lucide-react";
-import { VIDEO_STYLES } from "@shared/video-styles.mjs";
+import { VIDEO_STYLES, type GamingSplit, type SourceRegion } from "@shared/video-styles.mjs";
 import { previewMediaUrl } from "@/lib/previewMedia";
 
 /**
@@ -478,6 +478,7 @@ export function CropView({
     dual?: { top: Framing; bottom: Framing } | null;
     /** Dual Speaker: the clip has two-person shots, so keep the second player loaded between them. */
     hasDual?: boolean;
+    gaming?: GamingSplit | null;
   } | null;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -487,7 +488,9 @@ export function CropView({
   const styleSplit = look ? (VIDEO_STYLES as Record<string, { split?: string }>)[look.style]?.split : undefined;
   /* Dual Speaker is split only while two people are on screen. */
   const pair = styleSplit === "dual" ? look?.dual ?? null : null;
-  const splitKind = styleSplit === "dual" ? (pair ? "dual" : undefined) : styleSplit;
+  const gaming = styleSplit === "gaming" ? look?.gaming ?? null : null;
+  const splitKind = styleSplit === "dual" ? (pair ? "dual" : undefined)
+    : styleSplit === "gaming" ? (gaming ? "gaming" : undefined) : styleSplit;
   const grade = look?.style === "cinematic" ? "contrast(1.1) saturate(0.78) brightness(0.88) sepia(0.18)"
     : look?.style === "podcast" ? "contrast(1.05) saturate(1.06)" : undefined;
 
@@ -650,7 +653,23 @@ export function CropView({
     [natural, low?.zoom, low?.offsetX, low?.offsetY],
   );
 
-  const canPan = !!onChange && (layout.slackX > 0.0005 || layout.slackY > 0.0005);
+  const gamePanel = (region: SourceRegion): React.CSSProperties => {
+    const pictureAspect = natural.w * region.w / (natural.h * region.h);
+    const panelAspect = 1080 / 960;
+    const width = Math.min(1, pictureAspect / panelAspect);
+    const height = Math.min(1, panelAspect / pictureAspect);
+    return {
+      width: `${100 * width}%`, height: `${100 * height}%`,
+      left: `${50 * (1 - width)}%`, top: `${50 * (1 - height)}%`,
+    };
+  };
+  const gameRegion = (region: SourceRegion): React.CSSProperties => ({
+    width: `${100 / region.w}%`, height: `${100 / region.h}%`,
+    left: `${-100 * region.x / region.w}%`, top: `${-100 * region.y / region.h}%`,
+    objectFit: "fill",
+  });
+  const visibleScale = gaming ? 1 : videoScale;
+  const canPan = !gaming && !!onChange && (layout.slackX > 0.0005 || layout.slackY > 0.0005);
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (!canPan) return;
@@ -722,10 +741,10 @@ export function CropView({
       <div
         className="absolute inset-0 overflow-hidden"
         style={{
-          width: `${videoScale * 100}%`,
-          height: `${videoScale * 100}%`,
-          left: `${((1 - videoScale) / 2) * 100}%`,
-          top: `${((1 - videoScale) / 2) * 100}%`,
+          width: `${visibleScale * 100}%`,
+          height: `${visibleScale * 100}%`,
+          left: `${((1 - visibleScale) / 2) * 100}%`,
+          top: `${((1 - visibleScale) / 2) * 100}%`,
         }}
       >
       {/*
@@ -734,11 +753,12 @@ export function CropView({
         letterboxing or stretching occurs.
       */}
       <div className="absolute left-0 top-0 w-full overflow-hidden" style={{ height: splitKind ? "50%" : "100%" }}>
+      <div className="absolute overflow-hidden" style={gaming ? gamePanel(gaming.top) : { inset: 0 }}>
       <video
         ref={videoRef}
         src={previewMediaUrl(src)}
         className="absolute max-w-none pointer-events-none"
-        style={{
+        style={gaming ? gameRegion(gaming.top) : {
           width: `${layout.widthFrac * 100}%`,
           height: `${layout.heightFrac * 100}%`,
           left: `${layout.leftFrac * 100}%`,
@@ -785,6 +805,7 @@ export function CropView({
         loop={end == null}
       />
       </div>
+      </div>
       {look?.style === "cinematic" && (
         <div className="absolute inset-0 pointer-events-none"
           style={{ background: "radial-gradient(ellipse at 50% 42%, transparent 45%, rgba(0,0,0,0.6) 100%)" }} />
@@ -793,16 +814,17 @@ export function CropView({
         <div className="absolute left-0 bottom-0 w-full h-1/2 overflow-hidden pointer-events-none bg-neutral-900"
           /* Between two-person shots the second player stays loaded but out of
            * sight, so the next split appears at once and in step. */
-          style={splitKind ? undefined : { visibility: "hidden" }}>
+          style={gaming ? { background: "#000" } : splitKind ? undefined : { visibility: "hidden" }}>
           {splitKind === "background" && look?.backgroundUrl ? (
             <video src={previewMediaUrl(look.backgroundUrl)} className="w-full h-full object-cover" muted autoPlay loop playsInline />
-          ) : splitKind === "reaction" || styleSplit === "dual" ? (
+          ) : gaming || splitKind === "reaction" || styleSplit === "dual" ? (
             /* The same video again, kept in step with the main player: the
              * whole picture for a reaction split, the second person for Dual
              * Speaker. */
+            <div className="absolute overflow-hidden" style={gaming ? gamePanel(gaming.bottom) : { inset: 0 }}>
             <video ref={lowerRef} src={previewMediaUrl(src)} muted playsInline
-              className={lowerLayout ? "absolute max-w-none" : "w-full h-full object-cover"}
-              style={lowerLayout ? {
+              className={gaming || lowerLayout ? "absolute max-w-none" : "w-full h-full object-cover"}
+              style={gaming ? gameRegion(gaming.bottom) : lowerLayout ? {
                 width: `${lowerLayout.widthFrac * 100}%`,
                 height: `${lowerLayout.heightFrac * 100}%`,
                 left: `${lowerLayout.leftFrac * 100}%`,
@@ -815,6 +837,7 @@ export function CropView({
                 e.currentTarget.currentTime = main.currentTime;
                 if (!main.paused) void e.currentTarget.play().catch(() => {});
               }} />
+            </div>
           ) : (
             <div className="w-full h-full flex items-center justify-center px-4 text-center text-[11px] font-semibold text-white/70">
               Choose a background video to fill this half

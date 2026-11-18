@@ -2,6 +2,7 @@ import { useState } from "react";
 import { trpc } from "@/lib/trpc";
 
 export type SourceTranscriptionStage = "queued" | "fetching-info" | "checking-captions" | "downloading" | "transcribing";
+export type AnalysisRange = { start: number; end: number };
 
 type SourceTranscriptionResult = {
   source: "youtube" | "whisper" | "none";
@@ -14,6 +15,7 @@ type SourceTranscriptionResult = {
   note: string;
   skipped?: boolean;
   language?: string;
+  analysisRange?: AnalysisRange;
   heatmap?: { start: number; end: number; value: number }[];
   chapters?: { start: number; end: number; title: string }[];
 };
@@ -27,7 +29,7 @@ export function useSourceTranscription() {
   const { client } = sourceTrpc.useUtils();
 
   async function transcribe(
-    input: { url: string; language: string; allowSpeechToText: boolean; quickImport?: boolean },
+    input: { url: string; language: string; allowSpeechToText: boolean; quickImport?: boolean; analysisRange?: AnalysisRange },
     onStage?: (stage: SourceTranscriptionStage) => void,
     onJob?: (id: string) => void,
   ): Promise<SourceTranscriptionResult> {

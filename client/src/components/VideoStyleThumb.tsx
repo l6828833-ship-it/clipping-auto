@@ -92,6 +92,7 @@ export function VideoStyleThumb({ id }: { id: VideoStyleId | "auto" }) {
         </>
       );
       break;
+    case "gaming":
     case "gameplay":
       content = (
         <>

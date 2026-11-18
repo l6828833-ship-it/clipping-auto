@@ -341,7 +341,7 @@ def load_detector():
     return ort.InferenceSession(str(MODEL), options, providers=["CPUExecutionProvider"])
 
 
-def people(video, start, duration, width, height):
+def people(video, start, duration, width, height, stationary=False):
     """Where each person's face sits across the clip, for split-screen
     layouts. Faces are grouped by horizontal position; each group is one
     person: {"cx", "cy", "w", "h"} as fractions of the frame, plus "share",
@@ -352,7 +352,9 @@ def people(video, start, duration, width, height):
         total += 1
         seen = set()
         for face in detect(session, frame):
-            match = next((g for g in groups if abs(float(np.median(g["cx"])) - face[0]) < 0.12), None)
+            tolerance = 0.075 if stationary else 0.12
+            match = next((g for g in groups if abs(float(np.median(g["cx"])) - face[0]) < tolerance
+                          and (not stationary or abs(float(np.median(g["cy"])) - face[1]) < tolerance)), None)
             if match is None:
                 match = {"cx": [], "cy": [], "w": [], "h": [], "frames": 0}
                 groups.append(match)
@@ -371,8 +373,9 @@ def people(video, start, duration, width, height):
 
 
 def main():
-    if len(sys.argv) > 6 and sys.argv[6] == "people":
-        found = people(sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(float(sys.argv[4])), int(float(sys.argv[5])))
+    if len(sys.argv) > 6 and sys.argv[6] in {"people", "facecam"}:
+        found = people(sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(float(sys.argv[4])),
+                       int(float(sys.argv[5])), stationary=sys.argv[6] == "facecam")
         json.dump({"people": found}, sys.stdout)
         return
     if len(sys.argv) < 6:

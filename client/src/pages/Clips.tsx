@@ -17,7 +17,7 @@ import {
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import VideoStylePicker from "@/components/VideoStylePicker";
-import { montageCaptionStyle, punchIns, type VideoLayout } from "@shared/video-styles.mjs";
+import { montageCaptionStyle, punchIns, type GamingSplit, type VideoLayout } from "@shared/video-styles.mjs";
 import {
   youTubeThumbnail,
   youTubeWatchUrl,
@@ -401,12 +401,13 @@ function ClipEditorModal({
   /* Dual Speaker: which shots have two people, and the crop for each half.
    * The export frames every shot of this style itself, so its preview uses
    * that plan too rather than the manual framing. */
-  const { data: dualPlan } = trpc.videos.previewFraming.useQuery(
-    { id: video?.id ?? 0, startTime: start, endTime: end, style: "dual" },
-    { enabled: layout?.style === "dual" && !!video && hostedStatus === "ready" && end > start, staleTime: Infinity },
+  const splitStyle = layout?.style === "gaming" ? "gaming" : "dual";
+  const { data: splitPlan } = trpc.videos.previewFraming.useQuery(
+    { id: video?.id ?? 0, startTime: previewRange.start, endTime: previewRange.end, style: splitStyle },
+    { enabled: (layout?.style === "dual" || layout?.style === "gaming") && !!video && hostedStatus === "ready" && validRange, staleTime: Infinity },
   );
   const plan = layout?.style === "dual"
-    ? (((dualPlan as { segments?: PlanSegment[] } | undefined)?.segments) ?? [])
+    ? (((splitPlan as { segments?: PlanSegment[] } | undefined)?.segments) ?? [])
     : [];
   const planIndex = plan.length ? segmentAt(plan, playhead) : undefined;
   const planSegment = planIndex != null ? plan[planIndex] : undefined;
@@ -417,6 +418,7 @@ function ClipEditorModal({
     punch: punches.some(([a, b]) => playhead >= a && playhead < b),
     dual: pair,
     hasDual: plan.some(seg => seg.dual),
+    gaming: splitStyle === "gaming" ? (splitPlan as { gaming?: GamingSplit } | undefined)?.gaming : undefined,
   };
   const valid = end > start;
   const isRendered = !!clip.downloadUrl && clip.downloadUrl !== "#";

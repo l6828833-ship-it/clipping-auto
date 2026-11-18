@@ -50,33 +50,33 @@ export function sampleTimes(duration, peaks = []) {
   return [...times].sort((a, b) => a - b);
 }
 
-export async function readMediaEvidence({ file, duration, ffmpeg, peaks = [], deadline = Date.now() + 60_000 }) {
+export async function readMediaEvidence({ file, duration, offset = 0, ffmpeg, peaks = [], deadline = Date.now() + 60_000 }) {
   if (!Number.isFinite(duration) || duration <= 0) throw new Error("Video duration is unavailable.");
   const work = await mkdtemp(path.join(os.tmpdir(), "clip-evidence-"));
   try {
     const metadata = path.join(work, "sound.txt");
     let sound = [];
     try {
-      await run(ffmpeg, ["-nostdin", "-v", "error", "-i", file, "-vn", "-ac", "1", "-ar", "16000",
+      await run(ffmpeg, ["-nostdin", "-v", "error", "-ss", String(offset), "-i", file, "-t", String(duration), "-vn", "-ac", "1", "-ar", "16000",
         "-af", `asetnsamples=n=16000,astats=metadata=1:reset=1,ametadata=print:file=${metadata}`,
         "-f", "null", "-"], { timeout: Math.max(1, Math.min(25_000, deadline - Date.now())), maxBuffer: 256 * 1024 });
       sound = audioPeaks(await readFile(metadata, "utf8"), duration);
     } catch { /* Silent videos and video-only tracks still have visual evidence. */ }
     const anchors = [...peaks.slice(0, 5).map(p => (p.start + p.end) / 2), ...sound.map(p => p.time)];
-    const frames = await framesAt({ file, ffmpeg, work, times: sampleTimes(duration, anchors), deadline });
+    const frames = await framesAt({ file, offset, ffmpeg, work, times: sampleTimes(duration, anchors), deadline });
     return { frames, sound };
   } finally {
     await rm(work, { recursive: true, force: true });
   }
 }
 
-async function framesAt({ file, ffmpeg, work, times, deadline = Date.now() + 30_000 }) {
+async function framesAt({ file, offset = 0, ffmpeg, work, times, deadline = Date.now() + 30_000 }) {
   const frames = [];
   for (const time of times) {
     if (Date.now() >= deadline) break;
     const output = path.join(work, "frame.jpg");
     try {
-      await run(ffmpeg, ["-nostdin", "-v", "error", "-ss", String(time), "-i", file,
+      await run(ffmpeg, ["-nostdin", "-v", "error", "-ss", String(time + offset), "-i", file,
         "-frames:v", "1", "-vf", "scale=384:-2", "-q:v", "5", "-y", output],
       { timeout: Math.min(10_000, Math.max(1, deadline - Date.now())), maxBuffer: 256 * 1024 });
       const data = await readFile(output);
@@ -88,7 +88,7 @@ async function framesAt({ file, ffmpeg, work, times, deadline = Date.now() + 30_
 }
 
 /** Dense verification avoids calling a single still frame a completed event. */
-export async function verifyVisualHighlights({ highlights, file, duration, ffmpeg, ask, parse, deadline = Date.now() + 60_000 }) {
+export async function verifyVisualHighlights({ highlights, file, duration, offset = 0, ffmpeg, ask, parse, deadline = Date.now() + 60_000 }) {
   const candidates = highlights.filter(h => h.evidence === "visual").slice(0, 8);
   if (!candidates.length) return highlights;
   const work = await mkdtemp(path.join(os.tmpdir(), "clip-verify-"));
@@ -98,7 +98,7 @@ export async function verifyVisualHighlights({ highlights, file, duration, ffmpe
     for (const [index, h] of candidates.entries()) {
       const length = h.endTime - h.startTime;
       const times = Array.from({ length: 8 }, (_, i) => Math.max(0, Math.min(duration - 0.1, h.startTime + length * (i + 0.5) / 8)));
-      const frames = await framesAt({ file, ffmpeg, work, times, deadline: Math.min(deadline, Date.now() + 5000) });
+      const frames = await framesAt({ file, offset, ffmpeg, work, times, deadline: Math.min(deadline, Date.now() + 5000) });
       if (frames.length >= 3) visible.add(index);
       content.push({ type: "text", text: `Candidate ${index}: ${frames.length} frames follow.` }, ...frameContent(frames));
     }
@@ -118,9 +118,10 @@ export function frameContent(frames) {
   ]);
 }
 
-export const MEDIA_EDITOR_RULES = `You are editing the actual timestamped frames AND transcript provided. Classify the source as interview, football/sport, music/performance, comedy or mixed. A video may change type between sections; choose the edit per clip.
+export const MEDIA_EDITOR_RULES = `You are editing the actual timestamped frames AND transcript provided. Classify the source as interview, football/sport, music/performance, comedy, gaming or mixed. A video may change type between sections; choose the edit per clip.
 Interview: keep the complete question/claim and answer/payoff; use transcript word timings. Dialect transcripts (Moroccan Darija and others) contain recognition mistakes: read the meaning through them. Funny parts (teasing, banter, laughter, absurd stories, reactions) come before plain informative answers.
 Football/sport: keep the buildup, visible action and outcome/reaction together. Do not label a shot as a goal unless the sequence shows the result. Preserve the ball/action in the edit. Commentary alone does not establish what is visible.
+Gaming: keep the build-up, play and reaction. Choose montage "gaming" only when the frames show gameplay and a real player's facecam in the same shot. If there is no facecam, choose "normal".
 Music/performance: select a visually coherent performance section with a complete movement or phrase where supported. Sound-energy peaks are only loudness measurements; you have NOT heard the music, so never claim beat/chorus/drop detection. Do not invent lyrics or force speech captions onto instrumental sections.
 Comedy: keep setup, payoff and visible reaction. Visual jokes can work with no speech. Do not manufacture dialogue or infer a joke just because someone smiles.
 Mixed: judge each section from its own evidence. Background music does not make an interview a music video. Use speech for spoken clips and visual sequences for nonverbal clips.
@@ -128,4 +129,4 @@ The title, metadata and replay/loudness peaks are context, not proof. Images or 
 For each candidate return evidence: "speech" or "visual". Speech candidates must have speech in that interval. Visual candidates need timestamped frames inside the interval and must describe only what those frames establish. Keep original source timestamps. Do not snap a nonverbal event to unrelated words.
 Laughter is rarely transcribed: "ههه", "haha", bursts of short reactions, people talking over each other, loud moments and visible laughing are signs of a funny part.
 Return the full number of candidates requested whenever the video is long enough to hold them without overlap; score weaker ones honestly and they will be removed. Never invent what happens in a clip.
-Return JSON with contentType, reelTitle, and highlights: [{id,title,startTime,endTime,engagementScore,kind,montage,reason,evidence}]. Choose montage from viral,dynamic,podcast,cinematic,normal. Aim for 15–60 seconds; up to 90 for a complete story. Very short sources may be shorter. Do not overlap clips. Titles and reasons must follow the requested language.`;
+Return JSON with contentType, reelTitle, and highlights: [{id,title,startTime,endTime,engagementScore,kind,montage,reason,evidence}]. Choose montage from viral,dynamic,podcast,cinematic,normal,gaming. Aim for 15–60 seconds; up to 90 for a complete story. Very short sources may be shorter. Do not overlap clips. Titles and reasons must follow the requested language.`;

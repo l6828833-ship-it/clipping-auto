@@ -8,11 +8,12 @@ import { totalmem, tmpdir as systemTmpdir } from "os";
 
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { registerSocialPublishing } from "../server/social-publishing.mjs";
-import { facePanelCrop, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
+import { facePanelCrop, gamingPanelFilter, gamingSplitPlan, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
 import { OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildHighlightPrompts, buildJudgePrompt, clipCountFor, countOnPeaks, detectTextLanguage, filterSpeechHighlights, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines, transcriptWindows } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
+import { MAX_ANALYSIS_RANGE_SECONDS, wordsWithinRange } from "../shared/analysis-range.mjs";
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
@@ -1542,10 +1543,35 @@ async function downloadSourceAudio(url, tmpDir, language, onTranscribing, signal
   return { audioPath };
 }
 var captionLanguageInput = z.string().regex(/^(?:auto|[a-z]{2,3}(?:-[a-z]{2})?)$/i).transform(value => value.toLowerCase()).default("auto");
+const analysisRangeInput = z.object({
+  start: z.number().nonnegative().finite(),
+  end: z.number().positive().finite(),
+}).refine(({ start, end }) => end > start && end - start <= MAX_ANALYSIS_RANGE_SECONDS,
+  "Choose an end after the start and select up to 15 minutes.");
+
+function rangeForDuration(range, duration) {
+  if (!range || !(duration > 0)) return range;
+  if (range.start >= duration) throw new Error("Analysis starts after the video ends.");
+  return { start: range.start, end: Math.min(range.end, duration) };
+}
+
+async function openAnalysisRange(url, range) {
+  const hosted = await hostVideoShared({ videoId: analysisVideoKey(url), sourceUrl: url, range,
+    maxHeight: 360, sectionOnly: true, analysisOnly: true });
+  const offset = Math.max(0, range.start - hosted.offset);
+  if (hosted.duration > offset + range.end - range.start + 7) {
+    throw new Error("The video source did not honor the selected range.");
+  }
+  const length = Math.min(range.end - range.start, hosted.duration - offset);
+  if (!(length >= 0.5)) throw new Error("There is no playable video in the selected time range.");
+  return { file: path5.join(VIDEOS_DIR, hosted.fileName), offset, length, sourceInfo: hosted.sourceInfo };
+}
+
 var sourceTranscriptionInput = z.object({
   url: z.string().url("Invalid URL"),
   language: captionLanguageInput,
-  allowSpeechToText: z.boolean().default(true)
+  allowSpeechToText: z.boolean().default(true),
+  analysisRange: analysisRangeInput.optional()
 });
 async function transcribeSource(input, reportStage = () => {}, { signal, reportMetadata = () => {}, reportProgress = () => {} } = {}) {
   const url = assertSafeUrl(input.url);
@@ -1563,8 +1589,14 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     }
   }
 
+  let analysisRange;
+  try {
+    analysisRange = rangeForDuration(input.analysisRange, meta.duration);
+  } catch (error) {
+    throw new TRPCError2({ code: "BAD_REQUEST", message: error.message });
+  }
   const result = (source, transcript = "", words = [], note = "") => ({
-    success: true, ...meta, source, transcript, words, wordCount: words.length, note, language
+    success: true, ...meta, source, transcript, words, wordCount: words.length, note, language, analysisRange
   });
   reportMetadata(result("none"));
   reportStage("checking-captions");
@@ -1573,7 +1605,10 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
    * rule as scripts/whisper_words.py), Arabic goes straight to Whisper. */
   const whisperFirst = /^ar\b/.test(language);
   const captions = whisperFirst ? null : await tryYouTubeTranscript(url, language, signal);
-  if (captions) return result("youtube", captions.text, captions.words);
+  if (captions && analysisRange) {
+    const words = wordsWithinRange(captions.words, analysisRange);
+    if (words.length) return result("youtube", words.map(word => word.word).join(" "), words);
+  } else if (captions) return result("youtube", captions.text, captions.words);
   if (!input.allowSpeechToText) {
     return result("none", "", [], "Subtitles are off for this import.");
   }
@@ -1584,7 +1619,18 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     reportStage("downloading");
     let audioPath;
     try {
-      const download = await downloadSourceAudio(url, tmpDir, language, () => reportStage("transcribing"), signal);
+      const download = analysisRange ? await (async () => {
+        const media = await openAnalysisRange(url, analysisRange);
+        signal?.throwIfAborted();
+        analysisRange = { ...analysisRange, end: analysisRange.start + media.length };
+        const ffmpeg = await getFfmpeg();
+        const audioPath = path3.join(tmpDir, "selected-range.wav");
+        await promisify(execFile)(ffmpeg, [
+          "-nostdin", "-v", "error", "-ss", String(media.offset), "-i", media.file,
+          "-t", String(media.length), "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-y", audioPath
+        ], { timeout: 120000, signal, killSignal: "SIGKILL" });
+        return { audioPath, metadata: media.sourceInfo };
+      })() : await downloadSourceAudio(url, tmpDir, language, () => reportStage("transcribing"), signal);
       audioPath = download.audioPath;
       if (download.metadata) {
         const { title, duration, uploader, language: sourceLanguage } = download.metadata;
@@ -1603,7 +1649,9 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
       const details = redactDownloadError(String(error.stderr || error.message));
       console.warn("[Extract] Source audio unavailable:", details.slice(0, 600));
       const youtubeDenied = youtubeSourceId(url) && /403|429|forbidden|sign in|not a bot/i.test(details);
-      const note = youtubeDenied
+      const note = analysisRange
+        ? "The selected range couldn’t be opened for transcription. Check its times, or try a shorter range."
+        : youtubeDenied
         ? "YouTube blocked this server’s download. You can upload a copy of the video you own to transcribe it with Whisper."
         : "Clip Maker couldn’t prepare audio for Whisper. Try again or upload the original video.";
       return result("none", "", [], note);
@@ -1614,7 +1662,12 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
       // turn the user's Auto choice into forced Arabic on English passages.
       const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, input.language, signal, reportProgress);
       if (input.language === "auto" && detectedLanguage) language = detectedLanguage;
-      if (text && words.length) return result("whisper", text, words);
+      if (text && words.length) {
+        if (!analysisRange) return result("whisper", text, words);
+        const offset = analysisRange.start;
+        const mapped = wordsWithinRange(words.map(word => ({ ...word, start: word.start + offset, end: word.end + offset })), analysisRange);
+        if (mapped.length) return result("whisper", mapped.map(word => word.word).join(" "), mapped);
+      }
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {
       signal?.throwIfAborted();
@@ -1706,7 +1759,7 @@ var extractRouter = router({
      * small copy of the video that visual analysis will need. */
     let prefetched = false;
     const onStage = (stage) => {
-      if (stage === "transcribing" && !prefetched) {
+      if (stage === "transcribing" && !prefetched && !input.analysisRange) {
         prefetched = true;
         prefetchAnalysisVideo(input.url);
       }
@@ -2047,7 +2100,8 @@ var geminiRouter = router({
   detectHighlights: protectedProcedure.input(z2.object({
     transcript: z2.string().max(300000).default(""),
     videoId: z2.number().int().positive().optional(),
-    contentType: z2.enum(["auto", "interview", "sport", "music", "comedy", "mixed"]).default("auto"),
+    analysisRange: analysisRangeInput.optional(),
+    contentType: z2.enum(["auto", "interview", "sport", "music", "comedy", "gaming", "mixed"]).default("auto"),
     transcriptWords: z2.array(z2.object({ word: z2.string(), start: z2.number().nonnegative(), end: z2.number().optional() })).optional(),
     /** YouTube's most-replayed curve and chapter list, when the source has them. */
     heatmap: z2.array(z2.object({ start: z2.number(), end: z2.number(), value: z2.number() })).max(2000).optional(),
@@ -2067,18 +2121,35 @@ var geminiRouter = router({
     // file or a third-party media URL from the analysis request.
     const video = input.videoId ? await getVideoById(input.videoId, ctx.user.id) : null;
     if (input.videoId && !video) throw new TRPCError3({ code: "NOT_FOUND", message: "Video not found" });
+    let range;
+    try {
+      range = rangeForDuration(input.analysisRange, video?.duration || input.videoDuration);
+    } catch (error) {
+      throw new TRPCError3({ code: "BAD_REQUEST", message: error.message });
+    }
+    const sourceOffset = range?.start ?? 0;
+    const analysisDuration = range ? range.end - range.start : video?.duration || input.videoDuration;
     const deadline = Date.now() + 270000;
-    const timedWords = (input.transcriptWords ?? []).filter((w) => w.word.trim());
+    const words = (input.transcriptWords ?? []).filter((w) => w.word.trim());
+    const timedWords = range ? wordsWithinRange(words, range).map(w => ({
+      ...w, start: w.start - sourceOffset, end: w.end - sourceOffset
+    })) : words;
     const lines = timedWords.length >= 5 ? transcriptLines(timedWords) : [];
-    const transcript = lines.length ? formatTimedTranscript(lines) : input.transcript;
-    const peaks = replayPeaks(input.heatmap);
-    const targetCount = input.rankingMode ? 3 : clipCountFor(video?.duration || input.videoDuration);
+    const transcript = lines.length ? formatTimedTranscript(lines)
+      : range && words.length ? timedWords.map(w => w.word).join(" ") : input.transcript;
+    const allPeaks = replayPeaks(input.heatmap);
+    const peaks = range ? allPeaks.filter(p => p.end > range.start && p.start < range.end).map(p => ({
+      ...p, start: Math.max(p.start, range.start) - sourceOffset, end: Math.min(p.end, range.end) - sourceOffset
+    })) : allPeaks;
+    const chapters = (input.chapters ?? []).filter(c => !range || c.start >= range.start && c.start < range.end)
+      .map(c => ({ ...c, start: c.start - sourceOffset }));
+    const targetCount = input.rankingMode ? 3 : clipCountFor(analysisDuration);
     const prompts = buildHighlightPrompts({
       transcript,
       timed: lines.length > 0,
-      videoDuration: input.videoDuration,
+      videoDuration: analysisDuration,
       peaks,
-      chapters: input.chapters ?? [],
+      chapters,
       // A few alternate candidates survive timing adjustments and deduping.
       count: Math.min(12, targetCount + 3),
       videoTitle: input.sourceTitle ?? "",
@@ -2120,12 +2191,18 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       let visualWarning = "";
       if (video && !rankingMode) {
         try {
-          let file = video.hostedStatus === "ready" && !(video.hostedOffset > 0) ? await ensureLocalMedia(video.hostedUrl) : null;
+          let file = !range && video.hostedStatus === "ready" && !(video.hostedOffset > 0) ? await ensureLocalMedia(video.hostedUrl) : null;
           let info = file ? await probeMedia(file) : null;
+          let offset = 0;
           // A clip preview starting at zero may still cover only a small part
           // of the source. Do not mistake it for the full video.
           if (info && video.duration > info.duration + 2) file = null;
-          if (!file && video.sourceType === "url") {
+          if (range && video.sourceType === "url") {
+            const selected = await withinBudget(openAnalysisRange(video.sourceUrl, range), 60000);
+            file = selected.file;
+            info = { duration: selected.length };
+            offset = selected.offset;
+          } else if (!range && !file && video.sourceType === "url") {
             /* Usually already downloaded, or nearly, while Whisper ran. */
             const full = await withinBudget(hostVideoShared({ videoId: analysisVideoKey(video.sourceUrl), sourceUrl: video.sourceUrl, maxHeight: 360 }), 60000);
             file = path5.join(VIDEOS_DIR, full.fileName);
@@ -2133,9 +2210,9 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           }
           const ffmpeg = await findFfmpeg();
           if (file && info?.duration > 0 && ffmpeg) {
-            const evidence = await readMediaEvidence({ file, duration: info.duration, ffmpeg, peaks,
+            const evidence = await readMediaEvidence({ file, duration: info.duration, offset, ffmpeg, peaks,
               deadline: Math.min(deadline - 90000, Date.now() + 60000) });
-            if (evidence.frames.length >= 2) media = { ...evidence, file, duration: info.duration, ffmpeg };
+            if (evidence.frames.length >= 2) media = { ...evidence, file, duration: info.duration, offset, ffmpeg };
           }
           if (!media) visualWarning = "Visual analysis was unavailable. These suggestions use speech only.";
         } catch (error) {
@@ -2159,16 +2236,16 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       ];
       /* A long video is also searched part by part, all parts at once, so
        * moments deep in the video get the same attention as the start. */
-      const parts = rankingMode ? [] : transcriptWindows(lines, { duration: video?.duration || input.videoDuration });
+      const parts = rankingMode ? [] : transcriptWindows(lines, { duration: analysisDuration });
       const perPart = parts.length ? Math.min(6, Math.max(3, Math.ceil(targetCount * 2 / parts.length) + 1)) : 0;
       const searchPart = async (part) => {
         const from = part[0].start, to = part[part.length - 1].end;
         const p = buildHighlightPrompts({
           transcript: formatTimedTranscript(part),
           timed: true,
-          videoDuration: input.videoDuration,
+          videoDuration: analysisDuration,
           peaks: peaks.filter(pk => pk.end > from && pk.start < to),
-          chapters: (input.chapters ?? []).filter(c => c.start >= from && c.start < to),
+          chapters: chapters.filter(c => c.start >= from && c.start < to),
           count: perPart,
           videoTitle: input.sourceTitle ?? "",
           channel: input.channel ?? ""
@@ -2230,7 +2307,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         });
       }
       /* Land every clip on real speech boundaries and drop overlapping picks. */
-      const duration = media?.duration || video?.duration || input.videoDuration;
+      const duration = media?.duration || analysisDuration;
       const inBounds = h => Number.isFinite(h.startTime) && Number.isFinite(h.endTime)
         && h.startTime >= 0 && h.endTime > h.startTime && (!duration || h.endTime <= duration + 0.1)
         && h.endTime - h.startTime <= 95;
@@ -2341,7 +2418,11 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       return {
         hasWordTimings: lines.length > 0,
         heatPeaksUsed: countOnPeaks(ordered, peaks),
-        highlights: ordered,
+        highlights: range ? ordered.map(clip => ({
+          ...clip,
+          startTime: Number((clip.startTime + sourceOffset).toFixed(3)),
+          endTime: Number(Math.min(range.end, clip.endTime + sourceOffset).toFixed(3)),
+        })) : ordered,
         analysisMode: media ? "visual-and-speech" : "speech",
         analysisNote: visualWarning || (media ? "Uses sampled video frames and speech. Fast action or audio-only musical changes can be missed; preview the selected clips." : ""),
         contentType: typeof parsed.contentType === "string" ? parsed.contentType.slice(0, 80) : "interview",
@@ -3194,7 +3275,7 @@ async function hostVideo(opts) {
     const sectionTimeout = youtubeSourceId(sourceUrl) && youtubeWorkerAlive() ? 75e3 : 18e4;
     const downloadFull = () => runStreaming(
       ytDlp,
-      [...commonArgs, ...sectionArgs, "--match-filter", `duration < ${maxMinutes * 60}`, sourceUrl],
+      [...commonArgs, ...sectionArgs, ...(opts.analysisOnly ? [] : ["--match-filter", `duration < ${maxMinutes * 60}`]), sourceUrl],
       { timeout: range ? sectionTimeout : 18e5, onLine: makeProgressHandler() }
     );
     /*
@@ -3221,7 +3302,7 @@ async function hostVideo(opts) {
         "--newline", "--progress",
         "-o", `${stem}.%(ext)s`,
         ...sectionArgs,
-        "--match-filter", `duration < ${maxMinutes * 60}`,
+        ...(opts.analysisOnly ? [] : ["--match-filter", `duration < ${maxMinutes * 60}`]),
         sourceUrl
       ],
       { timeout: range ? sectionTimeout : 18e4, onLine: makeProgressHandler() }
@@ -3282,7 +3363,7 @@ async function hostVideo(opts) {
                 await fs6.rm(path5.join(tmpDir, f), { force: true }).catch(() => {});
               }
               await downloadShortCompatible(YT_PUBLIC_FALLBACK_CLIENT_ARGS);
-            } else if (range && /ffmpeg|exited with code|merge/i.test(shortMessage)) {
+            } else if (range && !opts.analysisOnly && /ffmpeg|exited with code|merge/i.test(shortMessage)) {
               /* Only a section-cut compatibility failure uses the complete,
                * size-bounded source rescue. It is never the normal path. */
               console.warn(`[Host] Compatible short-range cut failed; using the bounded full-source rescue for this source...`);
@@ -3300,7 +3381,7 @@ async function hostVideo(opts) {
         }
       }
     };
-    let downloaded;
+    let downloaded, sourceInfo;
     try {
       /* Once YouTube has refused this server, skip straight to the download
        * worker for a while. Retrying the blocked download first added most
@@ -3320,6 +3401,7 @@ async function hostVideo(opts) {
       const metadata = await downloadWithYouTubeWorker(youtubeSourceId(sourceUrl), workerVideo, {
         kind: "video",
         range: range ? { start: offset, duration: range.end + SECTION_BUFFER - offset } : undefined,
+        analysisOnly: opts.analysisOnly === true,
       });
       if (!metadata) {
         /* No worker to fall back on: try YouTube directly again next time. */
@@ -3327,6 +3409,7 @@ async function hostVideo(opts) {
         throw error;
       }
       compatibleFullSource = false;
+      sourceInfo = metadata;
       downloaded = workerVideo;
     }
     opts.onProgress?.(96);
@@ -3410,7 +3493,7 @@ async function hostVideo(opts) {
     /* A copy in the storage bucket, in the background: the import can be used
      * straight away from this instance's disk meanwhile. */
     await storeMedia(urlFor("video", fileName), { duration: meta.duration, width: meta.width, height: meta.height });
-    return { fileName, url: urlFor("video", fileName), bytes: stat.size, offset: effectiveOffset, ...meta, isLowRes };
+    return { fileName, url: urlFor("video", fileName), bytes: stat.size, offset: effectiveOffset, ...meta, isLowRes, sourceInfo };
   } catch (err) {
     await fs6.rm(outPath, { force: true }).catch(() => {
     });
@@ -3720,6 +3803,10 @@ async function analyseFraming(hostedPath, startInFile, duration, mode) {
     { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
   ));
   const result = JSON.parse(stdout);
+  if (mode === "facecam") {
+    const gaming = gamingSplitPlan(result.people ?? [], meta.width, meta.height);
+    return { found: !!gaming, gaming, segments: [] };
+  }
   const segments = Array.isArray(result.segments) ? result.segments : [];
   const found = segments.length > 0 && (result.faceCoverage ?? 0) >= 0.15;
   return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null, width: meta.width, height: meta.height };
@@ -3783,7 +3870,7 @@ async function renderClipFromHostedNow(opts) {
    * follow one person, and two-person shots marked `dual`. */
   const smartDual = styleId === "dual" && Array.isArray(opts.layout?.segments) && hostedMeta?.width > 0;
   const split = !smartDual && splitKind(styleId) && hostedMeta?.width > 0
-    ? planSplit({ kind: splitKind(styleId), people: opts.layout.people, srcW: hostedMeta.width, srcH: hostedMeta.height, crop, segments: cutSegments })
+    ? planSplit({ kind: splitKind(styleId), people: opts.layout.people, gaming: opts.layout.gaming, srcW: hostedMeta.width, srcH: hostedMeta.height, crop, segments: cutSegments })
     : null;
   if (splitKind(styleId) && !split && !smartDual) throw new MediaError("This video style could not be built for this clip.");
   const bottom = split?.bottom ?? null;
@@ -3797,6 +3884,7 @@ async function renderClipFromHostedNow(opts) {
   const segmentKey = segments.length > 1 || moving ? crypto2.createHash("sha1").update(JSON.stringify(segments)).digest("hex").slice(0, 8) : "static";
   const styleKey = styleId === "normal" ? null : {
     style: styleId, bg: opts.layout.backgroundPath ? path5.basename(opts.layout.backgroundPath) : null, people: opts.layout.people ?? null,
+    ...(opts.layout.gaming ? { gaming: opts.layout.gaming } : {}),
     ...(smartDual ? { pairs: segments.filter((seg) => seg.dual).map((seg) => [seg.start, seg.end, seg.dual]) } : {})
   };
   const effectsKey = scale !== 1 || overlays.length || cuts.length || styleKey
@@ -3884,7 +3972,7 @@ async function renderClipFromHostedNow(opts) {
       const w = hostedMeta?.width ?? 0, h = hostedMeta?.height ?? 0;
       const lower = bottom.type === "background"
         ? `[1:v]fps=${outputFps},scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${TARGET_W}:${TARGET_H},setsar=1,format=yuv420p[vbot]`
-        : `[0:v]${[...cutVideo, buildCropFilter(bottom.crop, w, h), "format=yuv420p"].join(",")}[vbot]`;
+        : `[0:v]${[...cutVideo, bottom.type === "gameplay" ? gamingPanelFilter(bottom.region, w, h) : buildCropFilter(bottom.crop, w, h), "format=yuv420p"].join(",")}[vbot]`;
       return [
         ...mainGraph,
         lower,
@@ -3892,7 +3980,10 @@ async function renderClipFromHostedNow(opts) {
         `[vstk]${captionFilter.length ? captionFilter.join(",") : "null"}[vout]`
       ].join(";");
     };
-    if (bottom && segments.length <= 1 && !moving) {
+    if (bottom?.type === "gameplay") {
+      const main = [...cutVideo, gamingPanelFilter(opts.layout.gaming.top, hostedMeta.width, hostedMeta.height)].join(",");
+      videoArgs.push("-filter_complex", stacked([`[0:v]${main}[vmain]`]), "-map", "[vout]", "-map", "0:a?");
+    } else if (bottom && segments.length <= 1 && !moving) {
       const main = [...cutVideo, buildCropFilter(segments[0], hostedMeta?.width ?? 0, hostedMeta?.height ?? 0), "format=yuv420p"].join(",");
       videoArgs.push("-filter_complex", stacked([`[0:v]${main}[vmain]`]), "-map", "[vout]", "-map", "0:a?");
     } else if (segments.length <= 1 && !moving && !segments[0]?.dual) {
@@ -4109,6 +4200,10 @@ async function resolveLayout(clip, userId, hostedPath, hostedOffset) {
     }
     console.warn(`[Render] Clip ${clip.id}: no faces found for "${style}". Rendering as Normal.`);
     return null;
+  }
+  if (kind === "gaming") {
+    const plan = await detectFraming(hostedPath, clip.startTime - hostedOffset, duration, "facecam").catch(() => null);
+    return plan?.gaming ? { style, gaming: plan.gaming } : null;
   }
   let people = [];
   try {
@@ -4591,7 +4686,7 @@ var appRouter = router({
       if (!video) throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
       const section = await sectionFor(video, { start: input.startTime, end: input.endTime });
       if (!section) return none;
-      const mode = input.style === "dual" ? "dual" : void 0;
+      const mode = input.style === "gaming" ? "facecam" : input.style === "dual" ? "dual" : void 0;
       const key = `${section.path}:${input.startTime}:${input.endTime}:${mode ?? ""}`;
       const known = previewFramings.get(key);
       if (known) return known;
@@ -4599,6 +4694,7 @@ var appRouter = router({
         const result = await detectFraming(section.path, input.startTime - section.offset, duration, mode);
         const answer = {
           found: result.found,
+          ...(result.gaming ? { gaming: result.gaming } : {}),
           segments: result.segments.map((seg) => seg.dual
             ? { ...seg, dual: seg.dual.map((person) => facePanelCrop(person, result.width, result.height)) }
             : seg)
@@ -4644,10 +4740,10 @@ var appRouter = router({
         if (process.env.CLIP_MAKER_AUTO_REFRAME === "0") return;
         for (const { r, result } of imported) {
           const kind = r.style ? splitKind(r.style) : null;
-          if (kind && kind !== "dual") continue;
+          if (kind && kind !== "dual" && kind !== "gaming") continue;
           const file = localPathFromUrl(result.url);
           if (!file) continue;
-          await detectFraming(file, r.startTime - (result.offset ?? 0), r.endTime - r.startTime, kind === "dual" ? "dual" : void 0)
+          await detectFraming(file, r.startTime - (result.offset ?? 0), r.endTime - r.startTime, kind === "gaming" ? "facecam" : kind === "dual" ? "dual" : void 0)
             .catch((error) => console.warn(`[AutoFrame] Prefetch framing of ${r.startTime}-${r.endTime}s for video ${video.id} failed: ${String(error?.stderr || error?.message || error).slice(0, 160)}`));
         }
       })();

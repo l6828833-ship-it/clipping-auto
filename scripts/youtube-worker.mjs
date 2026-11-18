@@ -38,7 +38,7 @@ async function request(endpoint, options = {}) {
   });
 }
 
-async function processJob({ id, videoId, kind, range, language, transcribe }) {
+async function processJob({ id, videoId, kind, range, analysisOnly, language, transcribe }) {
   if (!/^[0-9a-f-]{36}$/i.test(id) || !/^[A-Za-z0-9_-]{11}$/.test(videoId) || !["audio", "video"].includes(kind)) return;
   const directory = await mkdtemp(path.join(tmpdir(), "clip-maker-worker-"));
   try {
@@ -48,8 +48,8 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
     /* A clip's part of a video is short, so it can be fetched at 720p and
      * still fit the upload limit; 480p looked soft once cropped to vertical.
      * A whole video stays at 480p. */
-    const height = section ? 720 : 480;
-    const format = audio ? "ba[ext=m4a]/ba/b" : `bv[height<=${height}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[height<=720][ext=mp4]/b`;
+    const height = analysisOnly ? 360 : section ? 720 : 480;
+    const format = audio ? "ba[ext=m4a]/ba/b" : `bv[height<=${height}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[height<=${analysisOnly ? 360 : 720}][ext=mp4]/b`;
     const ytArgs = [
       "--ignore-config", "--no-playlist", "--no-progress", "--socket-timeout", "15", "--retries", "1",
       "--js-runtimes", `node:${process.execPath}`, "--max-filesize", "350M", "--check-formats", "-f", format,
@@ -67,7 +67,7 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
       if (!stdout.trim()) throw new Error("YouTube returned no downloadable stream.");
       downloadedSection = Boolean(section);
     } catch (error) {
-      if (!section) throw error;
+      if (!section || analysisOnly) throw error;
       ({ stdout } = await download("fallback", ["-f", "b[height<=720][ext=mp4]/b[height<=480]/b"]));
     }
     const { filepath, ...info } = JSON.parse(stdout);
@@ -116,8 +116,12 @@ async function processJob({ id, videoId, kind, range, language, transcribe }) {
       /* The upload is capped at 28 MiB. Hold a section's bitrate to what fits
        * in 24 MiB for its length (up to 4.5 Mbit/s, plenty for 720p). */
       const seconds = section ? Math.max(1, range.duration) : 0;
-      const kbps = section ? Math.max(600, Math.min(4500, Math.floor(24 * 1024 * 8 / seconds) - 160)) : 0;
-      const rateArgs = section ? ["-crf", "21", "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`] : [];
+      const kbps = !section ? 0 : analysisOnly
+        ? Math.max(100, Math.min(650, Math.floor(22 * 1024 * 8 / seconds) - 80))
+        : Math.max(600, Math.min(4500, Math.floor(24 * 1024 * 8 / seconds) - 160));
+      const rateArgs = analysisOnly && section
+        ? ["-vf", "scale=-2:min(360\\,ih)", "-b:v", `${kbps}k`, "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`, "-b:a", "64k"]
+        : section ? ["-crf", "21", "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`] : [];
       await run(ffmpeg, [
         "-nostdin", "-loglevel", "error", ...rangeArgs, "-i", filepath, ...(section ? ["-t", String(range.duration)] : []),
         "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", ...rateArgs, "-pix_fmt", "yuv420p",

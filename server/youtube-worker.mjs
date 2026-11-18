@@ -28,7 +28,7 @@ export function youtubeWorkerAlive() {
   return Boolean(workerToken()) && polledRecently();
 }
 
-export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, language, onTranscribing, signal } = {}) {
+export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, analysisOnly, language, onTranscribing, signal } = {}) {
   signal?.throwIfAborted();
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (!polledRecently() && !jobs.size)) return null;
   if (jobs.size >= 4) throw new Error("The YouTube download worker is busy. Try again shortly.");
@@ -55,7 +55,7 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
       timeout = setTimeout(() => finish(new Error("The YouTube download worker timed out.")), Math.max(1_000, Math.min(IDLE_JOB_MS, left)));
     };
     touch();
-    jobs.set(id, { videoId, destination, kind, range, language, onTranscribing, finish, touch, state: "waiting" });
+    jobs.set(id, { videoId, destination, kind, range, analysisOnly, language, onTranscribing, finish, touch, state: "waiting" });
     signal?.addEventListener("abort", cancel, { once: true });
     /* Hand it straight to a worker that is waiting on /claim. */
     for (const waiter of waiters) if (waiter()) break;
@@ -74,7 +74,7 @@ function claimNextJob() {
     job.touch();
     // The Mac worker only supplies blocked downloads. Self-hosted Whisper
     // runs in the web container, regardless of paid API configuration.
-    return { id, videoId: job.videoId, kind: job.kind, range: job.range, language: job.language, transcribe: false };
+    return { id, videoId: job.videoId, kind: job.kind, range: job.range, analysisOnly: job.analysisOnly, language: job.language, transcribe: false };
   }
   return null;
 }
