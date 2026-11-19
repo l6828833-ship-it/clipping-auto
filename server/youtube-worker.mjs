@@ -10,7 +10,9 @@ const maxBytes = 28 * 1024 * 1024;
 const jobs = new Map();
 let lastPoll = 0;
 const IDLE_JOB_MS = 900_000;
-const MAX_JOB_MS = 3_600_000;
+/* Two hours, as for a transcription: an hour-long part transcribed on the
+ * worker in Auto language takes over an hour. */
+const MAX_JOB_MS = 2 * 3_600_000;
 
 function workerToken() {
   return process.env.CLIP_MAKER_YOUTUBE_WORKER_TOKEN?.trim() || "";

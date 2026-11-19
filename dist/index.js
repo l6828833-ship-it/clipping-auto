@@ -1568,7 +1568,7 @@ const analysisRangeInput = z.object({
   start: z.number().nonnegative().finite(),
   end: z.number().positive().finite(),
 }).refine(({ start, end }) => end > start && end - start <= MAX_ANALYSIS_RANGE_SECONDS,
-  "Choose an end after the start and select up to 15 minutes.");
+  `Choose an end after the start and select up to ${MAX_ANALYSIS_RANGE_SECONDS / 60} minutes.`);
 
 function rangeForDuration(range, duration) {
   if (!range || !(duration > 0)) return range;
@@ -1773,6 +1773,8 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
   }
 }
 var sourceTranscriptionJobs = new Map();
+/* extract.previewStream answers, by link. */
+const previewStreams = new Map();
 var runningSourceTranscriptions = 0;
 /* A fixed 20-minute limit failed long videos that were transcribing fine,
  * just slowly. Instead a job fails when it stops moving for 10 minutes (no
@@ -1803,6 +1805,39 @@ var extractRouter = router({
     }
   }),
   transcribe: protectedProcedure.input(sourceTranscriptionInput).mutation(({ input }) => transcribeSource(input)),
+  /**
+   * Where the browser can play a link that is neither YouTube nor a plain
+   * file (a Kick VOD or clip, Twitch, ...), so the person can watch it while
+   * choosing the part to analyze. The video then streams from the platform
+   * to their browser; nothing passes through this server. Null when there is
+   * no single stream with both picture and sound.
+   */
+  previewStream: protectedProcedure.input(z.object({ url: z.string().url() })).query(async ({ input }) => {
+    const url = assertSafeUrl(input.url);
+    if (youtubeSourceId(url)) return null;
+    const known = previewStreams.get(url);
+    if (known && known.expires > Date.now()) return known.value;
+    let value = null;
+    try {
+      const ytDlp = await getYtDlp();
+      const { stdout } = await promisify(execFile)(ytDlp, [
+        "--ignore-config", "--no-playlist", "--no-warnings", ...YTDLP_COOKIE_ARGS, ...YT_RUNTIME_ARGS,
+        /* Small is enough to choose by, and starts quickly. */
+        "-f", "b[height<=480][vcodec!=none][acodec!=none]/b[height<=720]/b",
+        "--print", "%(url)s", "--print", "%(duration)s", "--print", "%(protocol)s", "--", url
+      ], { timeout: 45e3, maxBuffer: 4 * 1024 * 1024, killSignal: "SIGKILL" });
+      const [stream = "", duration = "", protocol = ""] = stdout.trim().split("\n");
+      if (/^https:\/\/\S+$/.test(stream)) {
+        value = { url: stream, duration: Number(duration) > 0 ? Number(duration) : 0, hls: /m3u8/.test(protocol) || /\.m3u8(\?|$)/i.test(stream) };
+      }
+    } catch (error) {
+      console.warn(`[Extract] No browser preview for ${new URL(url).hostname}: ${redactDownloadError(String(error.stderr || error.message)).slice(0, 240)}`);
+    }
+    /* Stream addresses are signed and expire; a failure is retried sooner. */
+    if (previewStreams.size >= 200) previewStreams.delete(previewStreams.keys().next().value);
+    previewStreams.set(url, { value, expires: Date.now() + (value ? 10 : 1) * 60_000 });
+    return value;
+  }),
   startTranscription: protectedProcedure.input(sourceTranscriptionInput.extend({
     quickImport: z.boolean().default(false)
   })).mutation(({ input, ctx }) => {

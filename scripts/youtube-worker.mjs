@@ -70,11 +70,13 @@ async function request(endpoint, options = {}) {
  * about twice as fast as the 4-vCPU web container, and the container's CPU
  * stays free for everyone else.
  */
-async function transcribeHere(id, audioPath, language) {
+async function transcribeHere(id, audioPath, language, seconds = 0) {
   const subprocess = run(process.env.WHISPER_PYTHON || "python3", [
     fileURLToPath(new URL("./whisper_words.py", import.meta.url)),
     audioPath, language || "auto", workerEnv.WHISPER_MODEL || "base",
-  ], { timeout: 2_400_000, maxBuffer: 8 * 1024 * 1024, env: {
+  /* 40 minutes, or twice the audio's length for an hour-long part: Auto
+   * language took 1.25 times real time here. */
+  ], { timeout: Math.max(2_400_000, seconds * 2_000), maxBuffer: 16 * 1024 * 1024, env: {
     ...workerEnv, CLIP_MAKER_WHISPER_ACCELERATE: workerEnv.CLIP_MAKER_WHISPER_ACCELERATE ?? "1",
     CLIP_MAKER_WHISPER_PROGRESS: "1",
   } });
@@ -175,17 +177,22 @@ async function processJob({ id, videoId, kind, range, analysisOnly, language, tr
       /* The upload is capped at 28 MiB. Hold a section's bitrate to what fits
        * in 24 MiB for its length (up to 4.5 Mbit/s, plenty for 720p). */
       const seconds = section ? Math.max(1, range.duration) : 0;
+      /* A part over 15 minutes (up to an hour) is only looked at as stills,
+       * so it goes smaller: 240p at 10 frames a second, 32 kbit/s sound.
+       * An hour then takes about 24 MiB. */
+      const long = analysisOnly && seconds > 900;
+      const audioKbps = long ? 32 : 64;
       const kbps = !section ? 0 : analysisOnly
-        ? Math.max(100, Math.min(650, Math.floor(22 * 1024 * 8 / seconds) - 80))
+        ? Math.max(long ? 24 : 100, Math.min(650, Math.floor(22 * 1024 * 8 / seconds) - (long ? audioKbps + 16 : 80)))
         : Math.max(600, Math.min(4500, Math.floor(24 * 1024 * 8 / seconds) - 160));
       const rateArgs = analysisOnly && section
-        ? ["-vf", "scale=-2:min(360\\,ih)", "-b:v", `${kbps}k`, "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`, "-b:a", "64k"]
+        ? ["-vf", long ? "fps=10,scale=-2:min(240\\,ih)" : "scale=-2:min(360\\,ih)", "-b:v", `${kbps}k`, "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`, "-b:a", `${audioKbps}k`]
         : section ? ["-crf", "21", "-maxrate", `${kbps}k`, "-bufsize", `${kbps * 2}k`] : [];
       await run(ffmpeg, [
         "-nostdin", "-loglevel", "error", ...rangeArgs, "-i", filepath, ...(section ? ["-t", String(range.duration)] : []),
         "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", ...rateArgs, "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-movflags", "+faststart", "-y", output,
-      ], { timeout: section ? 240_000 : 90_000, maxBuffer: 1024 * 1024 });
+      ], { timeout: section ? Math.max(240_000, seconds * 200) : 90_000, maxBuffer: 1024 * 1024 });
     }
     const mime = audio ? "audio/mpeg" : "video/mp4";
     const media = await openAsBlob(output, { type: mime });
@@ -262,7 +269,7 @@ async function processAudioRange({ id, url, videoId, range, language, transcribe
   if (transcribe) {
     await request(`${id}/transcribing`);
     try {
-      await sendTranscript(id, videoId, metadata, await transcribeHere(id, wav, language));
+      await sendTranscript(id, videoId, metadata, await transcribeHere(id, wav, language, range.duration));
       return;
     } catch (error) {
       if (/rejected|no longer has/i.test(error.message)) throw error;

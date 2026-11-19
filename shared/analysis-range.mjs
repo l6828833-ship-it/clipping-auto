@@ -1,4 +1,7 @@
-export const MAX_ANALYSIS_RANGE_SECONDS = 15 * 60;
+/* An hour: a long stream's best stretch rarely fits in 15 minutes. Longer
+ * parts get a smaller copy for visual analysis through the download worker
+ * (its uploads are capped at 28 MiB; see scripts/youtube-worker.mjs). */
+export const MAX_ANALYSIS_RANGE_SECONDS = 60 * 60;
 
 export function parseAnalysisTime(value) {
   const parts = value.trim().split(":");

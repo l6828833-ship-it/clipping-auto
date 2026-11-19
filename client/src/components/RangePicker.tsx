@@ -19,20 +19,48 @@ import {
   ArrowLeftToLine, ArrowRightToLine, GripHorizontal, Loader2, Pause, PictureInPicture2, Play, Repeat, X,
 } from "lucide-react";
 import { parseYouTubeId } from "@/lib/videoSource";
+import { trpc } from "@/lib/trpc";
 
 const MIN_SECONDS = 10;
 const MINI_WIDTH = 320;
 const MINI_BAR = 28;
 const FILE_LINK = /^https?:\/\/\S+\.(mp4|webm|m4v|mov|ogv)(\?|#|$)/i;
 
-type Source = { kind: "youtube"; id: string } | { kind: "file"; url: string };
+/* `hls`: an .m3u8 stream (Kick, Twitch, ...); `length` is the duration the
+ * server read, for streams whose player reports none. */
+type Source = { kind: "youtube"; id: string } | { kind: "file"; url: string; hls?: boolean; length?: number };
 
-/** What can be previewed in the browser for this link, if anything. */
-export function rangePreviewSource(url: string): Source | null {
+/** What can be previewed in the browser for this link, if anything. Other
+ * web links are asked of the server (`page`), which finds their stream. */
+export function rangePreviewSource(url: string): Source | { kind: "page"; url: string } | null {
   const link = url.trim();
   const id = parseYouTubeId(link);
   if (id) return { kind: "youtube", id };
-  return FILE_LINK.test(link) ? { kind: "file", url: link } : null;
+  if (FILE_LINK.test(link)) return { kind: "file", url: link };
+  try {
+    const parsed = new URL(link);
+    return /^https?:$/.test(parsed.protocol) && parsed.hostname.includes(".") ? { kind: "page", url: parsed.toString() } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** HLS plays through hls.js, loaded only when needed. The browser's own HLS
+ * is the fallback for where hls.js cannot run (an iPhone): recent Chromium
+ * says it can play HLS too, but gave up on Kick's MPEG-TS segments. */
+async function attachHls(video: HTMLVideoElement, url: string, onFatal: () => void) {
+  const { default: Hls } = await import("hls.js");
+  if (!Hls.isSupported()) {
+    if (!video.canPlayType("application/vnd.apple.mpegurl")) { onFatal(); return () => {}; }
+    video.src = url;
+    return () => { video.removeAttribute("src"); video.load(); };
+  }
+  /* Start low: this is for choosing a part, not for watching sharp. */
+  const hls = new Hls({ startLevel: 0, capLevelToPlayerSize: true, maxBufferLength: 20 });
+  hls.on(Hls.Events.ERROR, (_event, data) => { if (data.fatal) onFatal(); });
+  hls.loadSource(url);
+  hls.attachMedia(video);
+  return () => hls.destroy();
 }
 
 /** h:mm:ss for an hour or more, else m:ss. */
@@ -103,8 +131,39 @@ export default function RangePicker(props: {
 }) {
   const source = rangePreviewSource(props.url);
   if (!source) return null;
+  if (source.kind === "page") return <PagePicker key={source.url} page={source.url} {...props} />;
   /* A new link is a new player. */
   return <Picker key={source.kind === "youtube" ? source.id : source.url} source={source} {...props} />;
+}
+
+/** A Kick, Twitch or other page link: the server finds the stream, which then
+ * plays straight from the platform in this browser. */
+function PagePicker({ page, ...props }: { page: string } & Omit<Parameters<typeof RangePicker>[0], "url">) {
+  /* Typing a link fires on every key; wait until it has settled. */
+  const [settled, setSettled] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSettled(page), 600);
+    return () => window.clearTimeout(timer);
+  }, [page]);
+  const stream = trpc.extract.previewStream.useQuery({ url: settled }, {
+    enabled: settled === page, staleTime: 5 * 60_000, retry: false, refetchOnWindowFocus: false,
+  });
+  if (settled !== page || stream.isLoading) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Opening the video to watch here…
+      </div>
+    );
+  }
+  const found = stream.data as { url: string; duration: number; hls: boolean } | null | undefined;
+  if (!found) {
+    return (
+      <p className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+        This video can’t be played here, but it can still be imported. Type the times below.
+      </p>
+    );
+  }
+  return <Picker key={found.url} source={{ kind: "file", url: found.url, hls: found.hls, length: found.duration }} {...props} />;
 }
 
 function Picker({ source, start, end, maxLength, disabled, onChange }: {
@@ -191,29 +250,42 @@ function Picker({ source, start, end, maxLength, disabled, onChange }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceKey]);
 
-  /* A direct file: the browser's own <video>. */
+  /* A direct file or a stream: the browser's own <video>. */
   useEffect(() => {
     if (source.kind !== "file") return;
     const video = videoRef.current;
     if (!video) return;
+    const known = source.length && source.length > 0 ? source.length : 0;
     const onReady = () => {
       playerRef.current = {
         play: () => { void video.play().catch(() => {}); },
         pause: () => video.pause(),
         seek: (seconds) => { video.currentTime = seconds; },
         time: () => video.currentTime || 0,
-        duration: () => (Number.isFinite(video.duration) ? video.duration : 0),
+        duration: () => (Number.isFinite(video.duration) && video.duration > 0 ? video.duration : known),
         playing: () => !video.paused && !video.ended,
       };
       if (latest.current.from > 0) video.currentTime = latest.current.from;
       setReady(true);
     };
-    const onError = () => setProblem("This file can’t be played in the browser. Type the times below instead.");
+    const onError = () => setProblem("This video can’t be played in the browser. Type the times below instead.");
     video.addEventListener("loadedmetadata", onReady);
     video.addEventListener("error", onError);
+    let detach: (() => void) | null = null;
+    let cancelled = false;
+    if (source.hls) {
+      void attachHls(video, source.url, onError).then((stop) => {
+        if (cancelled) stop();
+        else detach = stop;
+      }, onError);
+    } else {
+      video.src = source.url;
+    }
     return () => {
+      cancelled = true;
       video.removeEventListener("loadedmetadata", onReady);
       video.removeEventListener("error", onError);
+      detach?.();
       playerRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -492,7 +564,7 @@ function Picker({ source, start, end, maxLength, disabled, onChange }: {
             <div ref={frameRef} className="absolute inset-0 [&>iframe]:h-full [&>iframe]:w-full"
               style={movingMini ? { pointerEvents: "none" } : undefined} />
           ) : (
-            <video ref={videoRef} src={source.url} preload="metadata" playsInline controls
+            <video ref={videoRef} preload="metadata" playsInline controls
               className="absolute inset-0 h-full w-full" style={movingMini ? { pointerEvents: "none" } : undefined} />
           )}
           {!ready && (

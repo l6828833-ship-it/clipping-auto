@@ -81,9 +81,11 @@ const LANGUAGES = [
   { code: "hi", label: "Hindi"   }, { code: "ko", label: "Korean"  },
 ];
 
+/** m:ss, or h:mm:ss from an hour on (a long stream showed "150:00"). */
 function fmt(s: number) {
-  const m = Math.floor(s/60), sec = Math.floor(s%60);
-  return `${m}:${sec.toString().padStart(2,"0")}`;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
 
 // ─── No API key warning ───────────────────────────────────────────────────────
@@ -512,7 +514,9 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                     </label>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    {requestedRange ? "Find automatic highlights in this range. Times use minutes:seconds." : "Enter a valid start and end time up to 15 minutes apart."}
+                    {requestedRange
+                      ? "Find automatic highlights in this range. Times use minutes:seconds, or hours:minutes:seconds."
+                      : `Enter a valid start and end time up to ${MAX_ANALYSIS_RANGE_SECONDS / 60} minutes apart, like 1:05:00 to 1:35:00.`}
                   </p>
                 </>
               )}
