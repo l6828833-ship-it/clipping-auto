@@ -1588,6 +1588,55 @@ async function openAnalysisRange(url, range) {
   return { file: path5.join(VIDEOS_DIR, hosted.fileName), offset, length, sourceInfo: hosted.sourceInfo };
 }
 
+function cleanTimedWords(words) {
+  return (Array.isArray(words) ? words : []).filter(
+    (w) => w && typeof w.word === "string" && w.word.trim() && Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start
+  ).map((w) => ({ word: w.word.trim(), start: w.start, end: w.end }));
+}
+
+/**
+ * A selected part of a YouTube video, fetched by the download worker and,
+ * unless CLIP_MAKER_WORKER_TRANSCRIBE=0 or the OpenAI speech API is set up,
+ * transcribed on the worker's own machine. Returns the download (with
+ * `rangeOffset`, the time its audio starts at), or null to use the server's
+ * own path.
+ *
+ * Before this, the server downloaded the part as a 360p video through the
+ * worker (11 minutes for 15 minutes of a 6.5-hour video, past the 10-minute
+ * stall limit) and then ran Whisper on its own 4 vCPUs.
+ */
+async function rangeAudioFromWorker(url, range, tmpDir, language, { signal, reportStage, reportProgress }) {
+  const videoId = youtubeSourceId(url);
+  if (!videoId || !youtubeWorkerAlive()) return null;
+  const transcribe = process.env.CLIP_MAKER_WORKER_TRANSCRIBE !== "0" && !hostedSttAvailable();
+  /* Frames for visual analysis need the video too. The worker takes one job
+   * at a time, so this queues behind the audio and is usually ready, or
+   * nearly, when the highlights are chosen. */
+  openAnalysisRange(url, range).catch((error) =>
+    console.warn(`[AI] Background download of the selected part failed: ${String(error?.message ?? error).slice(0, 160)}`));
+  let stage = "downloading";
+  let progress = 0;
+  const workerAudio = path3.join(tmpDir, "worker-range.mp3");
+  try {
+    const metadata = await downloadWithYouTubeWorker(videoId, workerAudio, {
+      kind: "audio", range: { start: range.start, duration: range.end - range.start }, language, transcribe, signal,
+      onAlive: () => stage === "transcribing" ? reportProgress({ stage, progress }) : reportStage(stage),
+      onTranscribing: (value) => {
+        stage = "transcribing";
+        if (value != null) progress = value;
+        reportProgress({ stage, progress });
+      },
+    });
+    if (!metadata) return null;
+    console.log(`[Extract] The download worker sent ${metadata.transcript ? "a transcript" : "audio"} for ${Math.round(range.end - range.start)} s of ${videoId}.`);
+    return { audioPath: workerAudio, metadata, rangeOffset: range.start };
+  } catch (error) {
+    signal?.throwIfAborted();
+    console.warn(`[Extract] The download worker couldn’t supply the selected part: ${String(error?.message ?? error).slice(0, 200)}`);
+    return null;
+  }
+}
+
 var sourceTranscriptionInput = z.object({
   url: z.string().url("Invalid URL"),
   language: captionLanguageInput,
@@ -1641,6 +1690,14 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     let audioPath;
     try {
       const download = analysisRange ? await (async () => {
+        const fromWorker = await rangeAudioFromWorker(url, analysisRange, tmpDir, input.language, { signal, reportStage, reportProgress });
+        if (fromWorker) {
+          const fullDuration = fromWorker.metadata?.duration;
+          if (Number.isFinite(fullDuration) && fullDuration > analysisRange.start) {
+            analysisRange = { ...analysisRange, end: Math.min(analysisRange.end, fullDuration) };
+          }
+          return fromWorker;
+        }
         const media = await openAnalysisRange(url, analysisRange);
         signal?.throwIfAborted();
         analysisRange = { ...analysisRange, end: analysisRange.start + media.length };
@@ -1661,7 +1718,17 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
         if (language === "auto" && /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(sourceLanguage ?? "")) language = sourceLanguage;
         reportMetadata(result("none"));
         if (download.metadata.transcript) {
-          const { text, words } = download.metadata.transcript;
+          const { text, words, language: detectedLanguage } = download.metadata.transcript;
+          if (input.language === "auto" && /^[a-z]{2,3}(?:-[a-z]{2})?$/i.test(detectedLanguage ?? "")) language = detectedLanguage;
+          /* A selected part was transcribed on its own: its word times
+           * count from the start of the part. */
+          if (analysisRange && download.rangeOffset != null) {
+            const mapped = wordsWithinRange(cleanTimedWords(words).map(word => ({
+              ...word, start: word.start + download.rangeOffset, end: word.end + download.rangeOffset
+            })), analysisRange);
+            return mapped.length ? result("whisper", mapped.map(word => word.word).join(" "), mapped)
+              : result("none", "", [], "Whisper didn’t detect speech in the selected part.");
+          }
           return text && words.length ? result("whisper", text, words) : result("none", "", [], "Whisper didn’t detect speech in this video.");
         }
       }

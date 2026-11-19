@@ -28,7 +28,15 @@ export function youtubeWorkerAlive() {
   return Boolean(workerToken()) && polledRecently();
 }
 
-export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, analysisOnly, language, onTranscribing, signal } = {}) {
+/**
+ * `transcribe: true` asks the worker to run Whisper on its own machine and
+ * send timed words instead of audio (it still sends audio if Whisper fails
+ * there). An audio job with a `range` gets only that part of the audio, with
+ * word times counted from the start of the range. `onAlive` is called on the
+ * worker's periodic sign of life, `onTranscribing(progress)` while it
+ * transcribes.
+ */
+export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, analysisOnly, language, transcribe = false, onTranscribing, onAlive, signal } = {}) {
   signal?.throwIfAborted();
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (!polledRecently() && !jobs.size)) return null;
   if (jobs.size >= 4) throw new Error("The YouTube download worker is busy. Try again shortly.");
@@ -55,7 +63,7 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
       timeout = setTimeout(() => finish(new Error("The YouTube download worker timed out.")), Math.max(1_000, Math.min(IDLE_JOB_MS, left)));
     };
     touch();
-    jobs.set(id, { videoId, destination, kind, range, analysisOnly, language, onTranscribing, finish, touch, state: "waiting" });
+    jobs.set(id, { videoId, destination, kind, range, analysisOnly, language, transcribe: transcribe === true, onTranscribing, onAlive, finish, touch, state: "waiting" });
     signal?.addEventListener("abort", cancel, { once: true });
     /* Hand it straight to a worker that is waiting on /claim. */
     for (const waiter of waiters) if (waiter()) break;
@@ -72,9 +80,10 @@ function claimNextJob() {
      * behind others used to expire while it was still being downloaded,
      * and its upload then got a 404. */
     job.touch();
-    // The Mac worker only supplies blocked downloads. Self-hosted Whisper
-    // runs in the web container, regardless of paid API configuration.
-    return { id, videoId: job.videoId, kind: job.kind, range: job.range, analysisOnly: job.analysisOnly, language: job.language, transcribe: false };
+    /* The worker transcribes only when the caller asked for it (a selected
+     * range of a YouTube video, see transcribeSource). Otherwise it only
+     * supplies the blocked download and Whisper runs in the web container. */
+    return { id, videoId: job.videoId, kind: job.kind, range: job.range, analysisOnly: job.analysisOnly, language: job.language, transcribe: job.transcribe };
   }
   return null;
 }
@@ -144,7 +153,19 @@ export function registerYouTubeWorker(app) {
     if (job?.state !== "claimed") return unknownJob(req, res);
     if (job.kind !== "audio") return res.sendStatus(404);
     job.touch();
-    job.onTranscribing?.();
+    const progress = Number(req.query.progress);
+    job.onTranscribing?.(Number.isFinite(progress) ? Math.min(1, Math.max(0, progress)) : undefined);
+    return res.sendStatus(204);
+  });
+
+  /* Sent every 30 seconds while the worker has a job. A long download used
+   * to look stuck: the transcription gave up after 10 minutes without news
+   * while the worker was still fetching the video. */
+  app.post(`${prefix}/:id/alive`, (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (job?.state !== "claimed") return unknownJob(req, res);
+    job.touch();
+    job.onAlive?.();
     return res.sendStatus(204);
   });
 
