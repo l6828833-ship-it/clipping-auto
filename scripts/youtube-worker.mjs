@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { openAsBlob } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,6 +29,32 @@ function rejection(what, status) {
   return `Rundploy rejected the ${what} (HTTP ${status}).`;
 }
 
+/**
+ * Runs yt-dlp in a process group of its own, so that a timeout also stops the
+ * ffmpeg it started. Killing yt-dlp alone left that ffmpeg downloading by
+ * itself for minutes after the job had already failed.
+ */
+function runYtDlp(args, timeout) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ytDlp, args, { env: workerEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout = (stdout + chunk).slice(-1024 * 1024); });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr = (stderr + chunk).slice(-64 * 1024); });
+    const timer = setTimeout(() => {
+      killed = true;
+      try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+    }, timeout);
+    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0 && !killed) return resolve({ stdout, stderr });
+      reject(Object.assign(new Error(`Command failed: ${args.slice(-8).join(" ")}`), { code, signal, killed, stdout, stderr }));
+    });
+  });
+}
+
 async function request(endpoint, options = {}) {
   return fetch(new URL(`/api/internal/youtube-worker/${endpoint}`, origin), {
     method: "POST", ...options,
@@ -56,19 +82,33 @@ async function processJob({ id, videoId, kind, range, analysisOnly, language, tr
       ...(process.env.CLIP_MAKER_FFMPEG ? ["--ffmpeg-location", ffmpeg] : []),
       "--print", "after_move:%(.{title,duration,uploader,language,filepath})j",
     ];
-    const download = (stem, extra = []) => run(ytDlp, [
-      ...ytArgs, ...extra, "-o", path.join(directory, `${stem}.%(ext)s`), "--", url,
-    ], { timeout: 180_000, maxBuffer: 1024 * 1024, env: workerEnv });
+    const download = async (stem, extra = [], timeout = 180_000) => {
+      const result = await runYtDlp([...ytArgs, ...extra, "-o", path.join(directory, `${stem}.%(ext)s`), "--", url], timeout);
+      if (!result.stdout.trim()) throw new Error("YouTube returned no downloadable stream.");
+      return result;
+    };
+    const sectionArgs = section ? ["--download-sections", `*${Math.max(0, range.start)}-${Math.max(0, range.start) + range.duration}`, "--merge-output-format", "mp4"] : [];
+    /* yt-dlp hands --download-sections to ffmpeg, which reads YouTube at about
+     * twice playback speed: the first 15 minutes of a 360p stream took over
+     * 7 minutes, against a 3-minute limit, so every long analysis range
+     * failed and the video got neither a transcript nor frames. yt-dlp's own
+     * downloader fetches the whole 360p file in a fraction of that, and the
+     * range is cut out below. A file over --max-filesize (a very long video)
+     * falls back to the section download, given time to finish. */
+    const whole = section && analysisOnly && range.duration > 120;
     let downloadedSection = false;
     let stdout;
     try {
-      const sectionArgs = section ? ["--download-sections", `*${Math.max(0, range.start)}-${Math.max(0, range.start) + range.duration}`, "--merge-output-format", "mp4"] : [];
-      ({ stdout } = await download("download", sectionArgs));
-      if (!stdout.trim()) throw new Error("YouTube returned no downloadable stream.");
-      downloadedSection = Boolean(section);
+      ({ stdout } = await download("download", whole ? ["--merge-output-format", "mp4"] : sectionArgs, whole ? 300_000 : 180_000));
+      downloadedSection = Boolean(section) && !whole;
     } catch (error) {
-      if (!section || analysisOnly) throw error;
-      ({ stdout } = await download("fallback", ["-f", "b[height<=720][ext=mp4]/b[height<=480]/b"]));
+      if (whole) {
+        ({ stdout } = await download("section", sectionArgs, Math.max(180_000, range.duration * 750)));
+        downloadedSection = true;
+      } else {
+        if (!section || analysisOnly) throw error;
+        ({ stdout } = await download("fallback", ["-f", "b[height<=720][ext=mp4]/b[height<=480]/b"]));
+      }
     }
     const { filepath, ...info } = JSON.parse(stdout);
     const selectedLanguage = language && language !== "auto" ? language : info.language || "auto";

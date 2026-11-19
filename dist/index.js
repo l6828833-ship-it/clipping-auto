@@ -1670,7 +1670,12 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
       const details = redactDownloadError(String(error.stderr || error.message));
       console.warn("[Extract] Source audio unavailable:", details.slice(0, 600));
       const youtubeDenied = youtubeSourceId(url) && /403|429|forbidden|sign in|not a bot/i.test(details);
-      const note = analysisRange
+      /* "Check its times" sent people hunting for a typo when the download
+       * worker had simply failed (it used to time out on long ranges). */
+      const workerFailed = /download worker/i.test(details);
+      const note = workerFailed
+        ? "YouTube blocked this server, and the download worker couldn’t fetch the video either. Try again in a minute, or upload a copy of the video."
+        : analysisRange
         ? "The selected range couldn’t be opened for transcription. Check its times, or try a shorter range."
         : youtubeDenied
         ? "YouTube blocked this server’s download. You can upload a copy of the video you own to transcribe it with Whisper."
