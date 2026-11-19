@@ -1188,7 +1188,6 @@ function StepSubtitles({
   const backgroundUrl = layout?.backgroundVideoId != null
     ? ((library as { id: number; hostedUrl?: string | null }[] | undefined)?.find(v => v.id === layout.backgroundVideoId)?.hostedUrl ?? null)
     : null;
-  const shownStyle = montageCaptionStyle(clipStyle, style) as SubStyle;
 
   /* The framing the export will use: the server follows the speaker's face,
    * and for Dual Speaker also says which shots have two people in them.
@@ -1201,16 +1200,24 @@ function StepSubtitles({
     },
     { enabled: videoId != null && !!clip && hostedStatus === "ready", staleTime: Infinity },
   );
-  const gaming = clipStyle === "gaming" ? (autoFraming as { gaming?: GamingSplit } | undefined)?.gaming : undefined;
+  /* A game stream with a facecam and no style chosen is exported as
+   * Facecam + Gameplay; preview it that way too. */
+  const framingAnswer = autoFraming as { gaming?: GamingSplit; segments?: PlanSegment[]; autoGaming?: { gaming: GamingSplit; segments: PlanSegment[] } } | undefined;
+  const autoGaming = clipStyle === "normal" && !layout ? framingAnswer?.autoGaming : undefined;
+  const shownClipStyle: VideoStyleId = autoGaming ? "gaming" : clipStyle;
+  const shownStyle = montageCaptionStyle(shownClipStyle, style) as SubStyle;
   /** Playback position in the clip, in steps coarse enough not to re-render every frame. */
   const [previewTime, setPreviewTime] = useState(0);
   useEffect(() => { setPreviewTime(0); }, [clip?.id]);
   const plan = useMemo(
-    () => ((autoFraming as { segments?: PlanSegment[] } | undefined)?.segments ?? []),
-    [autoFraming],
+    () => (autoGaming?.segments ?? framingAnswer?.segments ?? []),
+    [autoGaming, framingAnswer],
   );
   const planIndex = plan.length ? segmentAt(plan, previewTime) : undefined;
   const planSegment = planIndex != null ? plan[planIndex] : undefined;
+  /* Facecam + Gameplay is split except while the camera fills the screen. */
+  const gamingPlan = shownClipStyle === "gaming" ? (autoGaming?.gaming ?? framingAnswer?.gaming) : undefined;
+  const gaming = gamingPlan && (!plan.length || planSegment?.split) ? gamingPlan : undefined;
   /* Two people on screen right now: one per half. */
   const pair = clipStyle === "dual" && planSegment?.dual?.length === 2
     ? { top: planSegment.dual[0], bottom: planSegment.dual[1] } : null;
@@ -1378,7 +1385,9 @@ function StepSubtitles({
         <div className="glass rounded-2xl overflow-hidden self-start">
           <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-2">
             <span className="text-sm font-semibold">Live Preview</span>
-            <span className="text-[10px] text-muted-foreground">{VIDEO_STYLES[clipStyle as VideoStyleId]?.label ?? "Normal"} style</span>
+            <span className="text-[10px] text-muted-foreground">
+              {VIDEO_STYLES[shownClipStyle as VideoStyleId]?.label ?? "Normal"} style{autoGaming ? " (facecam found)" : ""}
+            </span>
           </div>
           <div className="p-4 flex flex-col items-center gap-3">
             {/* Clip switcher, when more than one is selected. */}
@@ -1413,7 +1422,7 @@ function StepSubtitles({
                 endTime={(clip?.endTime ?? 0) - hostedOffset}
                 className="w-full shadow-2xl"
                 style={{ maxWidth: "300px" }}
-                look={{ style: clipStyle, backgroundUrl, dual: pair, hasDual: plan.some(seg => seg.dual), gaming }}
+                look={{ style: shownClipStyle, backgroundUrl, dual: pair, hasDual: plan.some(seg => seg.dual || seg.split), gaming }}
                 onTime={t => setPreviewTime(Math.max(0, Math.round((t + hostedOffset - (clip?.startTime ?? 0)) * 20) / 20))}
                 onPlayingChange={setPlaying}
               >
@@ -1483,7 +1492,7 @@ function StepSubtitles({
 }
 
 /** A framing segment from the server; a two-person shot carries the crop for each half. */
-type PlanSegment = FramingSegment & { dual?: Framing[] };
+type PlanSegment = FramingSegment & { dual?: Framing[]; split?: boolean };
 
 /** The words spoken inside a clip, in clip-relative seconds. */
 function wordsInClip(words: TimelineWord[] | null | undefined, clip: Highlight): TimelineWord[] {
@@ -1640,8 +1649,10 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
           if (found) taken.add(found.id);
           const moved = !!found && (Math.abs((found.startTime ?? 0) - h.startTime) > 0.05 || Math.abs((found.endTime ?? 0) - h.endTime) > 0.05);
           // The style chosen in the first step, else the one the AI suggested.
+          /* The AI's "normal" saves no style, so the export may still pick
+           * Facecam + Gameplay by itself when the clip shows a facecam. */
           const wanted: VideoLayout | null = layout
-            ?? (h.montage && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage as VideoStyleId } : null);
+            ?? (h.montage && h.montage !== "normal" && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage as VideoStyleId } : null);
           let id = found?.id;
           if (id == null) {
             ({ id } = await patiently(() => createClip.mutateAsync({

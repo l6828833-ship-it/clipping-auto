@@ -72,7 +72,7 @@ type ClipRow = {
 };
 
 /** A framing segment from the server; a two-person shot carries the crop for each half. */
-type PlanSegment = TimelineSegment & { dual?: Framing[] };
+type PlanSegment = TimelineSegment & { dual?: Framing[]; split?: boolean };
 
 type VideoRow = {
   id: number;
@@ -401,24 +401,30 @@ function ClipEditorModal({
   /* Dual Speaker: which shots have two people, and the crop for each half.
    * The export frames every shot of this style itself, so its preview uses
    * that plan too rather than the manual framing. */
-  const splitStyle = layout?.style === "gaming" ? "gaming" : "dual";
+  /* With no style chosen, the export uses Facecam + Gameplay when the clip
+   * shows a facecam, so the preview asks for the automatic plan as well. */
+  const splitStyle = layout?.style === "gaming" ? "gaming" : layout?.style === "dual" ? "dual" : undefined;
   const { data: splitPlan } = trpc.videos.previewFraming.useQuery(
-    { id: video?.id ?? 0, startTime: previewRange.start, endTime: previewRange.end, style: splitStyle },
-    { enabled: (layout?.style === "dual" || layout?.style === "gaming") && !!video && hostedStatus === "ready" && validRange, staleTime: Infinity },
+    { id: video?.id ?? 0, startTime: previewRange.start, endTime: previewRange.end, ...(splitStyle ? { style: splitStyle } : {}) },
+    { enabled: (!!splitStyle || !layout) && !!video && hostedStatus === "ready" && validRange, staleTime: Infinity },
   );
-  const plan = layout?.style === "dual"
-    ? (((splitPlan as { segments?: PlanSegment[] } | undefined)?.segments) ?? [])
-    : [];
+  const answer = splitPlan as { gaming?: GamingSplit; segments?: PlanSegment[]; autoGaming?: { gaming: GamingSplit; segments: PlanSegment[] } } | undefined;
+  const autoGaming = !layout ? answer?.autoGaming : undefined;
+  const shownStyle = autoGaming ? "gaming" : layout?.style ?? "normal";
+  const plan = autoGaming ? autoGaming.segments
+    : splitStyle ? (answer?.segments ?? []) : [];
   const planIndex = plan.length ? segmentAt(plan, playhead) : undefined;
   const planSegment = planIndex != null ? plan[planIndex] : undefined;
   const pair = planSegment?.dual?.length === 2 ? { top: planSegment.dual[0], bottom: planSegment.dual[1] } : null;
+  const gamingPlan = shownStyle === "gaming" ? (autoGaming?.gaming ?? answer?.gaming) : undefined;
   const look = {
-    style: layout?.style ?? "normal",
+    style: shownStyle,
     backgroundUrl,
     punch: punches.some(([a, b]) => playhead >= a && playhead < b),
     dual: pair,
-    hasDual: plan.some(seg => seg.dual),
-    gaming: splitStyle === "gaming" ? (splitPlan as { gaming?: GamingSplit } | undefined)?.gaming : undefined,
+    hasDual: plan.some(seg => seg.dual || seg.split),
+    /* Split except while the camera fills the screen. */
+    gaming: gamingPlan && (!plan.length || planSegment?.split) ? gamingPlan : undefined,
   };
   const valid = end > start;
   const isRendered = !!clip.downloadUrl && clip.downloadUrl !== "#";

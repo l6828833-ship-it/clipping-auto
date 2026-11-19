@@ -52,18 +52,20 @@ SPEAK_CONFIRM = 1.0    # seconds they must keep that lead
 SPEAK_HOLD = 2.0       # shortest time on one person
 
 
-def read_frames(video, start, duration, width, height, detail=1):
+def read_frames(video, start, duration, width, height, detail=1, crop=None):
     """Yields RGB frames scaled to fit the detector's input, without distortion.
     With `detail` above 1 the frames are that many times larger; take every
-    `detail`-th pixel for the detector."""
+    `detail`-th pixel for the detector. `crop` (w, h, x, y in source pixels)
+    reads only that region; `width` and `height` are then its size."""
     scale = min(NET_W / width, NET_H / height)
     w = max(2, int(round(width * scale / 2)) * 2)
     h = max(2, int(round(height * scale / 2)) * 2)
     w, h = min(w, NET_W) * detail, min(h, NET_H) * detail
     ffmpeg = os.environ.get("CLIP_MAKER_FFMPEG") or "ffmpeg"
+    region = f"crop={crop[0]}:{crop[1]}:{crop[2]}:{crop[3]}," if crop else ""
     process = subprocess.Popen(
         [ffmpeg, "-v", "error", "-ss", f"{start:.3f}", "-i", video, "-t", f"{duration:.3f}", "-an",
-         "-vf", f"fps={SAMPLE_FPS},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+         "-vf", f"fps={SAMPLE_FPS},{region}scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     size = w * h * 3
     try:
@@ -372,6 +374,214 @@ def people(video, start, duration, width, height, stationary=False):
     return result
 
 
+FACECAM_TOLERANCE = 0.075   # how far (in frame fractions) a facecam face may wander
+# Share of sampled frames. The whole-frame pass misses a 20-pixel face in
+# about two frames of three, and the streamer may go full screen for part of
+# the clip, so a candidate needs little; the enlarged look at its region then
+# has to find the face in a quarter of all frames.
+FACECAM_MIN_SHARE = 0.12
+FACECAM_CONFIRM_SHARE = 0.25
+GAMING_WINDOW = SAMPLE_FPS  # frames per decision (one second)
+MIN_SPLIT_RUN = 2           # seconds; shorter switches are flicker
+MIN_FULL_RUN = 3
+
+
+def is_corner_face(face):
+    cx, cy, _, w, h = face[:5]
+    return 0 < w <= 0.24 and 0 < h <= 0.4 and min(cx, 1 - cx, cy, 1 - cy) <= 0.27
+
+
+def facecam_of(found, total):
+    """The streamer's facecam: a small face that keeps the same place near an
+    edge of the frame. Returns {"cx", "cy", "w", "h", "share"} or None."""
+    groups = []
+    for index, faces in enumerate(found):
+        for face in faces:
+            if not is_corner_face(face):
+                continue
+            group = next((g for g in groups if abs(g["mx"] - face[0]) < FACECAM_TOLERANCE
+                          and abs(g["my"] - face[1]) < FACECAM_TOLERANCE), None)
+            if group is None:
+                group = {"cx": [], "cy": [], "w": [], "h": [], "frames": set()}
+                groups.append(group)
+            if index in group["frames"]:
+                continue
+            group["frames"].add(index)
+            for key, value in zip(("cx", "cy", "w", "h"), (face[0], face[1], face[3], face[4])):
+                group[key].append(float(value))
+            group["mx"], group["my"] = float(np.median(group["cx"])), float(np.median(group["cy"]))
+    best = max(groups, key=lambda g: len(g["frames"]), default=None)
+    if best is None or len(best["frames"]) < max(6, FACECAM_MIN_SHARE * total):
+        return None
+    return {**{k: round(float(np.median(best[k])), 4) for k in ("cx", "cy", "w", "h")},
+            "share": round(len(best["frames"]) / total, 3)}
+
+
+EDGE_STEP = 8          # luma step (0-255) between neighbouring pixels that counts as an edge
+EDGE_PERSIST = 0.5     # share of frames an edge must be there in to be part of the overlay
+BOX_SUPPORT = 0.6      # share of each side of the facecam box that must be such an edge
+
+
+def facecam_box(ex, ey, cam):
+    """The rectangle of the facecam overlay, from the edges that stay put
+    while the game moves behind them. `ex` and `ey` give, per pixel, the
+    share of frames with a sideways and an up-down luma step there. Returns
+    {"x", "y", "w", "h"} (fractions of the frame) or None when no rectangle
+    around the face is clear enough; a side on the frame's own edge needs no
+    line."""
+    hx, wx = ex.shape
+    hy, wy = ey.shape
+    strong_x, strong_y = ex >= EDGE_PERSIST, ey >= EDGE_PERSIST
+    fx, fy, fw, fh = cam["cx"] * wy, cam["cy"] * hx, cam["w"] * wy, cam["h"] * hx
+    band_rows = slice(max(0, int(fy - 2 * fh)), min(hx, int(fy + 2 * fh) + 1))
+    band_cols = slice(max(0, int(fx - 1.5 * fw)), min(wy, int(fx + 1.5 * fw) + 1))
+
+    def peaks(scores, lo, hi, limit=4):
+        lo, hi = max(0, lo), min(len(scores), hi)
+        found = sorted(range(lo, hi), key=lambda i: -scores[i])
+        picked = []
+        for i in found:
+            if scores[i] < 0.5 or len(picked) >= limit:
+                break
+            if all(abs(i - p) > 2 for p in picked):
+                picked.append(i)
+        return picked
+
+    col_scores = strong_x[band_rows].mean(axis=0)
+    row_scores = strong_y[:, band_cols].mean(axis=1)
+    # Positions are pixel boundaries: column c of `ex` lies between pixels c and c + 1.
+    lefts = [None] + [c + 1 for c in peaks(col_scores, int(fx - 10 * fw), int(fx - 1.2 * fw))]
+    rights = [None] + [c + 1 for c in peaks(col_scores, int(fx + 1.2 * fw), int(fx + 10 * fw))]
+    tops = [None] + [r + 1 for r in peaks(row_scores, int(fy - 8 * fh), int(fy - 1.2 * fh))]
+    bottoms = [None] + [r + 1 for r in peaks(row_scores, int(fy + 1.2 * fh), int(fy + 8 * fh))]
+
+    def side(strong, line, a, b):
+        if line is None:
+            return 1.0
+        return float(strong[line - 1, a:b].mean()) if b - a >= 3 else 0.0
+
+    best, best_score = None, BOX_SUPPORT
+    for left in lefts:
+        x1 = 0 if left is None else left
+        for right in rights:
+            x2 = wy if right is None else right
+            for top in tops:
+                y1 = 0 if top is None else top
+                for bottom in bottoms:
+                    y2 = hx if bottom is None else bottom
+                    w, h = (x2 - x1) / wy, (y2 - y1) / hx
+                    # An overlay, not most of the screen; and on the frame's
+                    # edge at most on two sides, which must not be opposite.
+                    if w > 0.5 or h > 0.65 or w * h < 6 * cam["w"] * cam["h"]:
+                        continue
+                    if (left is None and right is None) or (top is None and bottom is None):
+                        continue
+                    score = min(
+                        side(strong_y, top, x1, x2), side(strong_y, bottom, x1, x2),
+                        side(strong_x.T, left, y1, y2), side(strong_x.T, right, y1, y2),
+                    )
+                    if score > best_score:
+                        best, best_score = (x1, y1, x2, y2), score
+    if best is None:
+        return None
+    x1, y1, x2, y2 = best
+    return {"x": round(x1 / wy, 4), "y": round(y1 / hx, 4), "w": round((x2 - x1) / wy, 4), "h": round((y2 - y1) / hx, 4)}
+
+
+def at_facecam(face, cam):
+    return abs(face[0] - cam["cx"]) < FACECAM_TOLERANCE and abs(face[1] - cam["cy"]) < FACECAM_TOLERANCE
+
+
+def facecam_presence(session, video, start, duration, width, height, cam):
+    """Per sampled frame, whether the streamer's face is in the facecam. The
+    region around the facecam is read at full resolution and enlarged: in a
+    480p stream the face is about 20 pixels wide, too small for the detector
+    on the whole frame in a third of the frames."""
+    rw, rh = min(1.0, 6 * cam["w"]), min(1.0, 5 * cam["h"])
+    rx = min(max(0.0, cam["cx"] - rw / 2), 1 - rw)
+    ry = min(max(0.0, cam["cy"] - rh / 2), 1 - rh)
+    even = lambda n: max(2, int(n // 2) * 2)
+    px, py, pw, ph = even(rx * width), even(ry * height), even(rw * width), even(rh * height)
+    seen = []
+    for frame in read_frames(video, start, duration, pw, ph, crop=(pw, ph, px, py)):
+        faces = detect(session, frame)
+        seen.append(any(0.15 < f[0] < 0.85 and 0.1 < f[1] < 0.9 for f in faces))
+    return seen
+
+
+def gaming_timeline(found, seen, cam, kept, duration):
+    """Splits the clip into "split" stretches (gameplay with the facecam over
+    it) and "full" stretches (the camera fills the screen: the streamer talks
+    to chat, stands up, shows something), one second at a time. A full
+    stretch carries the crop that keeps the streamer in the picture."""
+    total = len(found)
+    states = []
+    for a in range(0, total, GAMING_WINDOW):
+        frames = range(a, min(total, a + GAMING_WINDOW))
+        in_cam = sum(1 for i in frames if (seen[i] if i < len(seen) else False)
+                     or any(at_facecam(f, cam) for f in found[i]))
+        elsewhere = sum(1 for i in frames if any(not at_facecam(f, cam) for f in found[i]))
+        if in_cam:
+            states.append("split")
+        elif elsewhere * 2 >= len(frames):
+            states.append("full")
+        else:
+            states.append(None)  # no face anywhere: decided by its neighbours
+    known = [s for s in states if s]
+    if not known:
+        return [{"start": 0, "end": round(duration, 2), "split": True}]
+    last = known[0]
+    for i, s in enumerate(states):
+        states[i] = s or last
+        last = states[i]
+    runs = []
+    for i, s in enumerate(states):
+        if runs and runs[-1][0] == s:
+            runs[-1][2] = i + 1
+        else:
+            runs.append([s, i, i + 1])
+    # Fold flicker into its neighbours, shortest first.
+    while len(runs) > 1:
+        short = [k for k, r in enumerate(runs) if r[2] - r[1] < (MIN_FULL_RUN if r[0] == "full" else MIN_SPLIT_RUN)]
+        if not short:
+            break
+        k = min(short, key=lambda k: runs[k][2] - runs[k][1])
+        if k == 0:
+            other = 1
+        elif k == len(runs) - 1:
+            other = k - 1
+        else:
+            other = k - 1 if runs[k - 1][2] - runs[k - 1][1] >= runs[k + 1][2] - runs[k + 1][1] else k + 1
+        runs[other][1], runs[other][2] = min(runs[other][1], runs[k][1]), max(runs[other][2], runs[k][2])
+        del runs[k]
+        merged = []
+        for r in runs:
+            if merged and merged[-1][0] == r[0]:
+                merged[-1][2] = r[2]
+            else:
+                merged.append(r)
+        runs = merged
+
+    def to_offset(x):
+        return round(max(-1.0, min(1.0, (x - 0.5) / ((1 - kept) / 2))), 3) if kept < 0.98 else 0
+
+    out = []
+    for state, a, b in runs:
+        start = round(a * GAMING_WINDOW / SAMPLE_FPS, 2)
+        end = round(duration if b == len(states) else min(duration, b * GAMING_WINDOW / SAMPLE_FPS), 2)
+        if state == "split":
+            out.append({"start": start, "end": end, "split": True})
+            continue
+        xs = []
+        for i in range(a * GAMING_WINDOW, min(total, b * GAMING_WINDOW)):
+            others = [f for f in found[i] if not at_facecam(f, cam)]
+            if others:
+                xs.append(max(others, key=lambda f: f[2])[0])
+        out.append({"start": start, "end": end, "split": False,
+                    "offsetX": to_offset(float(np.median(xs))) if xs else 0})
+    return out
+
+
 def main():
     if len(sys.argv) > 6 and sys.argv[6] in {"people", "facecam"}:
         found = people(sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(float(sys.argv[4])),
@@ -400,18 +610,45 @@ def main():
 
     found, cuts = [], [0]
     previous_luma = None
+    # How often each pixel has an edge: an overlay's border stays put.
+    edges_x = edges_y = None
+    edge_frames = 0
     for index, frame in enumerate(read_frames(video, start, duration, width, height, DETAIL)):
         luma = frame.mean(axis=2)
+        faces = detect(session, frame[::DETAIL, ::DETAIL])
+        # Only frames that may show a facecam: a full-screen camera stretch
+        # would otherwise thin out the overlay's border.
+        if not dual_mode and any(is_corner_face(f) for f in faces):
+            step_x = np.abs(np.diff(luma, axis=1)) > EDGE_STEP
+            step_y = np.abs(np.diff(luma, axis=0)) > EDGE_STEP
+            edges_x = step_x.astype(np.float32) if edges_x is None else edges_x + step_x
+            edges_y = step_y.astype(np.float32) if edges_y is None else edges_y + step_y
+            edge_frames += 1
         cut = previous_luma is not None and float(np.abs(luma - previous_luma).mean()) > CUT_DIFF
         if cut:
             cuts.append(index)
-        faces = detect(session, frame[::DETAIL, ::DETAIL])
         # Nothing to compare a mouth against on the first frame of a shot.
         found.append([(*face, mouth_motion(luma, None if cut else previous_luma, face)) for face in faces])
         previous_luma = luma
     total = len(found)
     if total == 0:
         raise RuntimeError("no frames could be read from the clip")
+
+    # A game stream with a facecam: the plan for Facecam + Gameplay, which
+    # switches to the full camera while it fills the screen. The facecam's
+    # face is then left out of the normal framing, which otherwise slid
+    # between the game and that small face in the corner.
+    gaming = None
+    cam = None if dual_mode else facecam_of(found, total)
+    if cam:
+        seen = facecam_presence(session, video, start, duration, width, height, cam)
+        if sum(seen) >= FACECAM_CONFIRM_SHARE * total:
+            cam["share"] = round(max(cam["share"], sum(seen) / total), 3)
+            box = facecam_box(edges_x / edge_frames, edges_y / edge_frames, cam) if edge_frames >= 4 else None
+            if box:
+                cam["box"] = box
+            gaming = {"facecam": cam, "runs": gaming_timeline(found, seen, cam, kept, duration)}
+            found = [[f for f in faces if not at_facecam(f, cam)] for faces in found]
 
     # Who to follow in each camera shot. A change of speaker inside a shot is
     # treated as a cut of its own: the crop jumps rather than sweeping across.
@@ -491,7 +728,7 @@ def main():
 
     coverage = sum(1 for faces in found if faces) / total
     json.dump({"segments": segments, "faceCoverage": round(coverage, 3), "shots": len(bounds),
-               "speakerChanges": len(speaker_cuts)}, sys.stdout)
+               "speakerChanges": len(speaker_cuts), **({"gaming": gaming} if gaming else {})}, sys.stdout)
 
 
 if __name__ == "__main__":

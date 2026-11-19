@@ -12,7 +12,7 @@ export const VIDEO_STYLES = {
   cinematic: { label: "Cinematic Talk", hint: "Dark grade, slow push-in, elegant captions", group: "Single speaker" },
   viral: { label: "Viral Captions", hint: "Big bold captions, spoken word pops", group: "Single speaker" },
   gameplay: { label: "Speaker + Gameplay", hint: "Speaker on top, your gameplay video below", group: "Split screen", split: "background" },
-  gaming: { label: "Facecam + Gameplay", hint: "Crop the streamer above the gameplay from the same video", group: "Split screen", split: "gaming" },
+  gaming: { label: "Facecam + Gameplay", hint: "Streamer's camera above the game; full screen while the camera fills the stream. Chosen by itself when a clip shows a facecam", group: "Split screen", split: "gaming" },
   satisfying: { label: "Speaker + Satisfying", hint: "Speaker on top, your satisfying video below", group: "Split screen", split: "background" },
   dual: { label: "Dual Speaker", hint: "Two people: one per half. One person: full screen", group: "Split screen", split: "dual" },
   reaction: { label: "Reaction Split", hint: "Creator's face on top, full picture below", group: "Split screen", split: "reaction" },

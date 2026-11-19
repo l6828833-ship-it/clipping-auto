@@ -70,14 +70,38 @@ export function facePanelCrop(person, srcW, srcH) {
 }
 
 /** Stable faces near an edge are more likely to be a streamer's facecam. */
-export function gamingSplitPlan(people, srcW, srcH) {
+export function gamingSplitPlan(people, srcW, srcH, { minShare = 0.45 } = {}) {
   if (!(srcW > 0 && srcH > 0)) return null;
   const edge = p => Math.min(p.cx, 1 - p.cx, p.cy, 1 - p.cy);
-  const face = people.filter(p => p.share >= 0.45 && p.w > 0 && p.w <= 0.24 && p.h > 0 && p.h <= 0.4 && edge(p) <= 0.27)
+  const face = people.filter(p => p.share >= minShare && p.w > 0 && p.w <= 0.24 && p.h > 0 && p.h <= 0.4 && edge(p) <= 0.27)
     .sort((a, b) => (b.share - edge(b)) - (a.share - edge(a)))[0];
   if (!face) return null;
 
   const ratio = (PANEL_W / PANEL_H) * srcH / srcW;
+  /* The overlay's own rectangle, when scripts/auto_frame.py could see its
+   * border: the top half shows just the camera, filled, and the game below
+   * leaves exactly that rectangle out. */
+  const box = face.box;
+  if (box && box.w > 0 && box.h > 0 && box.x >= 0 && box.y >= 0 && box.x + box.w <= 1.001 && box.y + box.h <= 1.001) {
+    const m = 0.004; // the border line itself
+    const bx = box.x + m, by = box.y + m, bw = box.w - 2 * m, bh = box.h - 2 * m;
+    const tall = bw / bh < ratio;
+    const h = tall ? bw / ratio : bh, w = tall ? bw : ratio * bh;
+    const top = {
+      x: clamp(face.cx - w / 2, bx, bx + bw - w),
+      y: clamp(face.cy - 0.42 * h, by, by + bh - h),
+      w, h,
+    };
+    const strips = [
+      { x: box.x + box.w, y: 0, w: 1 - box.x - box.w, h: 1 },
+      { x: 0, y: 0, w: box.x, h: 1 },
+      { x: 0, y: box.y + box.h, w: 1, h: 1 - box.y - box.h },
+      { x: 0, y: 0, w: 1, h: box.y },
+    ];
+    const area = r => r.w * r.h;
+    const best = strips.sort((a, b) => area(b) - area(a))[0];
+    return { top, bottom: area(best) >= 0.72 ? best : { x: 0, y: 0, w: 1, h: 1 } };
+  }
   const h = Math.min(1, 1 / ratio, Math.max(3.4 * face.h, 3.2 * face.w / ratio, 0.12));
   const w = ratio * h;
   const top = { x: clamp(face.cx - w / 2, 0, 1 - w), y: clamp(face.cy + 0.25 * face.h - h / 2, 0, 1 - h), w, h };

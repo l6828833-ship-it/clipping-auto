@@ -3371,7 +3371,10 @@ async function hostVideo(opts) {
     const sectionTimeout = youtubeSourceId(sourceUrl) && youtubeWorkerAlive() ? 75e3 : 18e4;
     const downloadFull = () => runStreaming(
       ytDlp,
-      [...commonArgs, ...sectionArgs, ...(opts.analysisOnly ? [] : ["--match-filter", `duration < ${maxMinutes * 60}`]), sourceUrl],
+      /* The length limit is for whole videos. A part of a long stream (a
+       * 23-hour Kick VOD, a 6-hour YouTube stream) downloads only that part,
+       * and the filter used to refuse it outright. */
+      [...commonArgs, ...sectionArgs, ...(opts.analysisOnly || range ? [] : ["--match-filter", `duration < ${maxMinutes * 60}`]), sourceUrl],
       { timeout: range ? sectionTimeout : 18e5, onLine: makeProgressHandler() }
     );
     /*
@@ -3398,7 +3401,7 @@ async function hostVideo(opts) {
         "--newline", "--progress",
         "-o", `${stem}.%(ext)s`,
         ...sectionArgs,
-        ...(opts.analysisOnly ? [] : ["--match-filter", `duration < ${maxMinutes * 60}`]),
+        ...(opts.analysisOnly || range ? [] : ["--match-filter", `duration < ${maxMinutes * 60}`]),
         sourceUrl
       ],
       { timeout: range ? sectionTimeout : 18e4, onLine: makeProgressHandler() }
@@ -3628,6 +3631,8 @@ function normaliseSegments(segments, duration, base) {
       easeTo: s.easeTo,
       /* A two-person shot: the faces to stack instead of one framing. */
       ...(Array.isArray(s.dual) && s.dual.length === 2 ? { dual: s.dual } : {}),
+      /* Facecam + Gameplay: a stretch shown split. */
+      ...(s.split === true ? { split: true } : {}),
       start: Math.max(0, Math.min(duration, s.start)),
       end: Math.max(0, Math.min(duration, s.end)),
       // Kept so a clamped segment can be re-parameterised onto its own curve.
@@ -3659,7 +3664,7 @@ function normaliseSegments(segments, duration, base) {
     if (seg.to && span > 0.01 && (start > seg.rawStart + 1e-3 || seg.end < seg.rawEnd - 1e-3)) {
       out.push(sliceSegment(full2, start, seg.end));
     } else {
-      out.push({ ...full2, ...(seg.dual ? { dual: seg.dual } : {}), start, end: seg.end });
+      out.push({ ...full2, ...(seg.dual ? { dual: seg.dual } : {}), ...(seg.split ? { split: true } : {}), start, end: seg.end });
     }
     cursor = seg.end;
   }
@@ -3880,6 +3885,9 @@ function renderClipFromHosted(opts) {
  * by the preview and again by the render: work it out once. */
 const framingRuns = new Map();
 function detectFraming(hostedPath, startInFile, duration, mode) {
+  /* Facecam + Gameplay comes out of the same pass as the normal framing, so
+   * the preview, the style and the automatic choice share one run. */
+  if (mode === "facecam") return detectFraming(hostedPath, startInFile, duration).then(gamingFraming);
   const key = `${hostedPath}:${Number(startInFile).toFixed(2)}:${Number(duration).toFixed(2)}:${mode ?? ""}`;
   const known = framingRuns.get(key);
   if (known) return known;
@@ -3904,13 +3912,32 @@ async function analyseFraming(hostedPath, startInFile, duration, mode) {
     { timeout: 3e5, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, CLIP_MAKER_FFMPEG: ffmpeg } }
   ));
   const result = JSON.parse(stdout);
-  if (mode === "facecam") {
-    const gaming = gamingSplitPlan(result.people ?? [], meta.width, meta.height);
-    return { found: !!gaming, gaming, segments: [] };
-  }
   const segments = Array.isArray(result.segments) ? result.segments : [];
   const found = segments.length > 0 && (result.faceCoverage ?? 0) >= 0.15;
-  return { found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null, width: meta.width, height: meta.height };
+  return {
+    found, segments: found ? segments : [], faceCoverage: result.faceCoverage ?? 0, shots: result.shots ?? 0, reason: result.reason ?? null,
+    width: meta.width, height: meta.height,
+    /* A game stream with a facecam: where the facecam is, and when the
+     * camera fills the screen instead (scripts/auto_frame.py). */
+    ...(result.gaming?.facecam && Array.isArray(result.gaming.runs) ? { gamingTimeline: result.gaming } : {})
+  };
+}
+/**
+ * Facecam + Gameplay for a clip, shot by shot: `segments` mark the stretches
+ * shown split (`split: true`, facecam above the game) and the ones where the
+ * camera fills the screen, which keep a normal full-height crop on the
+ * streamer. `found` is false when the clip has no facecam.
+ */
+function gamingFraming(result) {
+  const timeline = result.gamingTimeline;
+  const gaming = timeline ? gamingSplitPlan([timeline.facecam], result.width, result.height, { minShare: 0.12 }) : null;
+  if (!gaming) return { found: false, gaming: null, segments: [], width: result.width, height: result.height };
+  const segments = timeline.runs
+    .filter((run) => Number.isFinite(run.start) && Number.isFinite(run.end) && run.end > run.start)
+    .map((run) => run.split
+      ? { start: run.start, end: run.end, zoom: 1, offsetX: 0, offsetY: 0, split: true }
+      : { start: run.start, end: run.end, zoom: 1, offsetX: Number.isFinite(run.offsetX) ? run.offsetX : 0, offsetY: 0 });
+  return { found: true, gaming, segments, width: result.width, height: result.height };
 }
 async function renderClipFromHostedNow(opts) {
   const offset = opts.hostedOffset ?? 0;
@@ -3969,7 +3996,10 @@ async function renderClipFromHostedNow(opts) {
   const styleId = VIDEO_STYLES[opts.layout?.style] ? opts.layout.style : "normal";
   /* Dual Speaker brings its own shot-by-shot framing: full-height shots that
    * follow one person, and two-person shots marked `dual`. */
-  const smartDual = styleId === "dual" && Array.isArray(opts.layout?.segments) && hostedMeta?.width > 0;
+  /* Facecam + Gameplay likewise: split stretches (`split`) and full-camera
+   * stretches that keep a normal crop. */
+  const smartGaming = styleId === "gaming" && Array.isArray(opts.layout?.segments) && opts.layout?.gaming?.top && hostedMeta?.width > 0;
+  const smartDual = (styleId === "dual" || smartGaming) && Array.isArray(opts.layout?.segments) && hostedMeta?.width > 0;
   const split = !smartDual && splitKind(styleId) && hostedMeta?.width > 0
     ? planSplit({ kind: splitKind(styleId), people: opts.layout.people, gaming: opts.layout.gaming, srcW: hostedMeta.width, srcH: hostedMeta.height, crop, segments: cutSegments })
     : null;
@@ -3986,7 +4016,7 @@ async function renderClipFromHostedNow(opts) {
   const styleKey = styleId === "normal" ? null : {
     style: styleId, bg: opts.layout.backgroundPath ? path5.basename(opts.layout.backgroundPath) : null, people: opts.layout.people ?? null,
     ...(opts.layout.gaming ? { gaming: opts.layout.gaming } : {}),
-    ...(smartDual ? { pairs: segments.filter((seg) => seg.dual).map((seg) => [seg.start, seg.end, seg.dual]) } : {})
+    ...(smartDual ? { pairs: segments.filter((seg) => seg.dual || seg.split).map((seg) => [seg.start, seg.end, seg.dual ?? "split"]) } : {})
   };
   const effectsKey = scale !== 1 || overlays.length || cuts.length || styleKey
     ? crypto2.createHash("sha1").update(JSON.stringify({ scale, barColor, overlays, ...(cuts.length ? { cuts } : {}), ...(styleKey ? { styleKey } : {}) })).digest("hex").slice(0, 8)
@@ -4087,7 +4117,7 @@ async function renderClipFromHostedNow(opts) {
     } else if (bottom && segments.length <= 1 && !moving) {
       const main = [...cutVideo, buildCropFilter(segments[0], hostedMeta?.width ?? 0, hostedMeta?.height ?? 0), "format=yuv420p"].join(",");
       videoArgs.push("-filter_complex", stacked([`[0:v]${main}[vmain]`]), "-map", "[vout]", "-map", "0:a?");
-    } else if (segments.length <= 1 && !moving && !segments[0]?.dual) {
+    } else if (segments.length <= 1 && !moving && !segments[0]?.dual && !segments[0]?.split) {
       videoArgs.push(
         "-vf",
         [
@@ -4100,7 +4130,17 @@ async function renderClipFromHostedNow(opts) {
       const source = (i) => keep ? `[cut${i}]` : "[0:v]";
       const parts = segments.map((seg, i) => {
         const piece = `${source(i)}trim=start=${seg.start.toFixed(3)}:end=${seg.end.toFixed(3)},setpts=PTS-STARTPTS`;
-        if (!seg.dual) return `${piece},${framingFor(seg)}[v${i}]`;
+        if (seg.split && smartGaming) {
+          /* Facecam above, the game below. */
+          const { top: cam, bottom: game } = opts.layout.gaming;
+          return [
+            `${piece},split=2[g${i}a][g${i}b]`,
+            `[g${i}a]${gamingPanelFilter(cam, hostedMeta.width, hostedMeta.height)}[g${i}t]`,
+            `[g${i}b]${gamingPanelFilter(game, hostedMeta.width, hostedMeta.height)}[g${i}l]`,
+            `[g${i}t][g${i}l]vstack=inputs=2,setsar=1[v${i}]`
+          ].join(";");
+        }
+        if (!seg.dual) return `${piece},${framingFor(seg)},setsar=1,format=yuv420p[v${i}]`;
         /* Two people: each gets a half, left person on top. */
         return [
           `${piece},split=2[d${i}a][d${i}b]`,
@@ -4303,8 +4343,17 @@ async function resolveLayout(clip, userId, hostedPath, hostedOffset) {
     return null;
   }
   if (kind === "gaming") {
-    const plan = await detectFraming(hostedPath, clip.startTime - hostedOffset, duration, "facecam").catch(() => null);
-    return plan?.gaming ? { style, gaming: plan.gaming } : null;
+    const plan = await detectFraming(hostedPath, clip.startTime - hostedOffset, duration, "facecam").catch((error) => {
+      console.warn(`[Render] Clip ${clip.id}: could not look for a facecam (${String(error.stderr || error.message).slice(0, 160)}).`);
+      return null;
+    });
+    if (!plan?.found) {
+      console.warn(`[Render] Clip ${clip.id}: no facecam found for "${style}". Rendering as Normal.`);
+      return null;
+    }
+    const full = plan.segments.filter((seg) => !seg.split).length;
+    console.log(`[Render] Clip ${clip.id}: Facecam + Gameplay, ${plan.segments.length - full} split and ${full} full-camera stretch(es).`);
+    return { style, gaming: plan.gaming, segments: plan.segments };
   }
   let people = [];
   try {
@@ -4793,9 +4842,13 @@ var appRouter = router({
       if (known) return known;
       try {
         const result = await detectFraming(section.path, input.startTime - section.offset, duration, mode);
+        /* A clip with no style chosen is exported as Facecam + Gameplay when
+         * it has a facecam (see clips.render); the preview needs that plan. */
+        const autoGaming = !mode && result.gamingTimeline ? gamingFraming(result) : null;
         const answer = {
           found: result.found,
           ...(result.gaming ? { gaming: result.gaming } : {}),
+          ...(autoGaming?.found ? { autoGaming: { gaming: autoGaming.gaming, segments: autoGaming.segments } } : {}),
           segments: result.segments.map((seg) => seg.dual
             ? { ...seg, dual: seg.dual.map((person) => facePanelCrop(person, result.width, result.height)) }
             : seg)
@@ -4886,7 +4939,9 @@ var appRouter = router({
       const { style, ...fields } = input;
       const id = await createClip({
         ...fields, userId: ctx.user.id, status: "pending",
-        ...(style && style !== "normal" ? { layout: { style } } : {})
+        /* Kept even for "normal": a style chosen by hand. No style means
+         * the automatic choice (Facecam + Gameplay for a game stream). */
+        ...(style ? { layout: { style } } : {})
       });
       return { id };
     }),
@@ -4978,7 +5033,10 @@ var appRouter = router({
         ...input.barColor !== void 0 ? { barColor: input.barColor } : {},
         ...input.textOverlays !== void 0 ? { textOverlays: input.textOverlays } : {},
         ...input.captionsEnabled !== void 0 ? { captionsEnabled: input.captionsEnabled } : {},
-        ...input.layout !== void 0 ? { layout: input.layout && input.layout.style !== "normal" ? input.layout : null } : {},
+        /* "Normal" chosen by hand is kept, so a game stream is not switched
+         * to Facecam + Gameplay automatically; no layout at all means the
+         * automatic choice. */
+        ...input.layout !== void 0 ? { layout: input.layout ?? null } : {},
         ...(captionsChanged || (input.layout !== void 0 && JSON.stringify(input.layout ?? null) !== JSON.stringify(clip.layout ?? null))) && clip.status === "done" ? { status: "pending", downloadUrl: null, errorMessage: null } : {},
         // An empty array means "no timeline", stored as null.
         ...input.framingSegments !== void 0 ? { framingSegments: input.framingSegments.length > 0 ? input.framingSegments : null } : {}
@@ -5084,6 +5142,9 @@ var appRouter = router({
       });
       void keepAlive(() => updateClip(clip.id, {}), async () => {
         let finalCaptions = null;
+        /* Out here so the re-import retry below renders the same style (it
+         * referred to a `layout` it could not see). */
+        let layout = null;
         try {
           finalCaptions = captionsEnabled ? await captionsForClip(clip, video) : null;
           if (captionsEnabled && !finalCaptions && actualHostedPath) {
@@ -5116,7 +5177,7 @@ var appRouter = router({
           }
           /* AI reframing without a click: a clip still on the default centre
            * crop gets the speaker-following framing before it is rendered. */
-          const layout = await resolveLayout(clip, ctx.user.id, actualHostedPath, actualHostedOffset);
+          layout = await resolveLayout(clip, ctx.user.id, actualHostedPath, actualHostedOffset);
           let framingSegments = clip.framingSegments;
           const untouched = (!Array.isArray(framingSegments) || framingSegments.length === 0)
             && crop.zoom === 1 && crop.offsetX === 0 && crop.offsetY === 0;
@@ -5124,7 +5185,15 @@ var appRouter = router({
           if (untouched && !layout?.segments && renderProfile === "standard" && process.env.CLIP_MAKER_AUTO_REFRAME !== "0") {
             try {
               const auto = await detectFraming(actualHostedPath, clip.startTime - actualHostedOffset, clip.endTime - clip.startTime);
-              if (auto.found) {
+              /* A game stream with a facecam, in a clip nobody chose a style
+               * for: Facecam + Gameplay. Normal framing slid between the
+               * game and the small face in the corner. Choosing "Normal"
+               * by hand keeps it normal (it is then saved, not null). */
+              const autoGaming = !clip.layout && auto.gamingTimeline ? gamingFraming(auto) : null;
+              if (autoGaming?.found) {
+                layout = { style: "gaming", gaming: autoGaming.gaming, segments: autoGaming.segments };
+                console.log(`[Render] Clip ${clip.id}: facecam found, rendering as Facecam + Gameplay.`);
+              } else if (auto.found) {
                 framingSegments = auto.segments;
                 await updateClip(clip.id, { framingSegments });
                 console.log(`[Render] Clip ${clip.id}: auto-reframed across ${auto.shots} shot(s).`);

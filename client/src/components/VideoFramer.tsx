@@ -476,7 +476,7 @@ export function CropView({
      * half. Null while one person is, and the picture then fills the frame.
      */
     dual?: { top: Framing; bottom: Framing } | null;
-    /** Dual Speaker: the clip has two-person shots, so keep the second player loaded between them. */
+    /** Dual Speaker and Facecam + Gameplay: the clip has split shots, so keep the second player loaded between them. */
     hasDual?: boolean;
     gaming?: GamingSplit | null;
   } | null;
@@ -810,14 +810,14 @@ export function CropView({
         <div className="absolute inset-0 pointer-events-none"
           style={{ background: "radial-gradient(ellipse at 50% 42%, transparent 45%, rgba(0,0,0,0.6) 100%)" }} />
       )}
-      {(splitKind || (styleSplit === "dual" && look?.hasDual)) && (
+      {(splitKind || ((styleSplit === "dual" || styleSplit === "gaming") && look?.hasDual)) && (
         <div className="absolute left-0 bottom-0 w-full h-1/2 overflow-hidden pointer-events-none bg-neutral-900"
           /* Between two-person shots the second player stays loaded but out of
            * sight, so the next split appears at once and in step. */
           style={gaming ? { background: "#000" } : splitKind ? undefined : { visibility: "hidden" }}>
           {splitKind === "background" && look?.backgroundUrl ? (
             <video src={previewMediaUrl(look.backgroundUrl)} className="w-full h-full object-cover" muted autoPlay loop playsInline />
-          ) : gaming || splitKind === "reaction" || styleSplit === "dual" ? (
+          ) : gaming || splitKind === "reaction" || styleSplit === "dual" || styleSplit === "gaming" ? (
             /* The same video again, kept in step with the main player: the
              * whole picture for a reaction split, the second person for Dual
              * Speaker. */
