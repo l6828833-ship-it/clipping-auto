@@ -8,7 +8,7 @@ import SubtitleOverlay, {
   CAPTION_FONTS, CaptionPresetPicker, captionAnchor, previewWordsFor,
 } from "@/components/SubtitleOverlay";
 import { captionAt, groupCaptionWords, type CaptionPresetId } from "@shared/captions.mjs";
-import { MAX_ANALYSIS_RANGE_SECONDS, parseAnalysisTime } from "@shared/analysis-range.mjs";
+import { MAX_ANALYSIS_RANGE_SECONDS, MAX_FULL_VIDEO_SECONDS, parseAnalysisTime } from "@shared/analysis-range.mjs";
 import {
   AI_VIDEO_STYLES, VIDEO_STYLES, montageCaptionStyle,
   type GamingSplit, type OwnableCaptionField, type VideoLayout, type VideoStyleId,
@@ -189,6 +189,11 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   const [videoMeta, setVideoMeta] = useState<{ title: string; duration: number; uploader: string } | null>(null);
   const [stageError, setStageError] = useState("");
   const [limitAnalysis, setLimitAnalysis] = useState(true);
+  /* The video's length once the player knows it, for the full-video limit. */
+  const [sourceLength, setSourceLength] = useState<{ url: string; seconds: number } | null>(null);
+  const knownLength = sourceLength?.url === url.trim() ? sourceLength.seconds : null;
+  const tooLongForFull = knownLength != null && knownLength > MAX_FULL_VIDEO_SECONDS;
+  useEffect(() => { if (tooLongForFull) setLimitAnalysis(true); }, [tooLongForFull]);
   const [rangeStart, setRangeStart] = useState("0:00");
   const [rangeEnd, setRangeEnd] = useState("5:00");
   const rangeFrom = parseAnalysisTime(rangeStart);
@@ -345,6 +350,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
     if (mode === "url") {
       if (!url.trim()) { toast.error("Please enter a video URL"); return; }
       if (limitAnalysis && !requestedRange) return;
+      if (!limitAnalysis && tooLongForFull) return;
       /* Already read (a save that failed is simply tried again). */
       const found = stage === "done" ? foundSoFar() : await extract();
       if (found) await saveAndContinue(found);
@@ -490,18 +496,24 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                     onChange={() => { setLimitAnalysis(true); resetRangeResult(); }} />
                   Part of the video
                 </label>
-                <label className="flex items-center gap-2">
-                  <input type="radio" name="analysis-scope" checked={!limitAnalysis}
+                <label className={`flex items-center gap-2 ${tooLongForFull ? "opacity-50" : ""}`}>
+                  <input type="radio" name="analysis-scope" checked={!limitAnalysis} disabled={tooLongForFull}
                     onChange={() => { setLimitAnalysis(false); resetRangeResult(); }} />
-                  Full video
+                  Full video <span className="text-xs text-muted-foreground">(up to {MAX_FULL_VIDEO_SECONDS / 3600} hour)</span>
                 </label>
               </div>
+              {tooLongForFull && knownLength != null && (
+                <p className="text-xs text-muted-foreground">
+                  This video is {fmt(knownLength)} long. Choose a part of up to {MAX_ANALYSIS_RANGE_SECONDS / 60} minutes.
+                </p>
+              )}
               {limitAnalysis && (
                 <>
                   {/* Watch the video and pick the part, in the browser: the
                    * server downloads nothing until Continue. */}
                   <RangePicker url={url} start={rangeFrom} end={rangeTo} maxLength={MAX_ANALYSIS_RANGE_SECONDS}
                     disabled={isExtracting}
+                    onDuration={(seconds) => setSourceLength({ url: url.trim(), seconds })}
                     onChange={(from, to) => { setRangeStart(fmt(from)); setRangeEnd(fmt(to)); resetRangeResult(); }} />
                   <div className="grid grid-cols-2 gap-3">
                     <label className="text-xs font-semibold">Start time

@@ -19,7 +19,7 @@ import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
 import { hostedSttAvailable, hostedWords, hostedWordTimings, noteHostedFailure, transcriptionKeywords } from "../server/hosted-stt.mjs";
 import { readMediaEvidence, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
-import { downloadWithYouTubeWorker, registerYouTubeWorker, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
+import { downloadWithYouTubeWorker, registerYouTubeWorker, workerLink, workerTakesLinks, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile, streamStoredMedia } from "../server/object-storage.mjs";
 import { pipeline as nodePipeline } from "node:stream/promises";
 
@@ -1245,6 +1245,11 @@ var WHISPER_PYTHON = process.env.WHISPER_PYTHON ?? "python3";
 var WHISPER_SCRIPT = process.env.WHISPER_SCRIPT ?? path3.join(process.cwd(), "scripts", "whisper_words.py");
 var WHISPER_MODEL = process.env.WHISPER_MODEL ?? "base";
 var whisperQueue = Promise.resolve();
+function whisperThreads() {
+  const set = Number(process.env.CLIP_MAKER_CPUS);
+  const cpus = Math.min(os2.availableParallelism?.() ?? os2.cpus().length, set > 0 ? set : process.env.K_SERVICE ? 4 : 8);
+  return Math.max(1, Math.floor(cpus) - 1);
+}
 /* `hosted`: the text comes from the OpenAI API and the script only places the
  * words with the small "base" model (scripts/hosted_transcribe.py). That is
  * light, so it neither waits behind a long local transcription nor holds one
@@ -1264,6 +1269,11 @@ async function localWhisperWords(audioPath, language = "auto", signal, onProgres
       { timeout: signal ? 125 * 60_000 : 20 * 60_000, maxBuffer: 64 * 1024 * 1024, signal, killSignal: "SIGKILL",
         env: {
           ...process.env, CLIP_MAKER_WHISPER_PROGRESS: "1",
+          /* One vCPU stays free for answering requests. With 8 threads on 4
+           * vCPUs the host found no capacity and refused pages with 429.
+           * Cloud Run shows the script 8 CPUs whatever the limit, so the
+           * limit comes from CLIP_MAKER_CPUS (default 4 there). */
+          WHISPER_THREADS: process.env.WHISPER_THREADS || String(whisperThreads()),
           ...(hosted ? { CLIP_MAKER_HOSTED_TEXT: "openai", CLIP_MAKER_STT_KEYWORDS: keywords.join("\n") } : {})
         } }
     );
@@ -1606,8 +1616,12 @@ function cleanTimedWords(words) {
  * stall limit) and then ran Whisper on its own 4 vCPUs.
  */
 async function rangeAudioFromWorker(url, range, tmpDir, language, { signal, reportStage, reportProgress }) {
+  /* YouTube by its ID; Kick and Twitch by their link, when the worker takes
+   * links. Whisper on this server's 4 vCPUs left no CPU for answering
+   * requests: the host turned pages away with 429 for minutes. */
   const videoId = youtubeSourceId(url);
-  if (!videoId || !youtubeWorkerAlive()) return null;
+  const link = videoId ? null : workerLink(url);
+  if (!(videoId || (link && workerTakesLinks())) || !youtubeWorkerAlive()) return null;
   const transcribe = process.env.CLIP_MAKER_WORKER_TRANSCRIBE !== "0" && !hostedSttAvailable();
   /* Frames for visual analysis need the video too. The worker takes one job
    * at a time, so this queues behind the audio and is usually ready, or
@@ -1617,8 +1631,10 @@ async function rangeAudioFromWorker(url, range, tmpDir, language, { signal, repo
   let stage = "downloading";
   let progress = 0;
   const workerAudio = path3.join(tmpDir, "worker-range.mp3");
+  const name = videoId ?? new URL(link).hostname;
   try {
     const metadata = await downloadWithYouTubeWorker(videoId, workerAudio, {
+      sourceUrl: link ?? undefined,
       kind: "audio", range: { start: range.start, duration: range.end - range.start }, language, transcribe, signal,
       onAlive: () => stage === "transcribing" ? reportProgress({ stage, progress }) : reportStage(stage),
       onTranscribing: (value) => {
@@ -1628,7 +1644,7 @@ async function rangeAudioFromWorker(url, range, tmpDir, language, { signal, repo
       },
     });
     if (!metadata) return null;
-    console.log(`[Extract] The download worker sent ${metadata.transcript ? "a transcript" : "audio"} for ${Math.round(range.end - range.start)} s of ${videoId}.`);
+    console.log(`[Extract] The download worker sent ${metadata.transcript ? "a transcript" : "audio"} for ${Math.round(range.end - range.start)} s of ${name}.`);
     return { audioPath: workerAudio, metadata, rangeOffset: range.start };
   } catch (error) {
     signal?.throwIfAborted();

@@ -48,11 +48,13 @@ export function useSourceTranscription() {
       } catch (error) {
         const failure = error as { cause?: { status?: number }; data?: { httpStatus?: number } };
         const httpStatus = failure?.data?.httpStatus ?? failure?.cause?.status;
-        if ((httpStatus === 404 || httpStatus === 502 || httpStatus === 503 || httpStatus === 504) && retries < 3) {
-          // A poll can land on a different instance or catch a brief restart.
-          // Retry this job ID so the user is never charged for a second job.
+        /* A poll can land on a different instance, catch a brief restart, or
+         * find the server too busy to answer (429). Keep asking about this
+         * job for about two minutes, so a busy moment does not end it. */
+        const busy = httpStatus === 429 || httpStatus === 502 || httpStatus === 503 || httpStatus === 504;
+        if ((busy && retries < 8) || (httpStatus === 404 && retries < 3)) {
           retries++;
-          await new Promise(resolve => window.setTimeout(resolve, retries * 1500));
+          await new Promise(resolve => window.setTimeout(resolve, Math.min(15_000, retries * 2000)));
           continue;
         }
         throw error;

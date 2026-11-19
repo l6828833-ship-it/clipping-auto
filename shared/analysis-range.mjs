@@ -2,6 +2,9 @@
  * parts get a smaller copy for visual analysis through the download worker
  * (its uploads are capped at 28 MiB; see scripts/youtube-worker.mjs). */
 export const MAX_ANALYSIS_RANGE_SECONDS = 60 * 60;
+/* "Full video" is for videos up to an hour; a longer one is analyzed a part
+ * at a time. Checked in the browser and again on the server. */
+export const MAX_FULL_VIDEO_SECONDS = 60 * 60;
 
 export function parseAnalysisTime(value) {
   const parts = value.trim().split(":");

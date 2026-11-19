@@ -69,18 +69,28 @@ const trpcClient = trpc.createClient({
         return {};
       },
       async fetch(input, init) {
-        const response = await globalThis.fetch(input, {
-          ...(init ?? {}),
-          credentials: "include",
-        });
-        if (!response.headers.get("content-type")?.includes("application/json")) {
+        /* The host answers 429 ("waiting too long for an available
+         * instance") when the server is busy, before the request reaches the
+         * app, so it is safe to send again; so is a read after a 502-504.
+         * Up to four tries over about 15 seconds, then the message below. */
+        const method = (init?.method ?? "GET").toUpperCase();
+        for (let attempt = 0; ; attempt++) {
+          const response = await globalThis.fetch(input, {
+            ...(init ?? {}),
+            credentials: "include",
+          });
+          if (response.headers.get("content-type")?.includes("application/json")) return response;
           await response.body?.cancel().catch(() => {});
-          const message = response.status >= 500
-            ? "Clip Maker is temporarily unavailable. Try again in a moment."
+          const retry = response.status === 429 || (method === "GET" && response.status >= 502 && response.status <= 504);
+          if (retry && attempt < 3) {
+            await new Promise(resolve => setTimeout(resolve, 1500 * 2 ** attempt));
+            continue;
+          }
+          const message = response.status === 429 || response.status >= 500
+            ? "Clip Maker is busy right now. Try again in a moment."
             : "Clip Maker received an unexpected response. Refresh the page and try again.";
           throw Object.assign(new Error(message), { status: response.status });
         }
-        return response;
       },
     }),
   ],

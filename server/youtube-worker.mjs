@@ -18,6 +18,30 @@ function workerToken() {
   return process.env.CLIP_MAKER_YOUTUBE_WORKER_TOKEN?.trim() || "";
 }
 
+/* Stream sites whose links the worker may be sent, besides YouTube video
+ * IDs. Only these: the worker runs on someone's own computer and network,
+ * and must not be pointed at whatever address a user types. The worker
+ * checks the same list (scripts/youtube-worker.mjs). */
+const LINK_HOSTS = new Set(["kick.com", "www.kick.com", "twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"]);
+
+/** The link as the worker may fetch it, or null when it is not allowed. */
+export function workerLink(url) {
+  try {
+    const link = new URL(url);
+    if (link.protocol !== "https:" || !LINK_HOSTS.has(link.hostname.toLowerCase()) || link.username || link.password || link.port) return null;
+    return link.toString();
+  } catch {
+    return null;
+  }
+}
+
+/* Whether the polling worker understands link jobs (it says so on /claim);
+ * older workers only take YouTube IDs. */
+let workerTakesLinksAt = 0;
+export function workerTakesLinks() {
+  return Date.now() - workerTakesLinksAt <= 60_000;
+}
+
 /* Workers that ask for it are held open on /claim until a job arrives (up to
  * LONG_POLL_MS), instead of polling every few seconds: the job still starts at
  * once, and the host's request log gets one line per 20 seconds, not eight. */
@@ -38,9 +62,12 @@ export function youtubeWorkerAlive() {
  * worker's periodic sign of life, `onTranscribing(progress)` while it
  * transcribes.
  */
-export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, analysisOnly, language, transcribe = false, onTranscribing, onAlive, signal } = {}) {
+export async function downloadWithYouTubeWorker(videoId, destination, { kind = "audio", range, analysisOnly, language, transcribe = false, onTranscribing, onAlive, signal, sourceUrl } = {}) {
   signal?.throwIfAborted();
-  if (!/^[A-Za-z0-9_-]{11}$/.test(videoId ?? "") || !workerToken() || (!polledRecently() && !jobs.size)) return null;
+  /* `sourceUrl`: a Kick or Twitch link instead of a YouTube ID, for a part's audio only. */
+  const link = !videoId && sourceUrl ? workerLink(sourceUrl) : null;
+  if (link && !(kind === "audio" && range && workerTakesLinks())) return null;
+  if (!(link || /^[A-Za-z0-9_-]{11}$/.test(videoId ?? "")) || !workerToken() || (!polledRecently() && !jobs.size)) return null;
   if (jobs.size >= 4) throw new Error("The YouTube download worker is busy. Try again shortly.");
 
   const id = randomUUID();
@@ -65,7 +92,7 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
       timeout = setTimeout(() => finish(new Error("The YouTube download worker timed out.")), Math.max(1_000, Math.min(IDLE_JOB_MS, left)));
     };
     touch();
-    jobs.set(id, { videoId, destination, kind, range, analysisOnly, language, transcribe: transcribe === true, onTranscribing, onAlive, finish, touch, state: "waiting" });
+    jobs.set(id, { videoId: link ? null : videoId, link, destination, kind, range, analysisOnly, language, transcribe: transcribe === true, onTranscribing, onAlive, finish, touch, state: "waiting" });
     signal?.addEventListener("abort", cancel, { once: true });
     /* Hand it straight to a worker that is waiting on /claim. */
     for (const waiter of waiters) if (waiter()) break;
@@ -73,9 +100,9 @@ export async function downloadWithYouTubeWorker(videoId, destination, { kind = "
 }
 
 /** Claims the oldest waiting job; returns what the worker needs, or null. */
-function claimNextJob() {
+function claimNextJob(takesLinks) {
   for (const [id, job] of jobs) {
-    if (job.state !== "waiting") continue;
+    if (job.state !== "waiting" || (job.link && !takesLinks)) continue;
     job.state = "claimed";
     /* The 15 minutes count from the claim, not from when the job was
      * queued. The worker takes one job at a time, so a job that waited
@@ -85,7 +112,10 @@ function claimNextJob() {
     /* The worker transcribes only when the caller asked for it (a selected
      * range of a YouTube video, see transcribeSource). Otherwise it only
      * supplies the blocked download and Whisper runs in the web container. */
-    return { id, videoId: job.videoId, kind: job.kind, range: job.range, analysisOnly: job.analysisOnly, language: job.language, transcribe: job.transcribe };
+    return {
+      id, videoId: job.videoId, ...(job.link ? { url: job.link } : {}),
+      kind: job.kind, range: job.range, analysisOnly: job.analysisOnly, language: job.language, transcribe: job.transcribe,
+    };
   }
   return null;
 }
@@ -122,7 +152,9 @@ export function registerYouTubeWorker(app) {
 
   app.post(`${prefix}/claim`, (req, res) => {
     lastPoll = Date.now();
-    const job = claimNextJob();
+    const takesLinks = /\blinks\b/.test(req.get("x-clip-maker-features") ?? "");
+    if (takesLinks) workerTakesLinksAt = Date.now();
+    const job = claimNextJob(takesLinks);
     if (job) return res.json(job);
     /* Older workers give up on a request after 10 seconds, so only hold the
      * ones that say how long they will wait. */
@@ -132,7 +164,7 @@ export function registerYouTubeWorker(app) {
     const done = () => { clearTimeout(timer); waiters.delete(waiter); lastPoll = Date.now(); };
     const waiter = () => {
       if (res.writableEnded || res.destroyed) { done(); return false; }
-      const next = claimNextJob();
+      const next = claimNextJob(takesLinks);
       if (!next) return false;
       done();
       res.json(next);

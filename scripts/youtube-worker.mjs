@@ -95,21 +95,44 @@ async function transcribeHere(id, audioPath, language, seconds = 0) {
   return transcript;
 }
 
-async function processJob({ id, videoId, kind, range, analysisOnly, language, transcribe }) {
-  if (!/^[0-9a-f-]{36}$/i.test(id) || !/^[A-Za-z0-9_-]{11}$/.test(videoId) || !["audio", "video"].includes(kind)) return;
+/* Sites whose links this machine fetches besides YouTube IDs, the same list
+ * as the server's (server/youtube-worker.mjs). Checked here as well: the
+ * worker must not fetch arbitrary addresses on this network for the server. */
+const LINK_HOSTS = new Set(["kick.com", "www.kick.com", "twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"]);
+function allowedLink(value) {
+  try {
+    const link = new URL(value);
+    return link.protocol === "https:" && LINK_HOSTS.has(link.hostname.toLowerCase()) && !link.username && !link.password && !link.port
+      ? link.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function processJob({ id, videoId, url: jobLink, kind, range, analysisOnly, language, transcribe }) {
+  if (!/^[0-9a-f-]{36}$/i.test(id) || !["audio", "video"].includes(kind)) return;
+  /* A Kick or Twitch link: only a part's audio (and transcript). */
+  const link = jobLink ? allowedLink(jobLink) : null;
+  if (jobLink && !(link && kind === "audio" && range)) {
+    console.warn(`Refused a job for ${String(jobLink).slice(0, 80)}: not a link this worker fetches.`);
+    await request(`${id}/failed`).catch(() => {});
+    return;
+  }
+  if (!link && !/^[A-Za-z0-9_-]{11}$/.test(videoId)) return;
   const directory = await mkdtemp(path.join(tmpdir(), "clip-maker-worker-"));
   /* A sign of life every 30 seconds, so the server does not take a long
    * download for a stuck one. Servers without this route answer 404. */
   const heartbeat = setInterval(() => void request(`${id}/alive`).catch(() => {}), 30_000);
   try {
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const url = link ?? `https://www.youtube.com/watch?v=${videoId}`;
     const audio = kind === "audio";
     const hasRange = range && Number.isFinite(range.start) && Number.isFinite(range.duration) && range.duration > 0;
     const section = !audio && hasRange;
     if (audio && hasRange) {
-      await processAudioRange({ id, url, videoId, range, language, transcribe: transcribe === true, directory });
+      await processAudioRange({ id, url, videoId: videoId ?? new URL(url).hostname, range, language, transcribe: transcribe === true, directory, stream: !!link });
       return;
     }
+    if (link) return;
     /* A clip's part of a video is short, so it can be fetched at 720p and
      * still fit the upload limit; 480p looked soft once cropped to vertical.
      * A whole video stays at 480p. */
@@ -211,7 +234,7 @@ async function processJob({ id, videoId, kind, range, analysisOnly, language, tr
       error.signal ? `signal ${error.signal}` : "",
       error.code != null ? `exit ${error.code}` : "",
     ].filter(Boolean).join(", ");
-    console.warn(`YouTube job ${videoId} failed${ending ? ` [${ending}]` : ""}:`, String(error.stderr || error.message).slice(-500));
+    console.warn(`Download job ${videoId ?? link} failed${ending ? ` [${ending}]` : ""}:`, String(error.stderr || error.message).slice(-500));
     await request(`${id}/failed`).catch(() => {});
   } finally {
     clearInterval(heartbeat);
@@ -235,12 +258,14 @@ async function sendTranscript(id, videoId, info, transcript) {
  * the same 15-minute part as a 360p video section took about 11 minutes,
  * because ffmpeg reads a section at about twice playback speed.
  */
-async function processAudioRange({ id, url, videoId, range, language, transcribe, directory }) {
+async function processAudioRange({ id, url, videoId, range, language, transcribe, directory, stream = false }) {
   const start = Math.max(0, range.start);
   const ytArgs = [
     "--ignore-config", "--no-playlist", "--no-progress", "--socket-timeout", "15", "--retries", "2",
     "--js-runtimes", `node:${process.execPath}`, "--max-filesize", "350M",
-    "-f", "ba[abr<=72][ext=m4a]/ba[abr<=72]/ba[ext=m4a]/ba/b",
+    /* Kick and Twitch have no audio-only stream: the smallest picture
+     * carries the same sound (160p is about 230 kbit/s on Kick). */
+    "-f", stream ? "ba/w[acodec!=none]/w" : "ba[abr<=72][ext=m4a]/ba[abr<=72]/ba[ext=m4a]/ba/b",
     ...(process.env.CLIP_MAKER_FFMPEG ? ["--ffmpeg-location", ffmpeg] : []),
     "--print", "after_move:%(.{title,duration,uploader,language,filepath})j",
   ];
@@ -252,11 +277,13 @@ async function processAudioRange({ id, url, videoId, range, language, transcribe
   let info;
   let cutStart = start;
   try {
+    /* A stream site's VOD can last a day: always just the part. */
+    if (stream) throw new Error("A stream site's part is downloaded on its own.");
     info = await download("audio", [], 300_000);
   } catch (error) {
     /* Over --max-filesize (a very long video at a higher bitrate), or the
      * whole track failed: fetch only the part, given time to finish. */
-    console.warn(`Whole audio for ${videoId} failed; downloading only the selected part:`, String(error.stderr || error.message).slice(-200));
+    if (!stream) console.warn(`Whole audio for ${videoId} failed; downloading only the selected part:`, String(error.stderr || error.message).slice(-200));
     info = await download("section", ["--download-sections", `*${start}-${start + range.duration}`], Math.max(180_000, range.duration * 750));
     cutStart = 0;
   }
@@ -294,7 +321,8 @@ let waitingForServer = false;
 for (;;) {
   try {
     /* The server holds the request until a job arrives, up to 20 seconds. */
-    const response = await request("claim", { headers: { "X-Clip-Maker-Wait": "20" }, timeout: 35_000 });
+    /* "links": this worker also takes Kick and Twitch links (see LINK_HOSTS). */
+    const response = await request("claim", { headers: { "X-Clip-Maker-Wait": "20", "X-Clip-Maker-Features": "links" }, timeout: 35_000 });
     if (response.status === 401 || response.status === 404) {
       if (!waitingForServer) console.warn("Waiting for the server to accept the worker token. Check the Rundploy runtime secret if this persists.");
       waitingForServer = true;
