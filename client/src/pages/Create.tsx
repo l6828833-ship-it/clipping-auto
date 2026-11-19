@@ -14,6 +14,7 @@ import {
   type GamingSplit, type OwnableCaptionField, type VideoLayout, type VideoStyleId,
 } from "@shared/video-styles.mjs";
 import VideoStylePicker from "@/components/VideoStylePicker";
+import RangePicker from "@/components/RangePicker";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { downloadMedia } from "@/lib/download";
 import { trpc } from "@/lib/trpc";
@@ -384,7 +385,10 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   const progress = STAGE_PROGRESS[stage];
 
   return (
-    <div className="max-w-2xl mx-auto animate-slide-up">
+    /* "backwards", not the class's "both": a transform left on this element
+     * after the entry animation would pin the range picker's mini player to
+     * this form instead of the screen. The animation looks the same. */
+    <div className="max-w-2xl mx-auto animate-slide-up" style={{ animationFillMode: "backwards" }}>
       <div className="mb-6">
         <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Add Your Video</h2>
         <p className="text-sm text-muted-foreground">Paste a video link or upload a file and press Continue. We read the video, transcribe it and find its best moments for you.</p>
@@ -492,6 +496,11 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
               </div>
               {limitAnalysis && (
                 <>
+                  {/* Watch the video and pick the part, in the browser: the
+                   * server downloads nothing until Continue. */}
+                  <RangePicker url={url} start={rangeFrom} end={rangeTo} maxLength={MAX_ANALYSIS_RANGE_SECONDS}
+                    disabled={isExtracting}
+                    onChange={(from, to) => { setRangeStart(fmt(from)); setRangeEnd(fmt(to)); resetRangeResult(); }} />
                   <div className="grid grid-cols-2 gap-3">
                     <label className="text-xs font-semibold">Start time
                       <input value={rangeStart} onChange={e => { setRangeStart(e.target.value); resetRangeResult(); }}
