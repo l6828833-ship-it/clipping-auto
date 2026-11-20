@@ -1751,7 +1751,8 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
     try {
       // YouTube metadata is useful for finding captions, but "ar" must not
       // turn the user's Auto choice into forced Arabic on English passages.
-      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, input.language, signal, reportProgress,
+      const speechLanguage = input.language === "auto" && language === "ar-ma" ? language : input.language;
+      const { text, words, language: detectedLanguage } = await transcribeWords(audioPath, speechLanguage, signal, reportProgress,
         { keywords: transcriptionKeywords(meta.title, meta.uploader) });
       if (input.language === "auto" && detectedLanguage) language = detectedLanguage;
       if (text && words.length) {
@@ -2357,7 +2358,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       const messages = media ? [
         { role: "system", content: `${MEDIA_EDITOR_RULES}\n${languageRule}` },
         { role: "user", content: [
-          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nSampled frames follow; do not assume they show every event in the video.` },
+          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nFrame-change times: ${media.motion.map(p => p.time).join(", ") || "none"}. Compare nearby frames on both sides of a change for action, a short reveal or a reaction. Sampled frames follow; do not assume they show every event in the video.` },
           ...frameContent(media.frames)
         ] }
       ] : [
@@ -2444,8 +2445,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       const bounded = highlights.filter(inBounds);
       const spoken = transcript.trim().length >= 10 ? filterSpeechHighlights(bounded.filter(h => h.evidence === "speech"), timedWords) : [];
       const visual = media ? bounded.filter(h => h.evidence === "visual"
-        && media.frames.filter(f => f.time >= h.startTime && f.time <= h.endTime).length >= 2) : [];
-      const supported = [...spoken, ...visual];
+        && media.frames.some(f => f.time >= h.startTime && f.time <= h.endTime)) : [];
       const snapped = filterSpeechHighlights(snapHighlights(spoken, timedWords, {
         videoDuration: duration,
         ...(rankingMode ? { minSeconds: 5, maxSeconds: 15, reach: 2, growTo: 0 } : {})
@@ -3972,7 +3972,7 @@ function gamingFraming(result) {
     .filter((run) => Number.isFinite(run.start) && Number.isFinite(run.end) && run.end > run.start)
     .map((run) => run.split
       ? { start: run.start, end: run.end, zoom: 1, offsetX: 0, offsetY: 0, split: true }
-      : { start: run.start, end: run.end, zoom: 1, offsetX: Number.isFinite(run.offsetX) ? run.offsetX : 0, offsetY: 0 });
+      : { start: run.start, end: run.end, zoom: Number.isFinite(run.zoom) ? run.zoom : 1, offsetX: Number.isFinite(run.offsetX) ? run.offsetX : 0, offsetY: 0 });
   return { found: true, gaming, segments, width: result.width, height: result.height };
 }
 async function renderClipFromHostedNow(opts) {

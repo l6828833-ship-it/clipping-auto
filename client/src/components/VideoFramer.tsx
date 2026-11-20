@@ -483,12 +483,14 @@ export function CropView({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const lowerRef = useRef<HTMLVideoElement>(null);
+  const gameplayRef = useRef<HTMLCanvasElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
   const styleSplit = look ? (VIDEO_STYLES as Record<string, { split?: string }>)[look.style]?.split : undefined;
   /* Dual Speaker is split only while two people are on screen. */
   const pair = styleSplit === "dual" ? look?.dual ?? null : null;
   const gaming = styleSplit === "gaming" ? look?.gaming ?? null : null;
+  const gameplay = gaming?.bottom;
   const splitKind = styleSplit === "dual" ? (pair ? "dual" : undefined)
     : styleSplit === "gaming" ? (gaming ? "gaming" : undefined) : styleSplit;
   const grade = look?.style === "cinematic" ? "contrast(1.1) saturate(0.78) brightness(0.88) sepia(0.18)"
@@ -501,6 +503,59 @@ export function CropView({
   // lets the user turn audio on once they interact with the page.
   const [muted, setMuted] = useState(true);
   const [mediaState, setMediaState] = useState<"loading" | "ready" | "error">("loading");
+  // The facecam and game are crops of the same decoded frame. A second video
+  // element can buffer or seek independently and freeze the lower panel.
+  useEffect(() => {
+    const video = videoRef.current;
+    const canvas = gameplayRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!gameplay || !video || !canvas || !ctx) return;
+
+    const draw = () => {
+      if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return;
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      const sw = w * gameplay.w;
+      const sh = h * gameplay.h;
+      const width = Math.max(1, Math.round(Math.min(640, sw)));
+      const height = Math.max(1, Math.round(width * sh / sw));
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      ctx.drawImage(video, w * gameplay.x, h * gameplay.y, sw, sh, 0, 0, width, height);
+    };
+
+    let stopFrames;
+    if (typeof video.requestVideoFrameCallback === "function") {
+      let id = 0;
+      const frame = () => {
+        draw();
+        id = video.requestVideoFrameCallback(frame);
+      };
+      id = video.requestVideoFrameCallback(frame);
+      stopFrames = () => video.cancelVideoFrameCallback(id);
+    } else {
+      let id = 0;
+      const frame = () => {
+        draw();
+        id = video.paused ? 0 : requestAnimationFrame(frame);
+      };
+      const startFrames = () => { if (!id) frame(); };
+      video.addEventListener("playing", startFrames);
+      startFrames();
+      stopFrames = () => {
+        video.removeEventListener("playing", startFrames);
+        cancelAnimationFrame(id);
+      };
+    }
+    draw();
+    video.addEventListener("loadeddata", draw);
+    video.addEventListener("seeked", draw);
+    return () => {
+      stopFrames();
+      video.removeEventListener("loadeddata", draw);
+      video.removeEventListener("seeked", draw);
+    };
+  }, [gameplay, src]);
   const previewErrorRef = useRef(onPreviewError);
   useEffect(() => { previewErrorRef.current = onPreviewError; }, [onPreviewError]);
   useEffect(() => setMediaState("loading"), [src]);
@@ -817,14 +872,18 @@ export function CropView({
           style={gaming ? { background: "#000" } : splitKind ? undefined : { visibility: "hidden" }}>
           {splitKind === "background" && look?.backgroundUrl ? (
             <video src={previewMediaUrl(look.backgroundUrl)} className="w-full h-full object-cover" muted autoPlay loop playsInline />
-          ) : gaming || splitKind === "reaction" || styleSplit === "dual" || styleSplit === "gaming" ? (
+          ) : gameplay ? (
+            <div className="absolute overflow-hidden" style={gamePanel(gameplay)}>
+              <canvas ref={gameplayRef} aria-hidden="true" className="block h-full w-full" />
+            </div>
+          ) : styleSplit === "gaming" ? null : splitKind === "reaction" || styleSplit === "dual" ? (
             /* The same video again, kept in step with the main player: the
              * whole picture for a reaction split, the second person for Dual
              * Speaker. */
-            <div className="absolute overflow-hidden" style={gaming ? gamePanel(gaming.bottom) : { inset: 0 }}>
+            <div className="absolute inset-0 overflow-hidden">
             <video ref={lowerRef} src={previewMediaUrl(src)} muted playsInline
-              className={gaming || lowerLayout ? "absolute max-w-none" : "w-full h-full object-cover"}
-              style={gaming ? gameRegion(gaming.bottom) : lowerLayout ? {
+              className={lowerLayout ? "absolute max-w-none" : "w-full h-full object-cover"}
+              style={lowerLayout ? {
                 width: `${lowerLayout.widthFrac * 100}%`,
                 height: `${lowerLayout.heightFrac * 100}%`,
                 left: `${lowerLayout.leftFrac * 100}%`,

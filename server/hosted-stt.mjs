@@ -37,7 +37,11 @@ export function transcriptionKeywords(...sources) {
  * "earlier text", which steers it to write Darija as Darija instead of
  * turning it into Modern Standard Arabic or French.
  */
-const DARIJA_PROMPT = "واش، بزاف، ديال، هادشي، دابا، غادي، كاين، شنو، علاش، مزيان، بغيت، كيفاش، صافي، ماشي.";
+const DARIJA_PROMPT = "واش كاين شي واحد؟ دابا غادي نوريك كيفاش كندير هادشي. شنو بغيتي؟ هادا ديالنا، راه مزيان بزاف.";
+const LANGUAGE_CODES = new Map(Object.entries({
+  arabic: "ar", chinese: "zh", english: "en", french: "fr", german: "de",
+  hindi: "hi", japanese: "ja", korean: "ko", portuguese: "pt", spanish: "es",
+}));
 
 export class GroqTranscriptionError extends Error {
   constructor(status) {
@@ -65,12 +69,34 @@ export function wordsFromResponse(payload) {
   return words;
 }
 
+/** Reject only spans with strong evidence of silence or repeated hallucination. */
+export function transcriptFromResponse(payload) {
+  const raw = wordsFromResponse(payload);
+  const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+  const rejected = segments.filter(s => s && Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start
+    && (s.no_speech_prob >= 0.9 && s.avg_logprob < -0.9
+      || s.compression_ratio >= 2.6 && s.avg_logprob < -1));
+  const words = rejected.length ? raw.filter(w => !rejected.some(s => {
+    const midpoint = (w.start + w.end) / 2;
+    return midpoint >= s.start && midpoint < s.end;
+  })) : raw;
+  const text = String(payload?.text ?? "").trim();
+  return {
+    text: words.length !== raw.length || (!raw.length && rejected.length > 0 && rejected.length === segments.length)
+      ? words.map(w => w.word).join(" ")
+      : text,
+    words,
+    language: payload?.language,
+  };
+}
+
 async function transcribePiece(file, { apiKey, language, prompt, signal, model }) {
   const form = new FormData();
-  form.append("file", new Blob([await readFile(file)], { type: "audio/mpeg" }), path.basename(file));
+  form.append("file", new Blob([await readFile(file)], { type: "audio/flac" }), path.basename(file));
   form.append("model", model);
   form.append("response_format", "verbose_json");
   form.append("timestamp_granularities[]", "word");
+  form.append("timestamp_granularities[]", "segment");
   form.append("temperature", "0");
   if (language) form.append("language", language);
   if (prompt) form.append("prompt", prompt);
@@ -85,8 +111,7 @@ async function transcribePiece(file, { apiKey, language, prompt, signal, model }
     await response.body?.cancel().catch(() => {});
     throw new GroqTranscriptionError(response.status);
   }
-  const payload = await response.json();
-  return { text: String(payload?.text ?? "").trim(), words: wordsFromResponse(payload), language: payload?.language };
+  return transcriptFromResponse(await response.json());
 }
 
 /** Transcribe short pieces and move their word times onto the source timeline. */
@@ -104,11 +129,11 @@ export async function groqWords({ audioPath, language = "auto", ffmpeg, workDire
   try {
     await promisify(execFile)(ffmpeg, [
       "-nostdin", "-hide_banner", "-loglevel", "error", "-i", audioPath,
-      "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
+      "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac",
       "-f", "segment", "-segment_time", String(CHUNK_SECONDS), "-reset_timestamps", "1",
-      path.join(directory, "piece-%04d.mp3"),
+      path.join(directory, "piece-%04d.flac"),
     ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024, signal, killSignal: "SIGKILL" });
-    const pieces = (await readdir(directory)).filter((name) => name.endsWith(".mp3")).sort();
+    const pieces = (await readdir(directory)).filter((name) => name.endsWith(".flac")).sort();
     if (pieces.length === 0) throw new GroqTranscriptionError();
     const prompt = [darija ? DARIJA_PROMPT : "", ...keywords].filter(Boolean).join(" ").slice(0, 220);
     const options = { apiKey, language: code, prompt, signal, model };
@@ -151,7 +176,7 @@ export async function groqWords({ audioPath, language = "auto", ffmpeg, workDire
       }
     });
     const detected = results.find(result => result.words.length && typeof result.language === "string")?.language?.toLowerCase();
-    const detectedLanguage = /^[a-z]{2,3}$/.test(detected ?? "") ? detected : undefined;
+    const detectedLanguage = LANGUAGE_CODES.get(detected) ?? (/^[a-z]{2,3}$/.test(detected ?? "") ? detected : undefined);
     console.log(`[HostedSTT] Groq transcribed ${pieces.length} piece(s) with ${model}.`);
     return { text: texts.join(" ").trim(), words, model, language: darija ? "ar-ma" : code || detectedLanguage };
   } finally {

@@ -78,20 +78,12 @@ export function gamingSplitPlan(people, srcW, srcH, { minShare = 0.45 } = {}) {
   if (!face) return null;
 
   const ratio = (PANEL_W / PANEL_H) * srcH / srcW;
-  /* The overlay's own rectangle, when scripts/auto_frame.py could see its
-   * border: the top half shows just the camera, filled, and the game below
-   * leaves exactly that rectangle out. */
+  /* Fit the whole camera inset inside the top half. A tight crop centred on
+   * one face can cut off the person sitting beside them. */
   const box = face.box;
-  if (box && box.w > 0 && box.h > 0 && box.x >= 0 && box.y >= 0 && box.x + box.w <= 1.001 && box.y + box.h <= 1.001) {
-    const m = 0.004; // the border line itself
-    const bx = box.x + m, by = box.y + m, bw = box.w - 2 * m, bh = box.h - 2 * m;
-    const tall = bw / bh < ratio;
-    const h = tall ? bw / ratio : bh, w = tall ? bw : ratio * bh;
-    const top = {
-      x: clamp(face.cx - w / 2, bx, bx + bw - w),
-      y: clamp(face.cy - 0.42 * h, by, by + bh - h),
-      w, h,
-    };
+  if (box && box.w > 0.008 && box.h > 0.008 && box.x >= 0 && box.y >= 0 && box.x + box.w <= 1.001 && box.y + box.h <= 1.001) {
+    const m = 0.004;
+    const top = { x: box.x + m, y: box.y + m, w: box.w - 2 * m, h: box.h - 2 * m };
     const strips = [
       { x: box.x + box.w, y: 0, w: 1 - box.x - box.w, h: 1 },
       { x: 0, y: 0, w: box.x, h: 1 },
@@ -105,12 +97,21 @@ export function gamingSplitPlan(people, srcW, srcH, { minShare = 0.45 } = {}) {
   const h = Math.min(1, 1 / ratio, Math.max(3.4 * face.h, 3.2 * face.w / ratio, 0.12));
   const w = ratio * h;
   const top = { x: clamp(face.cx - w / 2, 0, 1 - w), y: clamp(face.cy + 0.25 * face.h - h / 2, 0, 1 - h), w, h };
+  const companion = face.companion;
+  if (companion) {
+    const right = clamp(Math.max(top.x + top.w, companion.cx + 1.1 * companion.w), 0, 1);
+    const bottom = clamp(Math.max(top.y + top.h, companion.cy + 1.5 * companion.h), 0, 1);
+    top.x = clamp(Math.min(top.x, companion.cx - 1.1 * companion.w), 0, 1);
+    top.y = clamp(Math.min(top.y, companion.cy - companion.h), 0, 1);
+    top.w = right - top.x;
+    top.h = bottom - top.y;
+  }
   // Remove the smallest border strip that excludes the estimated camera
   // inset. When that would hide too much of the game, keep the full feed.
-  const left = clamp(face.cx - 1.65 * face.w, 0, 1);
-  const right = clamp(face.cx + 1.65 * face.w, 0, 1);
-  const above = clamp(face.cy - 1.55 * face.h, 0, 1);
-  const below = clamp(face.cy + 2.15 * face.h, 0, 1);
+  const left = companion ? top.x : clamp(face.cx - 1.65 * face.w, 0, 1);
+  const right = companion ? top.x + top.w : clamp(face.cx + 1.65 * face.w, 0, 1);
+  const above = companion ? top.y : clamp(face.cy - 1.55 * face.h, 0, 1);
+  const below = companion ? top.y + top.h : clamp(face.cy + 2.15 * face.h, 0, 1);
   const candidates = [
     { x: right, y: 0, w: 1 - right, h: 1 },
     { x: 0, y: 0, w: left, h: 1 },

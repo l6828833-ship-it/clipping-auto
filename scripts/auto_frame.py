@@ -18,8 +18,7 @@ the editor's timeline stores):
   {"segments": [{"start", "end", "zoom", "offsetX", "offsetY", "to"?, "ease"?}],
    "faceCoverage": 0..1, "shots": n}
 
-When two people share a shot and are too far apart for one crop, the crop
-cuts to whoever is speaking, judged by how much each mouth moves.
+When two people share a shot, the automatic crop widens to include both.
 
 A shot where the subject holds still gets one fixed crop. A shot where the
 subject moves gets a chain of short panning pieces that follow them. A shot
@@ -217,6 +216,20 @@ def two_people(frames):
     return sorted(boxes, key=lambda person: person["cx"])
 
 
+def keep_pair_in_frame(pair, kept):
+    """Use one wider crop when both people can share it."""
+    if kept >= 0.98:
+        return {"offsetX": 0, "zoom": 1}
+    left = max(0.0, min(face["cx"] - face["w"] for face in pair))
+    right = min(1.0, max(face["cx"] + face["w"] for face in pair))
+    width = max(kept, right - left)
+    zoom = kept / width
+    if zoom <= 0.5 or width >= 0.998:
+        return {"offsetX": 0, "zoom": 0.5}
+    centre = max(width / 2, min(1 - width / 2, (left + right) / 2))
+    return {"offsetX": round((centre - 0.5) / ((1 - width) / 2), 3), "zoom": round(zoom, 4)}
+
+
 def follow_speaker(frames, kept):
     """For one shot, picks who the crop follows in each frame.
 
@@ -383,7 +396,7 @@ FACECAM_MIN_SHARE = 0.12
 FACECAM_CONFIRM_SHARE = 0.25
 GAMING_WINDOW = SAMPLE_FPS  # frames per decision (one second)
 MIN_SPLIT_RUN = 2           # seconds; shorter switches are flicker
-MIN_FULL_RUN = 3
+MIN_FULL_RUN = 1           # preserve quick, confirmed switches to the camera
 
 
 def is_corner_face(face):
@@ -492,6 +505,21 @@ def at_facecam(face, cam):
     return abs(face[0] - cam["cx"]) < FACECAM_TOLERANCE and abs(face[1] - cam["cy"]) < FACECAM_TOLERANCE
 
 
+def facecam_companion(found, cam):
+    """Find a second face consistently next to the primary face in the inset."""
+    candidates = []
+    for faces in found:
+        if not any(abs(f[0] - cam["cx"]) <= cam["w"] * 0.65 and at_facecam(f, cam) for f in faces):
+            continue
+        candidates.append([
+            f for f in faces
+            if 0.75 * max(f[3], cam["w"]) < abs(f[0] - cam["cx"]) <= max(0.09, 4 * cam["w"])
+            and abs(f[1] - cam["cy"]) <= cam["h"]
+            and 0.5 * cam["h"] <= f[4] <= 1.8 * cam["h"]
+        ])
+    return facecam_of(candidates, len(candidates))
+
+
 def facecam_presence(session, video, start, duration, width, height, cam):
     """Per sampled frame, whether the streamer's face is in the facecam. The
     region around the facecam is read at full resolution and enlarged: in a
@@ -521,7 +549,7 @@ def gaming_timeline(found, seen, cam, kept, duration):
         in_cam = sum(1 for i in frames if (seen[i] if i < len(seen) else False)
                      or any(at_facecam(f, cam) for f in found[i]))
         elsewhere = sum(1 for i in frames if any(not at_facecam(f, cam) for f in found[i]))
-        if in_cam:
+        if in_cam * 2 >= len(frames):
             states.append("split")
         elif elsewhere * 2 >= len(frames):
             states.append("full")
@@ -572,11 +600,13 @@ def gaming_timeline(found, seen, cam, kept, duration):
         if state == "split":
             out.append({"start": start, "end": end, "split": True})
             continue
-        xs = []
-        for i in range(a * GAMING_WINDOW, min(total, b * GAMING_WINDOW)):
-            others = [f for f in found[i] if not at_facecam(f, cam)]
-            if others:
-                xs.append(max(others, key=lambda f: f[2])[0])
+        other_frames = [[f for f in faces if not at_facecam(f, cam)]
+                        for faces in found[a * GAMING_WINDOW:min(total, b * GAMING_WINDOW)]]
+        pair = two_people(other_frames)
+        if pair:
+            out.append({"start": start, "end": end, "split": False, **keep_pair_in_frame(pair, kept)})
+            continue
+        xs = [max(faces, key=lambda f: f[2])[0] for faces in other_frames if faces]
         out.append({"start": start, "end": end, "split": False,
                     "offsetX": to_offset(float(np.median(xs))) if xs else 0})
     return out
@@ -647,6 +677,10 @@ def main():
             box = facecam_box(edges_x / edge_frames, edges_y / edge_frames, cam) if edge_frames >= 4 else None
             if box:
                 cam["box"] = box
+            else:
+                companion = facecam_companion(found, cam)
+                if companion:
+                    cam["companion"] = companion
             gaming = {"facecam": cam, "runs": gaming_timeline(found, seen, cam, kept, duration)}
             found = [[f for f in faces if not at_facecam(f, cam)] for faces in found]
 
@@ -654,7 +688,7 @@ def main():
     # treated as a cut of its own: the crop jumps rather than sweeping across.
     centres, speaker_cuts, pairs = [], [], {}
     for a, b in zip(cuts, cuts[1:] + [total]):
-        pair = two_people(found[a:b]) if dual_mode else None
+        pair = two_people(found[a:b])
         if pair:
             # Both people are shown, so there is no speaker to follow.
             pairs[a] = pair
@@ -686,7 +720,8 @@ def main():
         if base["end"] - base["start"] < 0.05:
             continue
         if a in pairs:
-            segments.append({**base, "offsetX": 0, "dual": pairs[a]})
+            framing = {"offsetX": 0, "dual": pairs[a]} if dual_mode else keep_pair_in_frame(pairs[a], kept)
+            segments.append({**base, **framing})
             continue
         if kept >= 0.98:
             # Already as narrow as the output: nothing to pan.

@@ -67,3 +67,22 @@ test("real FFmpeg: silent video still supplies frames and visual approval is enf
     assert.deepEqual(missing, [], "model approval cannot substitute for decoded frames");
   } finally { await rm(work, { recursive: true, force: true }); }
 });
+
+test("real FFmpeg: a quick silent screen change gets frames before, during and afterward", async () => {
+  const work = await mkdtemp(path.join(os.tmpdir(), "motion-evidence-test-"));
+  const ffmpeg = process.env.FFMPEG_PATH || "ffmpeg";
+  try {
+    const file = path.join(work, "quick-switch.mp4");
+    await promisify(execFile)(ffmpeg, ["-v", "error",
+      "-f", "lavfi", "-i", "color=black:size=320x180:rate=12:duration=4",
+      "-f", "lavfi", "-i", "color=white:size=320x180:rate=12:duration=0.5",
+      "-f", "lavfi", "-i", "color=black:size=320x180:rate=12:duration=3.5",
+      "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0",
+      "-c:v", "libx264", file]);
+    const evidence = await readMediaEvidence({ file, duration: 6, offset: 2, ffmpeg });
+    assert.deepEqual(evidence.sound, []);
+    assert.ok(evidence.motion.some(p => p.time >= 1.75 && p.time <= 2.5));
+    assert.ok(evidence.frames.some(f => f.time >= 2 && f.time < 2.45));
+    assert.ok(evidence.frames.some(f => f.time > 2.5 && f.time < 3));
+  } finally { await rm(work, { recursive: true, force: true }); }
+});
