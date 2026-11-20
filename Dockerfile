@@ -41,10 +41,11 @@ COPY client ./client
 COPY shared ./shared
 COPY server ./server
 COPY scripts ./scripts
+COPY tests ./tests
 COPY assets ./assets
 COPY drizzle ./drizzle
 COPY dist/index.js ./dist/index.js
-COPY vite.config.ts tsconfig.json drizzle.config.ts ./
+COPY vite.config.ts tsconfig.json drizzle.config.ts eslint.config.mjs ./
 
 RUN npm run build && install -d -o node -g node /app/.data
 

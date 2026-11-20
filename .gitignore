@@ -1,6 +1,7 @@
 .data/
 .env
 .venv/
+/node_modules/
 
 # Python bytecode written by the build check
 __pycache__/

@@ -5,6 +5,8 @@ import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { totalmem, tmpdir as systemTmpdir } from "os";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { registerSocialPublishing } from "../server/social-publishing.mjs";
@@ -18,7 +20,7 @@ import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
 import { GroqTranscriptionError, groqWords, speechProvider, transcriptionKeywords } from "../server/hosted-stt.mjs";
-import { readMediaEvidence, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
+import { readMediaEvidence, hostedAnalysisSlice, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, workerLink, workerTakesLinks, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile, streamStoredMedia } from "../server/object-storage.mjs";
 import { pipeline as nodePipeline } from "node:stream/promises";
@@ -2322,37 +2324,40 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       let visualWarning = "";
       if (video && !rankingMode) {
         try {
-          let file = !range && video.hostedStatus === "ready" && !(video.hostedOffset > 0) ? await ensureLocalMedia(video.hostedUrl) : null;
-          let info = file ? await probeMedia(file) : null;
-          let offset = 0;
-          // A clip preview starting at zero may still cover only a small part
-          // of the source. Do not mistake it for the full video.
-          if (info && video.duration > info.duration + 2) file = null;
-          if (range && video.sourceType === "url") {
+          let file = null;
+          let slice = null;
+          if (video.hostedStatus === "ready" && (video.hostedOffset ?? 0) <= sourceOffset) {
+            const hosted = await ensureLocalMedia(video.hostedUrl).catch(() => null);
+            const info = hosted ? await probeMedia(hosted).catch(() => null) : null;
+            slice = hostedAnalysisSlice(info?.duration, video.hostedOffset ?? 0, range, video.duration || input.videoDuration);
+            if (slice) file = hosted;
+          }
+          if (!file && range && video.sourceType === "url") {
             const selected = await withinBudget(openAnalysisRange(video.sourceUrl, range), 60000);
             file = selected.file;
-            info = { duration: selected.length };
-            offset = selected.offset;
+            slice = { duration: selected.length, offset: selected.offset };
           } else if (!range && !file && video.sourceType === "url") {
             /* Usually already downloaded, or nearly, while Whisper ran. */
             const full = await withinBudget(hostVideoShared({ videoId: analysisVideoKey(video.sourceUrl), sourceUrl: video.sourceUrl, maxHeight: 360, noWorker: true }), 60000);
             file = path5.join(VIDEOS_DIR, full.fileName);
-            info = full;
+            slice = { duration: full.duration, offset: 0 };
           }
           const ffmpeg = await findFfmpeg();
-          if (file && info?.duration > 0 && ffmpeg) {
-            const evidence = await readMediaEvidence({ file, duration: info.duration, offset, ffmpeg, peaks,
+          if (file && slice?.duration > 0 && ffmpeg) {
+            const evidence = await readMediaEvidence({ file, ...slice, ffmpeg, peaks,
               deadline: Math.min(deadline - 90000, Date.now() + 60000) });
-            if (evidence.frames.length >= 2) media = { ...evidence, file, duration: info.duration, offset, ffmpeg };
+            if (evidence.frames.length >= 2) media = { ...evidence, file, ...slice, ffmpeg };
           }
-          if (!media) visualWarning = "Visual analysis was unavailable. These suggestions use speech only.";
+          if (!media) visualWarning = "Video frames are unavailable. These suggestions use speech only.";
         } catch (error) {
           console.warn(`[AI] Visual evidence unavailable for video ${video.id}: ${String(error.message).slice(0, 160)}`);
-          visualWarning = "The video could not be opened for visual analysis. These suggestions use speech only.";
+          visualWarning = video.sourceType === "url" && youtubeSourceId(video.sourceUrl) && /not a bot|sign in to confirm/i.test(error.message)
+            ? "YouTube didn’t provide the video frames. These suggestions use speech only."
+            : "The video could not be opened for visual analysis. These suggestions use speech only.";
         }
       }
       if (!media && transcript.trim().length < 10) {
-        throw new TRPCError3({ code: "BAD_REQUEST", message: "No usable speech or video frames were available. Try uploading the original video, or choose clip times manually." });
+        throw new TRPCError3({ code: "PRECONDITION_FAILED", message: "No usable speech or video frames were available. Upload a video excerpt for visual analysis, or choose clip times manually." });
       }
       const languageRule = titleLanguageInstruction(input.titleLanguage, input.transcript);
       const messages = media ? [
@@ -2536,7 +2541,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           console.warn(`[AI] Extra highlight pass failed: ${String(error?.message ?? error).slice(0, 160)}`);
         }
       }
-      console.log(`[AI] Highlight candidates=${highlights.length} (parts=${parts.length}, fromParts=${fromParts.length}), supported=${supported.length}, verifiedVisual=${verified.length}, judged=${judged}, extra=${added}, selected=${ordered.length}, target=${targetCount}`);
+      console.log(`[AI] Highlight candidates=${highlights.length} (parts=${parts.length}, fromParts=${fromParts.length}), supported=${spoken.length + visual.length}, verifiedVisual=${verified.length}, judged=${judged}, extra=${added}, selected=${ordered.length}, target=${targetCount}`);
       if (ordered.length === 0) {
         throw new TRPCError3({
           code: "INTERNAL_SERVER_ERROR",
@@ -2554,6 +2559,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           endTime: Number(Math.min(range.end, clip.endTime + sourceOffset).toFixed(3)),
         })) : ordered,
         analysisMode: media ? "visual-and-speech" : "speech",
+        visualWarning: visualWarning || undefined,
         analysisNote: visualWarning || (media ? "Uses sampled video frames and speech. Fast action or audio-only musical changes can be missed; preview the selected clips." : ""),
         contentType: typeof parsed.contentType === "string" ? parsed.contentType.slice(0, 80) : "interview",
         reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : ordered[0].title),
@@ -2562,10 +2568,9 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         metadata: response.metadata
       };
     } catch (err) {
-      console.error("[AI] detectHighlights error:", err);
       if (err instanceof TRPCError3) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new TRPCError3({ code: "INTERNAL_SERVER_ERROR", message: `AI analysis failed: ${msg}` });
+      console.error("[AI] detectHighlights error:", err);
+      throw new TRPCError3({ code: "INTERNAL_SERVER_ERROR", message: "AI analysis couldn’t finish. Try again." });
     }
   }),
   /**
@@ -5933,4 +5938,11 @@ async function sweepAnalysisCopies(maxAgeMs = 4 * 60 * 60_000) {
   }
   if (removed) console.log(`[Media] Removed ${removed} old visual-analysis cop${removed === 1 ? "y" : "ies"}`);
 }
-startServer().catch(console.error);
+export { appRouter };
+
+if (process.argv[1] && fs7.existsSync(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startServer().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

@@ -6,6 +6,20 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
+/** Locate the requested source times inside a copy already held by the app. */
+export function hostedAnalysisSlice(fileDuration, hostedOffset, range, sourceDuration) {
+  if (!(Number.isFinite(fileDuration) && fileDuration > 0)) return null;
+  const start = range?.start ?? 0;
+  const end = range?.end ?? (Number.isFinite(sourceDuration) && sourceDuration > 0 ? sourceDuration : fileDuration);
+  const seek = start - hostedOffset;
+  const length = end - start;
+  // Whole-video metadata can be rounded. A selected range needs closer coverage.
+  const tolerance = range ? 0.2 : 2;
+  if (!Number.isFinite(seek) || seek < 0 || length <= 0 || seek + length > fileDuration + tolerance) return null;
+  const duration = Math.min(length, fileDuration - seek);
+  return duration > 0 ? { offset: seek, duration } : null;
+}
+
 /** Keep HTTP analysis below the platform request timeout. A shared import
  * may finish in the background and be reused on the next attempt. */
 export async function withinBudget(promise, milliseconds) {

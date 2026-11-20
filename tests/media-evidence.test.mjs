@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { audioPeaks, sampleTimes, readMediaEvidence, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
+import { audioPeaks, hostedAnalysisSlice, sampleTimes, readMediaEvidence, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
 import { clipCountFor, filterSpeechHighlights, snapHighlights } from "../server/highlights.mjs";
 
 test("short videos have room for more than two candidates", () => {
@@ -33,6 +33,14 @@ test("sampling includes the entire video and stays bounded", () => {
   assert.ok(times.at(-1) < 1001);
   assert.ok(times[0] < 30);
   assert.ok(times.length <= 64);
+});
+
+test("use a saved video only when it covers the requested source times", () => {
+  assert.deepEqual(hostedAnalysisSlice(90, 0, undefined, 90), { offset: 0, duration: 90 });
+  assert.deepEqual(hostedAnalysisSlice(30, 35, { start: 40, end: 60 }, 90), { offset: 5, duration: 20 });
+  assert.equal(hostedAnalysisSlice(30, 0, undefined, 90), null);
+  assert.equal(hostedAnalysisSlice(30, 35, { start: 20, end: 45 }, 90), null);
+  assert.equal(hostedAnalysisSlice(30, 35, { start: 40, end: 70 }, 90), null);
 });
 
 test("audio signals ignore silence and avoid adjacent duplicate peaks", () => {

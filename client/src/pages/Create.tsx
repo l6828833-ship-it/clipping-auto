@@ -56,7 +56,8 @@ type SubStyle = {
 };
 
 /** What highlight detection found for a video, and the title language it wrote in. */
-type Detected = { highlights: Highlight[]; reelTitle: string; language: string; analysisNote?: string; contentType?: string; requestedType?: string };
+type Detected = { highlights: Highlight[]; reelTitle: string; language: string; visualWarning?: string; contentType?: string; requestedType?: string };
+type UploadSource = { title: string; subtitlesOn: boolean };
 
 /** The video style a clip is exported in: the one chosen for the video, else the AI's pick for that clip. */
 function clipVideoStyle(clip: Highlight, layout: VideoLayout | null): VideoStyleId {
@@ -184,8 +185,9 @@ function StepBar({ current, onGo }: { current: Step; onGo: (s: Step) => void }) 
 }
 
 // ─── Step 1: Input with auto-extraction ──────────────────────────────────────
-function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
+function StepInput({ apiKey, layout, uploadSource, onLayoutChange, onNext }: {
   apiKey: string;
+  uploadSource?: UploadSource;
   /** Video style for every clip of this video; null lets the AI pick per clip. */
   layout: VideoLayout | null;
   onLayoutChange: (layout: VideoLayout | null) => void;
@@ -205,7 +207,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
    * Off skips speech-to-text and exports without burned-in captions. It can be
    * turned back on later from the clip's Subtitles panel.
    */
-  const [subtitlesOn, setSubtitlesOn] = useState(true);
+  const [subtitlesOn, setSubtitlesOn] = useState(uploadSource?.subtitlesOn ?? true);
   // Real word timings from the source caption track, when it had them.
   const [timedWords, setTimedWords] = useState<{ word: string; start: number; end: number }[]>([]);
   /**
@@ -216,9 +218,9 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
    */
   const [heatmap, setHeatmap] = useState<{ start: number; end: number; value: number }[]>([]);
   const [chapters, setChapters] = useState<{ start: number; end: number; title: string }[]>([]);
-  const [mode, setMode] = useState<"url"|"upload">("url");
+  const [mode, setMode] = useState<"url"|"upload">(uploadSource ? "upload" : "url");
   const [url, setUrl] = useState("");
-  const [title, setTitle] = useState("");
+  const [title, setTitle] = useState(uploadSource?.title ?? "");
   const [transcript, setTranscript] = useState("");
   const [language, setLanguage] = useState(() => {
     try { const saved = localStorage.getItem("clip-maker-speech-language"); return LANGUAGES.some(l => l.code === saved) ? saved! : "auto"; }
@@ -417,6 +419,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       });
       const result = await response.json().catch(() => null);
       if (!response.ok || !result?.id) {
+        if (response.status === 413) throw new Error("This file is too large to upload. Trim the part you want to analyze or choose a smaller file.");
         throw new Error(result?.error ?? "Upload failed. Check your connection and try again.");
       }
       void utils.videos.list.invalidate();
@@ -827,7 +830,7 @@ function ManualClipPicker({ videoTitle, videoDuration, onNext }: {
 function StepHighlights({
   videoId, layout, videoTitle, sourceTitle, channel, transcript, apiKey, model, videoDuration,
   transcriptWords, heatmap, chapters, titleLanguage, onTitleLanguageChange,
-  detected, onDetected, pickedIds, onNext, analysisRange
+  detected, onDetected, pickedIds, onNext, analysisRange, onUploadSource
 }: {
   videoId: number | null;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
@@ -849,6 +852,7 @@ function StepHighlights({
   /** Ids picked last time, when coming back to this step. */
   pickedIds: number[];
   analysisRange?: AnalysisRange;
+  onUploadSource?: () => void;
   onNext: (clips: Highlight[], reelTitle: string) => void
 }) {
   const [found, setFound] = useState<Detected | null>(detected);
@@ -867,7 +871,8 @@ function StepHighlights({
   const detect = trpc.gemini.detectHighlights.useMutation({
     onSuccess: (data) => {
       const next: Detected = { highlights: data.highlights, reelTitle: data.reelTitle, language: titleLanguage,
-        analysisNote: data.analysisNote, contentType: data.contentType, requestedType: contentType };
+        visualWarning: data.visualWarning ?? (data.analysisMode === "speech" ? data.analysisNote : undefined),
+        contentType: data.contentType, requestedType: contentType };
       setFound(next);
       onDetected(next);
       setReelTitle(data.reelTitle);
@@ -970,18 +975,35 @@ function StepHighlights({
         className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
         Choose Clip Manually
       </button>
+      {found?.visualWarning && !detect.isError && (
+        <div role="status" className="glass mb-5 rounded-2xl border border-border px-4 py-3">
+          <p className="text-sm text-foreground">{found.visualWarning}</p>
+          {onUploadSource && (
+            <button type="button" onClick={onUploadSource} className="mt-2 text-xs font-semibold text-primary underline underline-offset-4">
+              Upload a video excerpt
+            </button>
+          )}
+        </div>
+      )}
       {detect.isError && (
-        <div className="glass rounded-2xl p-5 mb-5 border border-destructive/30">
+        <div role="alert" className="glass rounded-2xl p-5 mb-5 border border-destructive/30">
           <div className="flex items-center gap-2 mb-2">
             <AlertCircle className="w-4 h-4 text-destructive" />
             <span className="text-sm font-semibold text-destructive">Analysis failed</span>
           </div>
           <p className="text-xs text-muted-foreground mb-3">{detect.error?.message}</p>
-          <button onClick={() => detect.mutate(detectInput)}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white transition-all hover:opacity-80"
-            style={{ background: "var(--cobalt)" }}>
-            <RefreshCw className="w-3.5 h-3.5" /> Retry
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <button type="button" onClick={() => detect.mutate(detectInput)}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white transition-all hover:opacity-80"
+              style={{ background: "var(--cobalt)" }}>
+              <RefreshCw className="w-3.5 h-3.5" /> Retry
+            </button>
+            {onUploadSource && detect.error?.data?.code === "PRECONDITION_FAILED" && (
+              <button type="button" onClick={onUploadSource} className="text-xs font-semibold text-primary underline underline-offset-4">
+                Upload a video excerpt
+              </button>
+            )}
+          </div>
         </div>
       )}
       {highlights.length > 0 && (
@@ -1906,6 +1928,7 @@ export default function CreatePage() {
   // Kept so later steps can actually show and render the video.
   const [videoId, setVideoId] = useState<number | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
+  const [uploadSource, setUploadSource] = useState<UploadSource>();
   const [analysisRange, setAnalysisRange] = useState<AnalysisRange>();
   const [selectedClips, setSelectedClips] = useState<Highlight[]>([]);
   /** Highlights found for this video, kept so going back to step 2 shows them again. */
@@ -1924,7 +1947,8 @@ export default function CreatePage() {
       <div className="max-w-4xl mx-auto">
         <StepBar current={step} onGo={s => setStep(s)} />
         {step === 1 && (
-          <StepInput apiKey={apiKey} layout={videoLayout} onLayoutChange={setVideoLayout} onNext={v => {
+          <StepInput apiKey={apiKey} layout={videoLayout} uploadSource={uploadSource} onLayoutChange={setVideoLayout} onNext={v => {
+            setUploadSource(undefined);
             setVideoId(v.videoId); setVideoUrl(v.url);
             setAnalysisRange(v.analysisRange);
             setVideoTitle(v.title); setTranscript(v.transcript); setVideoDuration(v.duration);
@@ -1947,6 +1971,10 @@ export default function CreatePage() {
             titleLanguage={titleLanguage} onTitleLanguageChange={setTitleLanguage}
             detected={detected} onDetected={setDetected}
             pickedIds={selectedClips.map(c => c.id)}
+            onUploadSource={videoUrl ? () => {
+              setUploadSource({ title: videoTitle, subtitlesOn: captionsOn });
+              setStep(1);
+            } : undefined}
             onNext={(clips, rt) => {
               setSelectedClips(clips);
               setReelTitle(rt);
