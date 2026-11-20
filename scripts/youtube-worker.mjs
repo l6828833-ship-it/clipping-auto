@@ -79,6 +79,7 @@ async function transcribeHere(id, audioPath, language, seconds = 0) {
   ], { timeout: Math.max(2_400_000, seconds * 2_000), maxBuffer: 16 * 1024 * 1024, env: {
     ...workerEnv, CLIP_MAKER_WHISPER_ACCELERATE: workerEnv.CLIP_MAKER_WHISPER_ACCELERATE ?? "1",
     CLIP_MAKER_WHISPER_PROGRESS: "1",
+    CLIP_MAKER_HOSTED_TEXT: "",
   } });
   let progressBuffer = "";
   subprocess.child.stderr?.setEncoding("utf8").on("data", chunk => {

@@ -308,6 +308,16 @@ button:active:not(:disabled) {
   to { opacity: 1; transform: scale(1); }
 }
 
+@keyframes clip-maker-logo-lift {
+  0%, 100% { transform: translateY(0) rotate(-4deg); }
+  50% { transform: translateY(-5px) rotate(4deg); }
+}
+
+@keyframes clip-maker-progress-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+
 /* Status badges */
 .status-pending { color: #9a6700; background: rgba(241, 203, 103, 0.2); }
 .status-processing { color: #315ef5; background: rgba(49, 94, 245, 0.1); }

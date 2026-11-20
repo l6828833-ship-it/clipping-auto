@@ -17,7 +17,7 @@ import { MAX_ANALYSIS_RANGE_SECONDS, wordsWithinRange } from "../shared/analysis
 import { registerReelRoutes } from "../server/reels.mjs";
 import { registerNativeYouTube } from "../server/native-youtube.mjs";
 import { readSupabaseAuthConfig, registerSupabaseAuth } from "../server/supabase-auth.mjs";
-import { hostedSttAvailable, hostedWords, hostedWordTimings, noteHostedFailure, transcriptionKeywords } from "../server/hosted-stt.mjs";
+import { GroqTranscriptionError, groqWords, speechProvider, transcriptionKeywords } from "../server/hosted-stt.mjs";
 import { readMediaEvidence, frameContent, MEDIA_EDITOR_RULES, verifyVisualHighlights, withinBudget } from "../server/media-evidence.mjs";
 import { downloadWithYouTubeWorker, registerYouTubeWorker, workerLink, workerTakesLinks, youtubeWorkerAlive } from "../server/youtube-worker.mjs";
 import { fetchToFile, removeStored, signedLink, storageEnabled, storedInfo, storeFile, streamStoredMedia } from "../server/object-storage.mjs";
@@ -1250,16 +1250,12 @@ function whisperThreads() {
   const cpus = Math.min(os2.availableParallelism?.() ?? os2.cpus().length, set > 0 ? set : process.env.K_SERVICE ? 4 : 8);
   return Math.max(1, Math.floor(cpus) - 1);
 }
-/* `hosted`: the text comes from the OpenAI API and the script only places the
- * words with the small "base" model (scripts/hosted_transcribe.py). That is
- * light, so it neither waits behind a long local transcription nor holds one
- * up. `keywords`: names from the title, for the API to spell right. */
-async function localWhisperWords(audioPath, language = "auto", signal, onProgress = () => {}, { hosted = false, keywords = [] } = {}) {
+async function localWhisperWords(audioPath, language = "auto", signal, onProgress = () => {}) {
   onProgress({ stage: "queued", progress: 0 });
   const run = async () => {
     signal?.throwIfAborted();
     onProgress({ stage: "transcribing", progress: 0 });
-    console.log(`[Whisper] Starting ${hosted ? "OpenAI" : "self-hosted"} transcription, language=${language}`);
+    console.log(`[Whisper] Starting self-hosted transcription, language=${language}`);
     const execution = promisify(execFile)(
       WHISPER_PYTHON, [WHISPER_SCRIPT, audioPath, language, WHISPER_MODEL],
       /* A source import passes `signal` and has its own watchdog (no
@@ -1274,7 +1270,7 @@ async function localWhisperWords(audioPath, language = "auto", signal, onProgres
            * Cloud Run shows the script 8 CPUs whatever the limit, so the
            * limit comes from CLIP_MAKER_CPUS (default 4 there). */
           WHISPER_THREADS: process.env.WHISPER_THREADS || String(whisperThreads()),
-          ...(hosted ? { CLIP_MAKER_HOSTED_TEXT: "openai", CLIP_MAKER_STT_KEYWORDS: keywords.join("\n") } : {})
+          CLIP_MAKER_HOSTED_TEXT: ""
         } }
     );
     let pending = "";
@@ -1290,46 +1286,31 @@ async function localWhisperWords(audioPath, language = "auto", signal, onProgres
     });
     return execution;
   };
-  const transcription = hosted ? run() : whisperQueue.then(run);
-  if (!hosted) whisperQueue = transcription.then(() => {}, () => {});
+  const transcription = whisperQueue.then(run);
+  whisperQueue = transcription.then(() => {}, () => {});
   const { stdout } = await transcription;
   const parsed = JSON.parse(stdout);
   const words = (Array.isArray(parsed.words) ? parsed.words : []).filter(
     (w) => w && typeof w.word === "string" && w.word.trim() && Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start
   ).map((w) => ({ word: w.word.trim(), start: w.start, end: w.end }));
-  console.log(`[Whisper] Finished ${hosted ? "OpenAI" : "self-hosted"} transcription (${parsed.model ?? WHISPER_MODEL}), ${words.length} timed words`);
+  console.log(`[Whisper] Finished self-hosted transcription (${parsed.model ?? WHISPER_MODEL}), ${words.length} timed words`);
   return { text: typeof parsed.text === "string" ? parsed.text.trim() : "", words, language: parsed.language };
 }
 async function transcribeWords(audioPath, language = "auto", signal, onProgress, { keywords = [] } = {}) {
   signal?.throwIfAborted();
-  /* Only when CLIP_MAKER_TRANSCRIBE=openai is set (and OPENAI_API_KEY):
-   * seconds instead of minutes, paid per minute of audio. Anything that goes
-   * wrong falls back to the local Whisper below. */
-  if (hostedSttAvailable() && !hostedWordTimings()) {
-    try {
-      return await localWhisperWords(audioPath, language, signal, onProgress, { hosted: true, keywords });
-    } catch (error) {
-      signal?.throwIfAborted();
-      const detail = String(error.stderr || error.message || error);
-      noteHostedFailure(/clip-maker-hosted-error:(\d+)/.exec(detail)?.[1]);
-      console.warn("[STT] OpenAI transcription failed, using local Whisper:", detail.replace(/clip-maker-hosted-error:\d+\s*/, "").slice(-300));
-    }
-  } else if (hostedSttAvailable()) {
-    try {
-      const hosted = await hostedWords({
-        audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir(), signal,
-        onProgress: onProgress ? (fraction) => onProgress({ stage: "transcribing", progress: Math.min(1, fraction) }) : void 0
-      });
-      if (hosted) {
-        console.log(`[STT] OpenAI transcription (${hosted.model}): ${hosted.words.length} words.`);
-        return { text: hosted.text, words: hosted.words };
-      }
-    } catch (error) {
-      signal?.throwIfAborted();
-      console.warn("[STT] OpenAI transcription failed, using local Whisper:", String(error.message ?? error).slice(0, 300));
-    }
+  if (speechProvider() !== "groq") return localWhisperWords(audioPath, language, signal, onProgress);
+  const progress = fraction => onProgress?.({ stage: "transcribing", progress: fraction });
+  progress(0);
+  try {
+    return await groqWords({
+      audioPath, language, ffmpeg: await findFfmpeg(), workDirectory: systemTmpdir(),
+      signal, keywords, onProgress: progress,
+    });
+  } catch (error) {
+    signal?.throwIfAborted();
+    console.warn("[STT] Groq transcription failed:", error.status ?? error.name);
+    throw error instanceof GroqTranscriptionError ? error : new GroqTranscriptionError();
   }
-  return localWhisperWords(audioPath, language, signal, onProgress);
 }
 var FFMPEG_MISSING = "ffmpeg is not installed on the server. Install it with `winget install Gyan.FFmpeg` (or your package manager) and restart the dev server.";
 function q(value) {
@@ -1606,7 +1587,8 @@ function cleanTimedWords(words) {
 
 /**
  * A selected part of a YouTube video, fetched by the download worker and,
- * unless CLIP_MAKER_WORKER_TRANSCRIBE=0 or the OpenAI speech API is set up,
+ * when local transcription is selected and CLIP_MAKER_WORKER_TRANSCRIBE is
+ * enabled,
  * transcribed on the worker's own machine. Returns the download (with
  * `rangeOffset`, the time its audio starts at), or null to use the server's
  * own path.
@@ -1622,7 +1604,7 @@ async function rangeAudioFromWorker(url, range, tmpDir, language, { signal, repo
   const videoId = youtubeSourceId(url);
   const link = videoId ? null : workerLink(url);
   if (!(videoId || (link && workerTakesLinks())) || !youtubeWorkerAlive()) return null;
-  const transcribe = process.env.CLIP_MAKER_WORKER_TRANSCRIBE !== "0" && !hostedSttAvailable();
+  const transcribe = process.env.CLIP_MAKER_WORKER_TRANSCRIBE !== "0" && speechProvider() === "local";
   /* Frames for visual analysis need the video too. The worker takes one job
    * at a time, so this queues behind the audio and is usually ready, or
    * nearly, when the highlights are chosen. */
@@ -1781,6 +1763,9 @@ async function transcribeSource(input, reportStage = () => {}, { signal, reportM
       return result("none", "", [], "Whisper didn’t detect speech in this video.");
     } catch (error) {
       signal?.throwIfAborted();
+      if (error instanceof GroqTranscriptionError) {
+        throw new TRPCError2({ code: "BAD_REQUEST", message: error.message });
+      }
       console.warn("[Extract] Local Whisper failed:", String(error.stderr || error.message).slice(0, 600));
       return result("none", "", [], "Local Whisper couldn’t transcribe this video. Try again with a shorter source or paste a transcript.");
     }

@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo, useEffect } from "react";
+import { useState, useRef, useMemo, useEffect, useLayoutEffect, useId } from "react";
 // (useRef/useEffect drive the one-shot import trigger in StepSubtitles)
 import AppLayout from "@/components/AppLayout";
 import ClipPreview from "@/components/ClipPreview";
@@ -101,16 +101,60 @@ const STAGE_LABELS: Record<Stage, string> = {
   "checking-captions": "Checking for YouTube captions…",
   downloading: "Downloading source audio…",
   queued: "Waiting for the current transcription to finish…",
-  transcribing: "Transcribing with local Whisper…",
+  transcribing: "Transcribing audio…",
   uploading: "Uploading and preparing your file…",
   saving: "Saving your video…",
   done: "Transcript ready!",
   error: "Extraction failed",
 };
-const STAGE_PROGRESS: Record<Stage, number> = {
-  idle: 0, "fetching-info": 15, "checking-captions": 35, downloading: 55,
-  queued: 60, transcribing: 75, uploading: 0, saving: 95, done: 100, error: 0,
-};
+function ProcessingScreen({ status, progress }: { status: string; progress?: number }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const headingId = useId();
+
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    dialog.showModal();
+    headingRef.current?.focus();
+    return () => dialog.close();
+  }, []);
+
+  const percent = progress != null && Number.isFinite(progress) && progress > 0
+    ? Math.min(100, Math.round(progress * 100))
+    : undefined;
+
+  return (
+    <dialog ref={dialogRef} aria-labelledby={headingId} onCancel={event => event.preventDefault()}
+      className="fixed inset-0 m-0 size-full max-h-none max-w-none bg-background text-foreground">
+      <div className="grid min-h-full place-items-center px-6 py-12"
+        style={{ background: "radial-gradient(ellipse at 50% 42%, color-mix(in oklab, var(--cobalt) 14%, transparent), transparent 55%)" }}>
+        <div className="w-full max-w-sm text-center">
+          <div aria-hidden="true" className="relative mx-auto mb-8 grid size-32 place-items-center">
+            <div className="absolute inset-0 rounded-full border border-primary/20" />
+            <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-primary motion-safe:animate-spin [animation-duration:2.4s]" />
+            <div className="absolute inset-2.5 rounded-full border border-primary/15" />
+            <div className="relative grid size-[4.5rem] place-items-center rounded-[1.4rem] text-white motion-safe:animate-[clip-maker-logo-lift_2.4s_ease-in-out_infinite]"
+              style={{ background: "linear-gradient(145deg, var(--cobalt), oklch(0.49 0.22 272))", boxShadow: "0 8px 30px color-mix(in oklab, var(--cobalt) 40%, transparent)" }}>
+              <Zap className="size-9" strokeWidth={2.2} />
+            </div>
+          </div>
+          <h2 ref={headingRef} id={headingId} tabIndex={-1} className="text-2xl font-black outline-none sm:text-3xl">
+            Processing your video
+          </h2>
+          <p role="status" className="mt-2 text-sm text-muted-foreground">{status}</p>
+          <div role="progressbar" aria-label="Processing progress" aria-valuenow={percent}
+            className="relative mx-auto mt-7 h-1.5 w-full max-w-56 overflow-hidden rounded-full bg-secondary">
+            {percent == null
+              ? <div className="h-full w-2/5 rounded-full bg-primary motion-safe:animate-[clip-maker-progress-sweep_1.8s_ease-in-out_infinite]" />
+              : <div className="h-full rounded-full bg-primary motion-safe:transition-[width] motion-safe:duration-500" style={{ width: `${percent}%` }} />}
+          </div>
+          {percent != null && <p aria-hidden="true" className="mt-2 text-xs tabular-nums text-muted-foreground">{percent}%</p>}
+        </div>
+      </div>
+    </dialog>
+  );
+}
 
 // ─── Step bar ─────────────────────────────────────────────────────────────────
 function StepBar({ current, onGo }: { current: Step; onGo: (s: Step) => void }) {
@@ -275,7 +319,6 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         // Still save the source so the next step can inspect its frames.
         toast.info(result.note || "No speech found. Continuing with visual analysis.");
       }
-      setStage("done");
       return found;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Video analysis failed.";
@@ -343,7 +386,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
 
   /*
    * The one button of this step. A link is read, transcribed and saved in one
-   * go, with the progress shown below, and the highlights are looked for as
+   * go, with the processing screen shown, and the highlights are looked for as
    * soon as the next step opens. An upload is sent and transcribed by the server.
    */
   const handleProceed = async () => {
@@ -390,7 +433,14 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
   };
 
   const isExtracting = stage !== "idle" && stage !== "done" && stage !== "error";
-  const progress = STAGE_PROGRESS[stage];
+  if (isExtracting) {
+    return <ProcessingScreen
+      status={stage === "downloading" && mode === "url" && limitAnalysis
+        ? "Downloading selected time range…"
+        : STAGE_LABELS[stage]}
+      progress={stage === "transcribing" ? transcriptionProgress : undefined}
+    />;
+  }
 
   return (
     /* "backwards", not the class's "both": a transform left on this element
@@ -416,7 +466,6 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         type="button"
         role="switch"
         aria-checked={subtitlesOn}
-        disabled={isExtracting}
         onClick={() => { setSubtitlesOn(v => !v); setStage("idle"); setTranscript(""); setTimedWords([]); }}
         className="w-full glass rounded-2xl p-4 mb-5 flex items-center gap-3 text-left transition-colors hover:bg-secondary/30">
         <Captions className="w-5 h-5 shrink-0" style={{ color: subtitlesOn ? "var(--coral)" : "var(--muted-foreground)" }} />
@@ -437,7 +486,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
       {/* Mode toggle */}
       <div className="flex gap-2 p-1 rounded-xl bg-secondary/40 mb-6 w-fit">
         {(["url","upload"] as const).map(m => (
-          <button key={m} disabled={isExtracting} onClick={() => { setMode(m); setStage("idle"); setTranscript(""); setTimedWords([]); setVideoMeta(null); setHeatmap([]); setChapters([]); }}
+          <button key={m} onClick={() => { setMode(m); setStage("idle"); setTranscript(""); setTimedWords([]); setVideoMeta(null); setHeatmap([]); setChapters([]); }}
             className={`flex items-center gap-2 px-5 py-2 rounded-lg text-sm font-semibold transition-all duration-200 ${mode === m ? "text-white" : "text-muted-foreground hover:text-foreground"}`}
             style={mode === m ? { background: "var(--cobalt)" } : {}}>
             {m === "url" ? <Link2 className="w-4 h-4" /> : <Upload className="w-4 h-4" />}
@@ -454,13 +503,13 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
             <div className="flex gap-2">
               <div className="relative flex-1">
                 <Youtube className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                <input type="url" value={url} disabled={isExtracting} onChange={e => { setUrl(e.target.value); setStage("idle"); setTranscript(""); setTimedWords([]); setVideoMeta(null); setHeatmap([]); setChapters([]); }}
+                <input type="url" value={url} onChange={e => { setUrl(e.target.value); setStage("idle"); setTranscript(""); setTimedWords([]); setVideoMeta(null); setHeatmap([]); setChapters([]); }}
                   placeholder="https://youtube.com/watch?v=... or any video URL"
                   className="w-full pl-10 pr-4 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm" />
               </div>
               {/* Language picker */}
               <div className="relative">
-                <button onClick={() => setShowLangPicker(v => !v)} disabled={isExtracting}
+                <button onClick={() => setShowLangPicker(v => !v)}
                   className="flex items-center gap-1.5 px-3 py-3 rounded-xl bg-secondary/60 hover:bg-secondary text-sm font-semibold text-foreground transition-colors whitespace-nowrap">
                   <Globe2 className="w-4 h-4" />
                   {LANGUAGES.find(l => l.code === language)?.label ?? language}
@@ -488,7 +537,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
             </div>
             <p className="text-xs text-muted-foreground">Supports YouTube, Vimeo, Twitter/X, TikTok, direct MP4 links, and 1000+ sites via yt-dlp.</p>
             <p className="text-xs text-muted-foreground">For Moroccan videos, select Moroccan Darija. Auto-detect identifies Arabic but cannot reliably identify the dialect.</p>
-            <fieldset disabled={isExtracting} className="space-y-2 rounded-xl border border-border px-3 py-3">
+            <fieldset className="space-y-2 rounded-xl border border-border px-3 py-3">
               <legend className="px-1 text-sm font-semibold">Analyze</legend>
               <div className="flex flex-wrap gap-4 text-sm">
                 <label className="flex items-center gap-2">
@@ -512,7 +561,6 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
                   {/* Watch the video and pick the part, in the browser: the
                    * server downloads nothing until Continue. */}
                   <RangePicker url={url} start={rangeFrom} end={rangeTo} maxLength={MAX_ANALYSIS_RANGE_SECONDS}
-                    disabled={isExtracting}
                     onDuration={(seconds) => setSourceLength({ url: url.trim(), seconds })}
                     onChange={(from, to) => { setRangeStart(fmt(from)); setRangeEnd(fmt(to)); resetRangeResult(); }} />
                   <div className="grid grid-cols-2 gap-3">
@@ -543,18 +591,18 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
             <div
               onDragOver={e => { e.preventDefault(); setDragOver(true); }}
               onDragLeave={() => setDragOver(false)}
-              onDrop={e => { e.preventDefault(); setDragOver(false); if (!isExtracting && e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]); }}
-              onClick={() => { if (!isExtracting) fileRef.current?.click(); }}
+              onDrop={e => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]); }}
+              onClick={() => fileRef.current?.click()}
               className={`relative flex flex-col items-center justify-center gap-3 p-8 rounded-2xl border-2 border-dashed cursor-pointer transition-all duration-200 ${dragOver ? "border-primary bg-primary/5" : "border-border hover:border-primary/50 hover:bg-secondary/30"}`}>
               <input ref={fileRef} type="file" accept="video/*,audio/*" className="hidden"
-                aria-label="Video or audio file" disabled={isExtracting}
+                aria-label="Video or audio file"
                 onChange={e => { const f = e.target.files?.[0]; if (f) selectFile(f); e.target.value = ""; }} />
               {file ? (
                 <>
                   <CheckCircle2 className="w-8 h-8" style={{ color: "var(--mint)" }} />
                   <p className="text-sm font-semibold text-foreground">{file.name}</p>
                   <p className="text-xs text-muted-foreground">{(file.size / (1024*1024)).toFixed(1)} MB</p>
-                  <button type="button" aria-label="Remove selected file" disabled={isExtracting} onClick={e => { e.stopPropagation(); selectFile(null); }}
+                  <button type="button" aria-label="Remove selected file" onClick={e => { e.stopPropagation(); selectFile(null); }}
                     className="absolute top-3 right-3 p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"><X className="w-4 h-4" /></button>
                 </>
               ) : (
@@ -569,7 +617,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
             {subtitlesOn && (
               <label className="flex items-center gap-3 text-sm font-medium">
                 Caption language
-                <select value={language} onChange={e => setLanguage(e.target.value)} disabled={isExtracting}
+                <select value={language} onChange={e => setLanguage(e.target.value)}
                   className="rounded-lg border border-border bg-input px-3 py-2">
                   {LANGUAGES.map(option => <option key={option.code} value={option.code}>{option.label}</option>)}
                 </select>
@@ -578,44 +626,9 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
           </div>
         )}
 
-        {/* Progress bar */}
-        {isExtracting && (
-          <div className="glass rounded-2xl p-5 space-y-3">
-            <div className="flex items-center gap-3">
-              <Loader2 className="w-4 h-4 animate-spin shrink-0" style={{ color: "var(--cobalt)" }} />
-              <span className="text-sm font-semibold text-foreground">{stage === "downloading" && mode === "url" && limitAnalysis ? "Downloading selected time range…" : STAGE_LABELS[stage]}{stage === "transcribing" && transcriptionProgress > 0 ? ` ${Math.round(transcriptionProgress * 100)}%` : ""}</span>
-            </div>
-            {stage !== "uploading" && <><div className="h-2 rounded-full bg-secondary overflow-hidden">
-              <div className="h-full rounded-full transition-all duration-700"
-                style={{ width: `${stage === "transcribing" ? 60 + transcriptionProgress * 35 : progress}%`, background: "linear-gradient(90deg, var(--cobalt), var(--coral))" }} />
-            </div>
-            <div className="flex items-center gap-4 text-xs text-muted-foreground">
-              {[
-                { s: "checking-captions", label: "Captions" },
-                { s: "downloading", label: "Audio" },
-                { s: "transcribing", label: "Transcribe" },
-              ].map(({ s, label }) => {
-                const stageOrder = ["checking-captions", "downloading", "transcribing", "saving", "done"];
-                const currentIdx = stageOrder.indexOf(stage);
-                const thisIdx = stageOrder.indexOf(s);
-                const done = currentIdx > thisIdx;
-                const active = currentIdx === thisIdx;
-                return (
-                  <div key={s} className="flex items-center gap-1">
-                    {done ? <CheckCircle2 className="w-3 h-3" style={{ color: "var(--mint)" }} />
-                      : active ? <Loader2 className="w-3 h-3 animate-spin" style={{ color: "var(--cobalt)" }} />
-                      : <div className="w-3 h-3 rounded-full border border-border" />}
-                    <span className={done ? "" : active ? "text-foreground font-medium" : ""}>{label}</span>
-                  </div>
-                );
-              })}
-            </div></>}
-          </div>
-        )}
-
         {/* Error state */}
         {stage === "error" && stageError && (
-          <div className="glass rounded-2xl p-4 border border-destructive/30">
+          <div role="alert" className="glass rounded-2xl p-4 border border-destructive/30">
             <div className="flex items-center gap-2 mb-1">
               <AlertCircle className="w-4 h-4 text-destructive" />
               <span className="text-sm font-semibold text-destructive">
@@ -685,7 +698,7 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
           <label className="text-sm font-medium text-foreground">
             Video Title{mode === "url" && <span className="font-normal text-muted-foreground"> (optional)</span>}
           </label>
-          <input type="text" value={title} disabled={isExtracting} maxLength={512} onChange={e => setTitle(e.target.value)}
+          <input type="text" value={title} maxLength={512} onChange={e => setTitle(e.target.value)}
             placeholder={videoMeta?.title ?? (mode === "url" ? "Leave empty to use the video’s own title" : "e.g. Top 5 Moments from My Podcast")}
             className="w-full px-4 py-3 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all text-sm" />
         </div>
@@ -693,12 +706,10 @@ function StepInput({ apiKey, layout, onLayoutChange, onNext }: {
         {/* The one button: read, transcribe and save, then on to the highlights. */}
         <button
           onClick={handleProceed}
-          disabled={isExtracting || createVideo.isPending || (mode === "upload" ? !file || !title.trim() : !url.trim() || (limitAnalysis && !requestedRange))}
+          disabled={createVideo.isPending || (mode === "upload" ? !file || !title.trim() : !url.trim() || (limitAnalysis && !requestedRange))}
           className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm text-white transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed glow-blue"
           style={{ background: "linear-gradient(135deg, var(--cobalt), oklch(0.55 0.22 270))" }}>
-          {isExtracting || createVideo.isPending
-            ? <><Loader2 className="w-4 h-4 animate-spin" /> {stage === "uploading" ? "Preparing upload…" : STAGE_LABELS[stage] || "Saving…"}</>
-            : stage === "error" && mode === "url"
+          {stage === "error" && mode === "url"
               ? <><RefreshCw className="w-4 h-4" /> Try again</>
               : <><ArrowRight className="w-4 h-4" /> {mode === "upload" ? "Upload & Continue" : "Continue"}</>}
         </button>
@@ -935,6 +946,7 @@ function StepHighlights({
       />
     );
   }
+  if (analysing) return <ProcessingScreen status="Finding the best moments…" />;
 
   return (
     <div className="max-w-2xl mx-auto animate-slide-up">
@@ -945,7 +957,7 @@ function StepHighlights({
       </div>
       <label className="mb-4 block text-sm font-semibold text-foreground">
         Highlight title language
-        <select value={titleLanguage} disabled={analysing}
+        <select value={titleLanguage}
           onChange={event => onTitleLanguageChange(event.target.value)}
           className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
           {LANGUAGES.map(({ code, label }) => (
@@ -958,18 +970,6 @@ function StepHighlights({
         className="mb-4 rounded-lg border border-border px-4 py-2 text-sm font-semibold">
         Choose Clip Manually
       </button>
-      {analysing && (
-        <div className="glass rounded-2xl p-8 mb-6 text-center">
-          <div className="flex justify-center gap-1 mb-4">
-            {[0,1,2,3,4].map(i => (
-              <div key={i} className="w-1.5 rounded-full animate-pulse"
-                style={{ height:`${20+i*8}px`, background:"var(--cobalt)", animationDelay:`${i*0.1}s` }} />
-            ))}
-          </div>
-          <p className="text-sm font-semibold text-foreground mb-1">Finding the best moments…</p>
-          <p className="text-xs text-muted-foreground">Preparing video frames, reading the transcript and checking candidate clips. Long videos take longer to download and inspect.</p>
-        </div>
-      )}
       {detect.isError && (
         <div className="glass rounded-2xl p-5 mb-5 border border-destructive/30">
           <div className="flex items-center gap-2 mb-2">
@@ -1013,9 +1013,10 @@ function StepHighlights({
                         <span dir="auto" className="text-sm font-bold text-foreground" style={{ fontFamily: "Montserrat, sans-serif" }}>{h.title}</span>
                         <span className="text-xs font-black px-2 py-0.5 rounded-full shrink-0" style={{ color, background: `${color}22` }}>{h.engagementScore}</span>
                       </div>
-                      <div className="flex items-center gap-3 text-xs text-muted-foreground mb-2">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground mb-2">
                         <span className="flex items-center gap-1"><Clock className="w-3 h-3" />{fmt(h.startTime)}–{fmt(h.endTime)}</span>
                         <span>{Math.round(h.endTime - h.startTime)}s</span>
+                        <span>{VIDEO_STYLES[clipVideoStyle(h, layout)].label}</span>
                       </div>
                       <p dir="auto" className="text-xs text-muted-foreground italic">{h.reason}</p>
                       <div className="mt-2 h-1 rounded-full bg-secondary overflow-hidden">
@@ -1668,7 +1669,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
           /* The AI's "normal" saves no style, so the export may still pick
            * Facecam + Gameplay by itself when the clip shows a facecam. */
           const wanted: VideoLayout | null = layout
-            ?? (h.montage && h.montage !== "normal" && (AI_VIDEO_STYLES as string[]).includes(h.montage) ? { style: h.montage as VideoStyleId } : null);
+            ?? (clipVideoStyle(h, null) !== "normal" ? { style: clipVideoStyle(h, null) } : null);
           let id = found?.id;
           if (id == null) {
             ({ id } = await patiently(() => createClip.mutateAsync({

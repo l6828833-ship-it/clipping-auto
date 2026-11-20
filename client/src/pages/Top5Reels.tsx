@@ -467,7 +467,7 @@ export default function Top5ReelsPage() {
         url: entry.url.trim(),
         language: entry.language || "auto",
         allowSpeechToText: true,
-      }, stage => patchRank(rank, { analysisProgress: stage === "queued" ? "Waiting for Whisper…" : stage === "transcribing" ? "Transcribing with local Whisper…" : "Preparing source audio…" }));
+      }, stage => patchRank(rank, { analysisProgress: stage === "queued" ? "Waiting to transcribe…" : stage === "transcribing" ? "Transcribing audio…" : "Preparing source audio…" }));
       const sourceTitle = source.title || `Rank ${rank} source`;
       const transcript = String(source.transcript || "").trim();
       if (transcript.length < 10) {

@@ -37,7 +37,7 @@ export function VideoStylePicker({ value, onChange, excludeVideoId, disabled, al
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5">
-        {allowAuto && card("auto", "auto", "AI chooses", "Best style for each clip", auto, () => onChange(null))}
+        {allowAuto && card("auto", "auto", "Auto", "AI picks a style for each clip", auto, () => onChange(null))}
         {VIDEO_STYLE_IDS.map(id =>
           card(id, id, VIDEO_STYLES[id].label, VIDEO_STYLES[id].hint, !auto && style === id,
             () => onChange({ style: id, backgroundVideoId: value?.backgroundVideoId ?? null })))}
