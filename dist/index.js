@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { registerMediaUpload } from "../server/media-upload.mjs";
 import { registerSocialPublishing } from "../server/social-publishing.mjs";
 import { facePanelCrop, gamingPanelFilter, gamingSplitPlan, montageCaptionStyle, montageFilters, planSplit, splitKind } from "../server/montage.mjs";
-import { AI_VIDEO_STYLES, OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS } from "../shared/video-styles.mjs";
+import { AI_VIDEO_STYLES, OWNABLE_CAPTION_FIELDS, VIDEO_STYLES, VIDEO_STYLE_IDS, allowsAutoGaming } from "../shared/video-styles.mjs";
 import { cutSeconds, detectCuts, keepExpression, normaliseCuts, shiftTimed } from "../server/cuts.mjs";
 import { buildClipStylePrompt, buildHighlightPrompts, buildJudgePrompt, clipCountFor, countOnPeaks, detectTextLanguage, filterSpeechHighlights, formatTimedTranscript, replayPeaks, snapHighlights, transcriptLines, transcriptWindows } from "../server/highlights.mjs";
 import { buildAssFile, cleanWord, DEFAULT_CAPTION_STYLE, CAPTION_PRESET_IDS } from "../shared/captions.mjs";
@@ -2246,6 +2246,7 @@ async function selectClipStyles(clips, lines, deadline) {
     }
   }
   return suggested.map(clip => {
+    if (clip.montage === "gaming" && clip.evidence === "visual") return clip;
     const style = choices.get(clip.id);
     const reviewed = style === "gaming" && clip.montage !== "gaming" ? undefined : style;
     const original = !uniform || !needsReview || choices.size > 0 ? clip.montage : undefined;
@@ -4983,8 +4984,7 @@ var appRouter = router({
       if (known) return known;
       try {
         const result = await detectFraming(section.path, input.startTime - section.offset, duration, mode);
-        /* A clip with no style chosen is exported as Facecam + Gameplay when
-         * it has a facecam (see clips.render); the preview needs that plan. */
+        /* The preview uses this same plan when Auto finds a facecam. */
         const autoGaming = !mode && result.gamingTimeline ? gamingFraming(result) : null;
         const answer = {
           found: result.found,
@@ -5071,18 +5071,16 @@ var appRouter = router({
       startTime: z4.number(),
       endTime: z4.number(),
       engagementScore: z4.number().optional(),
-      /** Video style suggested by the AI for this clip. */
-      style: z4.enum(VIDEO_STYLE_IDS).optional()
+      style: z4.enum(VIDEO_STYLE_IDS).optional(),
+      autoStyle: z4.literal(true).optional()
     })).mutation(async ({ input, ctx }) => {
       if (!await getVideoById(input.videoId, ctx.user.id)) {
         throw new TRPCError5({ code: "NOT_FOUND", message: "Video not found" });
       }
-      const { style, ...fields } = input;
+      const { style, autoStyle, ...fields } = input;
       const id = await createClip({
         ...fields, userId: ctx.user.id, status: "pending",
-        /* Kept even for "normal": a style chosen by hand. No style means
-         * the automatic choice (Facecam + Gameplay for a game stream). */
-        ...(style ? { layout: { style } } : {})
+        ...(style ? { layout: { style, ...(autoStyle ? { auto: true } : {}) } } : {})
       });
       return { id };
     }),
@@ -5098,7 +5096,8 @@ var appRouter = router({
       /** Video style and, for split-screen styles, the lower-panel video. */
       layout: z4.object({
         style: z4.enum(VIDEO_STYLE_IDS),
-        backgroundVideoId: z4.number().nullish()
+        backgroundVideoId: z4.number().nullish(),
+        auto: z4.literal(true).optional()
       }).nullish(),
       // Reframing set by dragging/zooming the preview.
       zoom: z4.number().min(0.1).max(10).optional(),
@@ -5175,9 +5174,7 @@ var appRouter = router({
         ...input.barColor !== void 0 ? { barColor: input.barColor } : {},
         ...input.textOverlays !== void 0 ? { textOverlays: input.textOverlays } : {},
         ...input.captionsEnabled !== void 0 ? { captionsEnabled: input.captionsEnabled } : {},
-        /* "Normal" chosen by hand is kept, so a game stream is not switched
-         * to Facecam + Gameplay automatically; no layout at all means the
-         * automatic choice. */
+        /* Keep the Auto flag so framing can refine the saved recommendation. */
         ...input.layout !== void 0 ? { layout: input.layout ?? null } : {},
         ...(captionsChanged || layoutChanged) && clip.status === "done" ? { status: "pending", downloadUrl: null, errorMessage: null } : {},
         // An empty array means "no timeline", stored as null.
@@ -5333,19 +5330,16 @@ var appRouter = router({
           let framingSegments = clip.framingSegments;
           const untouched = (!Array.isArray(framingSegments) || framingSegments.length === 0)
             && crop.zoom === 1 && crop.offsetX === 0 && crop.offsetY === 0;
-          /* Dual Speaker has already framed every shot itself. */
-          if (untouched && !layout?.segments && renderProfile === "standard" && process.env.CLIP_MAKER_AUTO_REFRAME !== "0") {
+          const checkAutoGaming = allowsAutoGaming(clip.layout) && (clip.layout?.auto === true || untouched);
+          /* Split styles with a framing plan have already analysed the clip. */
+          if ((untouched || checkAutoGaming) && !layout?.segments && renderProfile === "standard" && process.env.CLIP_MAKER_AUTO_REFRAME !== "0") {
             try {
               const auto = await detectFraming(actualHostedPath, clip.startTime - actualHostedOffset, clip.endTime - clip.startTime);
-              /* A game stream with a facecam, in a clip nobody chose a style
-               * for: Facecam + Gameplay. Normal framing slid between the
-               * game and the small face in the corner. Choosing "Normal"
-               * by hand keeps it normal (it is then saved, not null). */
-              const autoGaming = !clip.layout && auto.gamingTimeline ? gamingFraming(auto) : null;
+              const autoGaming = checkAutoGaming && auto.gamingTimeline ? gamingFraming(auto) : null;
               if (autoGaming?.found) {
                 layout = { style: "gaming", gaming: autoGaming.gaming, segments: autoGaming.segments };
                 console.log(`[Render] Clip ${clip.id}: facecam found, rendering as Facecam + Gameplay.`);
-              } else if (auto.found) {
+              } else if (untouched && auto.found) {
                 framingSegments = auto.segments;
                 await updateClip(clip.id, { framingSegments });
                 console.log(`[Render] Clip ${clip.id}: auto-reframed across ${auto.shots} shot(s).`);

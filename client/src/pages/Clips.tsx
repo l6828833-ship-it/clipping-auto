@@ -17,7 +17,7 @@ import {
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import VideoStylePicker from "@/components/VideoStylePicker";
-import { montageCaptionStyle, punchIns, type GamingSplit, type VideoLayout } from "@shared/video-styles.mjs";
+import { allowsAutoGaming, montageCaptionStyle, punchIns, type GamingSplit, type VideoLayout } from "@shared/video-styles.mjs";
 import {
   youTubeThumbnail,
   youTubeWatchUrl,
@@ -214,9 +214,9 @@ function ClipEditorModal({
   const [layout, setLayout] = useState<VideoLayout | null>((clip.layout as VideoLayout | null) ?? null);
   const saveLayout = trpc.clips.update.useMutation({ onError: (err: { message: string }) => toast.error(err.message) });
   const chooseLayout = (next: VideoLayout | null) => {
-    if (!next) return;
-    setLayout(next);
-    saveLayout.mutate({ id: clip.id, layout: next });
+    const chosen: VideoLayout = next ?? (layout?.auto ? layout : { style: "normal", auto: true });
+    setLayout(chosen);
+    saveLayout.mutate({ id: clip.id, layout: chosen });
   };
   /** Jump cuts: the server finds pauses and filler sounds from the word timings. */
   const tighten = trpc.clips.tighten.useMutation({
@@ -274,9 +274,6 @@ function ClipEditorModal({
     ...DEFAULT_SUBTITLE_STYLE,
     ...((savedSubtitle?.style as Partial<SubtitleStyle> | null) ?? {}),
   };
-  /* What the chosen video style does to the captions at render time, so the
-   * preview shows the same design. The saved style itself is left alone. */
-  const shownCaptionStyle = montageCaptionStyle(layout?.style, captionStyle) as SubtitleStyle;
   const captionWords = useMemo(
     () => previewWordsFor(video?.transcript ?? "", clip.startTime, []),
     [video?.transcript, clip.startTime]
@@ -327,27 +324,6 @@ function ClipEditorModal({
       .map(w => ({ ...w, start: w.start - clipStartAbs, end: w.end - clipStartAbs }))
       .filter(w => w.end > 0 && w.start < length);
   }, [timelineWords, storedWords, video?.transcriptWords, clip.endTime, clipStartAbs]);
-
-  /**
-   * Only the caption belonging at the playhead.
-   *
-   * The overlay draws every word it is handed, so passing a whole clip's worth
-   * stacked the transcript on top of the frame. The renderer shows one word at a
-   * time, so the preview matches it. Falls back to the transcript sample when
-   * there are no real word timings to place.
-   *
-   * When the playhead sits between words (or before/after all words), we show
-   * the most-recent word that has already started — this prevents "nothing" from
-   * appearing when the video is paused between subtitle events.
-   */
-  const visibleCaption = useMemo(() => {
-    if (effectiveWords.length > 0) {
-      // The line the renderer would show at the playhead, in the chosen design.
-      const frame = captionFrame(effectiveWords, shownCaptionStyle, playhead);
-      return frame ? { words: frame.words, activeIndex: frame.activeIndex, wordIndex: frame.anchorIndex } : null;
-    }
-    return captionWords.length > 0 ? { words: captionWords, activeIndex: 0, wordIndex: -1 } : null;
-  }, [effectiveWords, playhead, captionWords, shownCaptionStyle.preset, shownCaptionStyle.fontSize, shownCaptionStyle.uppercase]);
 
   const validRange = previewRange.end > previewRange.start;
   const sectionInput = {
@@ -406,17 +382,39 @@ function ClipEditorModal({
   /* Dual Speaker: which shots have two people, and the crop for each half.
    * The export frames every shot of this style itself, so its preview uses
    * that plan too rather than the manual framing. */
-  /* With no style chosen, the export uses Facecam + Gameplay when the clip
-   * shows a facecam, so the preview asks for the automatic plan as well. */
   const splitStyle = layout?.style === "gaming" ? "gaming" : layout?.style === "dual" ? "dual" : undefined;
+  const checkAutoGaming = allowsAutoGaming(layout);
+  const canCheckFraming = (!!splitStyle || checkAutoGaming) && !!video && hostedStatus === "ready" && validRange;
   const { data: splitPlan, isPending: splitPending } = trpc.videos.previewFraming.useQuery(
     { id: video?.id ?? 0, startTime: previewRange.start, endTime: previewRange.end, ...(splitStyle ? { style: splitStyle } : {}) },
-    { enabled: (!!splitStyle || !layout) && !!video && hostedStatus === "ready" && validRange, staleTime: Infinity },
+    { enabled: canCheckFraming, staleTime: Infinity },
   );
   const answer = splitPlan as { gaming?: GamingSplit; segments?: PlanSegment[]; autoGaming?: { gaming: GamingSplit; segments: PlanSegment[] } } | undefined;
-  const waitingForGaming = splitStyle === "gaming" && hostedStatus === "ready" && validRange && splitPending;
-  const autoGaming = !layout ? answer?.autoGaming : undefined;
-  const shownStyle = autoGaming ? "gaming" : layout?.style ?? "normal";
+  const waitingForFraming = canCheckFraming && splitPending && (checkAutoGaming || splitStyle === "gaming");
+  const autoGaming = checkAutoGaming ? answer?.autoGaming : undefined;
+  const shownStyle = autoGaming ? "gaming" : splitStyle === "gaming" && answer && !answer.gaming ? "normal" : layout?.style ?? "normal";
+  const shownCaptionStyle = montageCaptionStyle(shownStyle, captionStyle) as SubtitleStyle;
+  /**
+   * Only the caption belonging at the playhead.
+   *
+   * The overlay draws every word it is handed, so passing a whole clip's worth
+   * stacked the transcript on top of the frame. The renderer shows one word at a
+   * time, so the preview matches it. Falls back to the transcript sample when
+   * there are no real word timings to place.
+   *
+   * When the playhead sits between words (or before/after all words), we show
+   * the most-recent word that has already started — this prevents "nothing" from
+   * appearing when the video is paused between subtitle events.
+   */
+  const visibleCaption = useMemo(() => {
+    if (effectiveWords.length > 0) {
+      // The line the renderer would show at the playhead, in the chosen design.
+      const frame = captionFrame(effectiveWords, shownCaptionStyle, playhead);
+      return frame ? { words: frame.words, activeIndex: frame.activeIndex, wordIndex: frame.anchorIndex } : null;
+    }
+    return captionWords.length > 0 ? { words: captionWords, activeIndex: 0, wordIndex: -1 } : null;
+  }, [effectiveWords, playhead, captionWords, shownCaptionStyle.preset, shownCaptionStyle.fontSize, shownCaptionStyle.uppercase]);
+
   const plan = autoGaming ? autoGaming.segments
     : splitStyle ? (answer?.segments ?? []) : [];
   const planIndex = plan.length ? segmentAt(plan, playhead) : undefined;
@@ -435,7 +433,7 @@ function ClipEditorModal({
   const valid = end > start;
   const isRendered = !!clip.downloadUrl && clip.downloadUrl !== "#";
   const rendering = clip.status === "rendering";
-  const canRender = valid && hostedStatus === "ready" && !rendering && !render.isPending && !update.isPending;
+  const canRender = valid && hostedStatus === "ready" && !rendering && !render.isPending && !update.isPending && !saveLayout.isPending;
 
   // Persist edits, then render from the saved values.
   /**
@@ -584,10 +582,10 @@ function ClipEditorModal({
         <div className="grid gap-5 md:grid-cols-[320px_1fr]">
           {/* Live player — 9:16 */}
           <div className="mx-auto w-full" style={{ maxWidth: "320px" }}>
-            {waitingForGaming ? (
+            {waitingForFraming ? (
               <div role="status" className="grid aspect-[9/16] place-content-center rounded-2xl bg-black text-center text-sm text-white">
                 <Loader2 aria-hidden="true" className="mx-auto mb-2 size-5 motion-safe:animate-spin" />
-                Preparing facecam and gameplay…
+                Checking clip framing…
               </div>
             ) : hostedStatus === "ready" && hostedUrl ? (
               <>
@@ -895,7 +893,7 @@ function ClipEditorModal({
 
             <div className="rounded-2xl border border-border p-4">
               <p className="text-sm font-semibold text-foreground mb-2">Video style</p>
-              <VideoStylePicker value={layout} onChange={chooseLayout} excludeVideoId={video?.id} />
+              <VideoStylePicker value={layout} onChange={chooseLayout} excludeVideoId={video?.id} allowAuto />
             </div>
 
             {/* Undo / Redo */}

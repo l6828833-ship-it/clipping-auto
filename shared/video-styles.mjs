@@ -21,6 +21,11 @@ export const VIDEO_STYLE_IDS = Object.keys(VIDEO_STYLES);
 /** Styles the AI may suggest: the ones that need nothing but the clip itself. */
 export const AI_VIDEO_STYLES = ["normal", "dynamic", "podcast", "cinematic", "viral", "gaming"];
 
+/** A suggested style can be refined when framing finds a facecam. */
+export function allowsAutoGaming(layout) {
+  return !layout || layout.auto === true;
+}
+
 /**
  * Caption settings a person can choose. The video styles below change some of
  * them; a setting listed in the caption style's `own` was chosen by hand and

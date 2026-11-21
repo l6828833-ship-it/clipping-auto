@@ -17,7 +17,7 @@ export function VideoStylePicker({ value, onChange, excludeVideoId, disabled, al
   /** Offer "AI chooses" (reported as null) ahead of the styles. */
   allowAuto?: boolean;
 }) {
-  const auto = Boolean(allowAuto) && !value;
+  const auto = Boolean(allowAuto) && (!value || value.auto === true);
   const style: VideoStyleId = value?.style && VIDEO_STYLES[value.style] ? value.style : "normal";
   const needsBackground = !auto && VIDEO_STYLES[style].split === "background";
   const { data: videos } = trpc.videos.list.useQuery(undefined, { enabled: needsBackground });

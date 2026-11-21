@@ -10,7 +10,7 @@ import SubtitleOverlay, {
 import { captionAt, groupCaptionWords, type CaptionPresetId } from "@shared/captions.mjs";
 import { MAX_ANALYSIS_RANGE_SECONDS, MAX_FULL_VIDEO_SECONDS, parseAnalysisTime } from "@shared/analysis-range.mjs";
 import {
-  AI_VIDEO_STYLES, VIDEO_STYLES, montageCaptionStyle, punchIns,
+  AI_VIDEO_STYLES, VIDEO_STYLES, allowsAutoGaming, montageCaptionStyle, punchIns,
   type GamingSplit, type OwnableCaptionField, type VideoLayout, type VideoStyleId,
 } from "@shared/video-styles.mjs";
 import VideoStylePicker from "@/components/VideoStylePicker";
@@ -74,7 +74,7 @@ function clipVideoStyle(clip: Highlight, layout: VideoLayout | null): VideoStyle
 function clipVideoLayout(clip: Highlight, layout: VideoLayout | null): VideoLayout | null {
   if (layout) return layout;
   return clip.montage && (AI_VIDEO_STYLES as readonly string[]).includes(clip.montage)
-    ? { style: clip.montage as VideoStyleId } : null;
+    ? { style: clip.montage as VideoStyleId, auto: true } : null;
 }
 
 /**
@@ -1208,7 +1208,9 @@ function StepSubtitles({
   }, [videoId, clips]);
 
   /* The video style this clip will be exported in, imitated by the preview. */
-  const clipStyle = clip ? clipVideoStyle(clip, activeLayout) : "normal";
+  const requestedLayout = clip ? clipVideoLayout(clip, activeLayout) : null;
+  const clipStyle = requestedLayout?.style ?? "normal";
+  const checkAutoGaming = allowsAutoGaming(requestedLayout);
   const { data: library } = trpc.videos.list.useQuery(undefined, { enabled: activeLayout?.backgroundVideoId != null });
   const backgroundUrl = activeLayout?.backgroundVideoId != null
     ? ((library as { id: number; hostedUrl?: string | null }[] | undefined)?.find(v => v.id === activeLayout.backgroundVideoId)?.hostedUrl ?? null)
@@ -1218,18 +1220,19 @@ function StepSubtitles({
    * and for Dual Speaker also says which shots have two people in them.
    * Asked for once the clip's part of the video is imported, so the preview
    * shows the same picture as the finished clip rather than the plain centre. */
+  const canCheckFraming = videoId != null && !!clip && hostedStatus === "ready";
   const { data: autoFraming, isPending: framingPending } = trpc.videos.previewFraming.useQuery(
     {
       id: videoId ?? 0, startTime: clip?.startTime ?? 0, endTime: clip?.endTime ?? 0,
       ...(clipStyle === "dual" || clipStyle === "gaming" ? { style: clipStyle } : {}),
     },
-    { enabled: videoId != null && !!clip && hostedStatus === "ready", staleTime: Infinity },
+    { enabled: canCheckFraming, staleTime: Infinity },
   );
-  /* A game stream with a facecam and no style chosen is exported as
-   * Facecam + Gameplay; preview it that way too. */
+  /* Auto checks the clip's frames even when the highlight analysis already
+   * suggested a style from the speech. */
   const framingAnswer = autoFraming as { gaming?: GamingSplit; segments?: PlanSegment[]; autoGaming?: { gaming: GamingSplit; segments: PlanSegment[] } } | undefined;
-  const autoGaming = clip && !clipVideoLayout(clip, activeLayout) ? framingAnswer?.autoGaming : undefined;
-  const waitingForGaming = clipStyle === "gaming" && hostedStatus === "ready" && framingPending;
+  const autoGaming = checkAutoGaming ? framingAnswer?.autoGaming : undefined;
+  const waitingForFraming = canCheckFraming && framingPending && (checkAutoGaming || clipStyle === "gaming");
   const shownClipStyle: VideoStyleId = autoGaming ? "gaming" : clipStyle === "gaming" && framingAnswer && !framingAnswer.gaming ? "normal" : clipStyle;
   const shownStyle = montageCaptionStyle(shownClipStyle, style) as SubStyle;
   /** Playback position in the clip, in steps coarse enough not to re-render every frame. */
@@ -1321,11 +1324,11 @@ function StepSubtitles({
         <div className="space-y-4">
           {clip && (
             <details className="glass rounded-2xl p-4" key={clip.id}>
-              <summary className="cursor-pointer text-sm font-semibold">Video style · {VIDEO_STYLES[clipStyle].label}</summary>
+              <summary className="cursor-pointer text-sm font-semibold">Video style · {VIDEO_STYLES[shownClipStyle].label}</summary>
               <div className="mt-3">
-                <VideoStylePicker value={clipVideoLayout(clip, activeLayout)} excludeVideoId={videoId}
+                <VideoStylePicker value={requestedLayout} excludeVideoId={videoId} allowAuto={!layout}
                   onChange={next => update(value => ({ ...value, layout: next ?? undefined }))} />
-                {current.layout && (
+                {current.layout && layout && (
                   <button type="button" onClick={() => update(value => ({ ...value, layout: undefined }))}
                     className="mt-2 text-xs font-semibold text-primary underline underline-offset-4">Reset video style</button>
                 )}
@@ -1456,7 +1459,7 @@ function StepSubtitles({
             </span>
           </div>
           <div className="p-4 flex flex-col items-center gap-3">
-            {hostedStatus === "ready" && hostedUrl && !waitingForGaming ? (
+            {hostedStatus === "ready" && hostedUrl && !waitingForFraming ? (
               /*
                * No `onChange`, so the frame cannot be panned here: the export
                * follows the speaker by itself. The caption IS draggable,
@@ -1498,7 +1501,7 @@ function StepSubtitles({
                   ) : (
                     <>
                       <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                      <span>{waitingForGaming ? "Preparing facecam and gameplay…" : `Getting clip #${previewIdx + 1} ready${video?.hostProgress ? `… ${video.hostProgress}%` : "…"}`}</span>
+                      <span>{waitingForFraming ? "Checking clip framing…" : `Getting clip #${previewIdx + 1} ready${video?.hostProgress ? `… ${video.hostProgress}%` : "…"}`}</span>
                     </>
                   )}
                 </div>
@@ -1717,13 +1720,15 @@ function StepExport({ clips, settings, layout, videoId, videoTitle, sourceTitle,
               startTime: h.startTime,
               endTime: h.endTime,
               engagementScore: h.engagementScore,
-              ...(wanted ? { style: wanted.style } : {}),
+              ...(wanted ? { style: wanted.style, ...(wanted.auto ? { autoStyle: true as const } : {}) } : {}),
             })));
           }
           const saved = (found as { layout?: VideoLayout | null } | undefined)?.layout ?? null;
-          const styleChanged = wanted != null && (found
-            ? saved?.style !== wanted?.style || (saved?.backgroundVideoId ?? null) !== (wanted?.backgroundVideoId ?? null)
-            : wanted.backgroundVideoId != null);
+          const styleChanged = found
+            ? saved?.style !== wanted?.style
+              || saved?.auto !== wanted?.auto
+              || (saved?.backgroundVideoId ?? null) !== (wanted?.backgroundVideoId ?? null)
+            : wanted?.backgroundVideoId != null;
           const clipRow = id;
           await patiently(() => updateClip.mutateAsync({
             id: clipRow, captionsEnabled: captionsOn,
