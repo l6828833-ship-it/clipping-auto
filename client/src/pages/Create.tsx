@@ -131,26 +131,21 @@ function ProcessingScreen({ status, progress }: { status: string; progress?: num
       <div className="grid min-h-full place-items-center px-6 py-12"
         style={{ background: "radial-gradient(ellipse at 50% 42%, color-mix(in oklab, var(--cobalt) 14%, transparent), transparent 55%)" }}>
         <div className="w-full max-w-sm text-center">
-          <div aria-hidden="true" className="relative mx-auto mb-8 grid size-32 place-items-center">
-            <div className="absolute inset-0 rounded-full border border-primary/20" />
-            <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-primary motion-safe:animate-spin [animation-duration:2.4s]" />
-            <div className="absolute inset-2.5 rounded-full border border-primary/15" />
-            <div className="relative grid size-[4.5rem] place-items-center rounded-[1.4rem] text-white motion-safe:animate-[clip-maker-logo-lift_2.4s_ease-in-out_infinite]"
-              style={{ background: "linear-gradient(145deg, var(--cobalt), oklch(0.49 0.22 272))", boxShadow: "0 8px 30px color-mix(in oklab, var(--cobalt) 40%, transparent)" }}>
-              <Zap className="size-9" strokeWidth={2.2} />
-            </div>
-          </div>
-          <h2 ref={headingRef} id={headingId} tabIndex={-1} className="text-2xl font-black outline-none sm:text-3xl">
-            Processing your video
+          <h2 ref={headingRef} id={headingId} tabIndex={-1}
+            className="inline-flex items-center gap-3 whitespace-nowrap text-[clamp(2.2rem,8vw,3.25rem)] font-bold leading-none tracking-[-0.07em] outline-none sm:gap-4">
+            <img src="/clip-maker-favicon.svg" alt="" width={56} height={56}
+              className="size-12 shrink-0 drop-shadow-[0_8px_18px_rgba(49,94,245,0.3)] motion-safe:animate-[clip-maker-logo-lift_2.4s_ease-in-out_infinite] sm:size-14" />
+            <span>Clip <span className="text-primary">Maker</span></span>
+            <span className="sr-only"> loading</span>
           </h2>
-          <p role="status" className="mt-2 text-sm text-muted-foreground">{status}</p>
-          <div role="progressbar" aria-label="Processing progress" aria-valuenow={percent}
-            className="relative mx-auto mt-7 h-1.5 w-full max-w-56 overflow-hidden rounded-full bg-secondary">
+          <div role="progressbar" aria-label="Video processing" aria-valuenow={percent}
+            className="relative mx-auto mt-7 h-1 w-full max-w-56 overflow-hidden rounded-full bg-primary/15">
             {percent == null
-              ? <div className="h-full w-2/5 rounded-full bg-primary motion-safe:animate-[clip-maker-progress-sweep_1.8s_ease-in-out_infinite]" />
+              ? <div className="h-full w-2/5 rounded-full bg-primary motion-safe:animate-[clip-maker-progress-sweep_1.6s_ease-in-out_infinite]" />
               : <div className="h-full rounded-full bg-primary motion-safe:transition-[width] motion-safe:duration-500" style={{ width: `${percent}%` }} />}
           </div>
-          {percent != null && <p aria-hidden="true" className="mt-2 text-xs tabular-nums text-muted-foreground">{percent}%</p>}
+          <p role="status" className="mt-4 text-sm text-muted-foreground">{status}</p>
+          {percent != null && <p aria-hidden="true" className="mt-1 text-xs tabular-nums text-muted-foreground">{percent}%</p>}
         </div>
       </div>
     </dialog>

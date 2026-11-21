@@ -2085,7 +2085,8 @@ async function aiListModels() {
   return data.data ?? [];
 }
 function aiContent(response) {
-  return response.choices?.[0]?.message?.content ?? "";
+  const content = response?.choices?.[0]?.message?.content;
+  return typeof content === "string" ? content : "";
 }
 function aiTruncated(response) {
   const reason = response.choices?.[0]?.finish_reason;
@@ -2180,8 +2181,8 @@ function aiParseJSON(response) {
 var HighlightSchema = z2.object({
   id: z2.coerce.number().optional(),
   title: z2.string(),
-  startTime: z2.coerce.number(),
-  endTime: z2.coerce.number(),
+  startTime: z2.union([z2.number(), z2.string().trim().min(1)]).pipe(z2.coerce.number().finite()),
+  endTime: z2.union([z2.number(), z2.string().trim().min(1)]).pipe(z2.coerce.number().finite()),
   engagementScore: z2.coerce.number().catch(75),
   kind: z2.string().optional(),
   montage: z2.string().optional(),
@@ -2190,6 +2191,21 @@ var HighlightSchema = z2.object({
   reason: z2.string().catch(""),
   evidence: z2.enum(["speech", "visual"]).default("speech")
 });
+function parseHighlightAnswer(response, pass) {
+  try {
+    const result = aiParseJSON(response);
+    const items = Array.isArray(result) ? result : result?.highlights;
+    const highlights = (Array.isArray(items) ? items : []).flatMap(item => {
+      const candidate = HighlightSchema.safeParse(item);
+      return candidate.success ? [candidate.data] : [];
+    });
+    if (highlights.length) return { ...result, highlights };
+    console.warn(`[AI] ${pass} returned no usable candidates (received=${Array.isArray(items) ? items.length : 0}).`);
+  } catch {
+    console.warn(`[AI] ${pass} returned an unreadable candidate list.`);
+  }
+  return { highlights: [] };
+}
 const titleLanguages = {
   "ar-ma": "Moroccan Darija in Arabic script",
   ar: "Arabic",
@@ -2363,7 +2379,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       const messages = media ? [
         { role: "system", content: `${MEDIA_EDITOR_RULES}\n${languageRule}` },
         { role: "user", content: [
-          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nFrame-change times: ${media.motion.map(p => p.time).join(", ") || "none"}. Compare nearby frames on both sides of a change for action, a short reveal or a reaction. Sampled frames follow; do not assume they show every event in the video.` },
+          { type: "text", text: `Video: ${input.sourceTitle || video.title || "Untitled"}. Requested type: ${input.contentType} (auto means classify the evidence). Duration: ${media.duration}s. Suggest ${Math.min(12, targetCount + 3)} candidates for ${targetCount} final clips. All supplied times are seconds from the beginning of the selected video or excerpt. Return startTime and endTime as numbers on that same timeline. Transcript:\n${transcript || "No speech detected."}\nLoudness peaks (seconds/dB, NOT music recognition): ${JSON.stringify(media.sound)}\nReplay peaks: ${JSON.stringify(peaks)}\nFrame-change times: ${media.motion.map(p => p.time).join(", ") || "none"}. Compare nearby frames on both sides of a change for action, a short reveal or a reaction. Sampled frames follow; do not assume they show every event in the video.` },
           ...frameContent(media.frames)
         ] }
       ] : [
@@ -2372,7 +2388,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       ];
       /* A long video is also searched part by part, all parts at once, so
        * moments deep in the video get the same attention as the start. */
-      const parts = rankingMode ? [] : transcriptWindows(lines, { duration: analysisDuration });
+      const parts = rankingMode ? [] : transcriptWindows(lines, { duration: analysisDuration, minSeconds: 900 });
       const perPart = parts.length ? Math.min(6, Math.max(3, Math.ceil(targetCount * 2 / parts.length) + 1)) : 0;
       const searchPart = async (part) => {
         const from = part[0].start, to = part[part.length - 1].end;
@@ -2396,12 +2412,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
           temperature: 0.4,
           max_tokens: 8192
         });
-        const found = [];
-        for (const item of aiParseJSON(answer).highlights ?? []) {
-          const result = HighlightSchema.safeParse(item);
-          if (result.success) found.push({ ...result.data, evidence: "speech" });
-        }
-        return found;
+        return parseHighlightAnswer(answer, "Transcript window").highlights.map(clip => ({ ...clip, evidence: "speech" }));
       };
       const partsJob = Promise.all(parts.map(part => searchPart(part).catch(error => {
         console.warn(`[AI] Part ${Math.floor(part[0].start)}s: ${String(error?.message ?? error).slice(0, 160)}`);
@@ -2419,29 +2430,37 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       });
       /* With parts to fall back on, a failed whole-video pass is not fatal. */
       const [main, partFound] = await Promise.all([
-        parts.length ? mainJob.catch(error => {
-          console.warn(`[AI] Whole-video pass failed, using the parts: ${String(error?.message ?? error).slice(0, 160)}`);
+        parts.length || (media && transcript.trim().length >= 10) ? mainJob.catch(error => {
+          console.warn(`[AI] Whole-video pass failed (status=${error?.status ?? error?.name ?? "unknown"}). Trying remaining analysis paths.`);
           return null;
         }) : mainJob,
         partsJob
       ]);
-      const response = main?.response ?? { choices: [{ message: { content: "{}" } }] };
+      const response = main?.response;
       const modelUsed = main?.modelUsed ?? aiModel();
       console.log(`[AI] Highlights analysed by ${modelUsed}${parts.length ? ` (and ${parts.length} parts)` : ""}.`);
-      const parsed = aiParseJSON(response);
-      const highlights = [];
-      for (const item of parsed.highlights ?? []) {
-        const result = HighlightSchema.safeParse(item);
-        if (result.success) highlights.push(result.data);
+      let parsed = response ? parseHighlightAnswer(response, "Whole-video analysis") : { highlights: [] };
+      if (media && !parsed.highlights.length && transcript.trim().length < 10 && deadline - Date.now() > 60_000) {
+        try {
+          const { response: retry } = await aiAnswer({
+            model: aiModel(),
+            messages: [
+              { role: "system", content: `${MEDIA_EDITOR_RULES}\n${languageRule}` },
+              { role: "user", content: [
+                { type: "text", text: `Find up to ${targetCount} complete visible actions in these frames. Duration: ${media.duration}s. There is no usable dialogue. Return {"highlights":[{"title":"...","reason":"...","startTime":0,"endTime":10,"engagementScore":80,"evidence":"visual"}]}. Use seconds on the displayed timeline. The numbers in the example show the format only.` },
+                ...frameContent(media.frames),
+              ] },
+            ],
+            deadline: deadline - 45_000,
+            max_tokens: 4096,
+          });
+          parsed = parseHighlightAnswer(retry, "Visual recovery pass");
+        } catch (error) {
+          console.warn(`[AI] Visual recovery failed (status=${error?.status ?? error?.name ?? "unknown"}).`);
+        }
       }
       const fromParts = partFound.flat();
-      highlights.push(...fromParts);
-      if (highlights.length === 0) {
-        throw new TRPCError3({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "The model did not return any usable highlights. Try again or pick a different model."
-        });
-      }
+      const highlights = [...parsed.highlights, ...fromParts];
       /* Land every clip on real speech boundaries and drop overlapping picks. */
       const duration = media?.duration || analysisDuration;
       const inBounds = h => Number.isFinite(h.startTime) && Number.isFinite(h.endTime)
@@ -2508,26 +2527,26 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       /* Models sometimes return far fewer clips than asked for. Ask once more
        * for the missing ones, away from the clips already chosen. */
       let added = 0;
-      if (!rankingMode && ordered.length < targetCount && transcript.trim().length >= 10 && deadline - Date.now() > 45000) {
+      if ((!rankingMode || ordered.length === 0) && ordered.length < targetCount && transcript.trim().length >= 10 && deadline - Date.now() > 45000) {
         try {
           const missing = targetCount - ordered.length;
           const taken = ordered.map(h => `${Math.floor(h.startTime)}s-${Math.ceil(h.endTime)}s`).join(", ") || "none";
           const { response: more } = await aiAnswer({
             model: aiModel(),
             messages: [
-              { role: "system", content: `${prompts.system}\n${languageRule}` },
-              { role: "user", content: `${prompts.user}\n\nALREADY CHOSEN (do not reuse or overlap): ${taken}.\nFind ${missing + 2} MORE clips from the rest of the video. Funny parts first, then strong stories, arguments and reactions. Titles must not repeat the chosen ones.\n\n${languageRule}` }
+              { role: "system", content: `${systemPrompt}\n${languageRule}` },
+              { role: "user", content: `${userPrompt}\n\nALREADY CHOSEN (do not reuse or overlap): ${taken}.\nFind ${rankingMode ? 3 : missing + 2} clips from the transcript. Use numeric seconds from the supplied timeline. Funny parts first, then strong stories, arguments and reactions. Titles must not repeat the chosen ones.\n\n${languageRule}` }
             ],
             deadline,
             temperature: 0.6,
             max_tokens: 8192
           });
-          const extra = [];
-          for (const item of aiParseJSON(more).highlights ?? []) {
-            const result = HighlightSchema.safeParse(item);
-            if (result.success && inBounds(result.data)) extra.push({ ...result.data, evidence: "speech" });
-          }
-          const fitted = filterSpeechHighlights(snapHighlights(filterSpeechHighlights(extra, timedWords), timedWords, { videoDuration: duration }), timedWords);
+          const extra = parseHighlightAnswer(more, "Recovery pass").highlights.filter(inBounds)
+            .map(clip => ({ ...clip, evidence: "speech" }));
+          const fitted = filterSpeechHighlights(snapHighlights(filterSpeechHighlights(extra, timedWords), timedWords, {
+            videoDuration: duration,
+            ...(rankingMode ? { minSeconds: 5, maxSeconds: 15, reach: 2, growTo: 0 } : {}),
+          }), timedWords);
           const clashes = (a, b) => Math.min(a.endTime, b.endTime) - Math.max(a.startTime, b.startTime)
             > 0.4 * Math.min(a.endTime - a.startTime, b.endTime - b.startTime);
           for (const h of fitted.sort((a, b) => b.engagementScore - a.engagementScore)) {
@@ -2544,7 +2563,7 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
       console.log(`[AI] Highlight candidates=${highlights.length} (parts=${parts.length}, fromParts=${fromParts.length}), supported=${spoken.length + visual.length}, verifiedVisual=${verified.length}, judged=${judged}, extra=${added}, selected=${ordered.length}, target=${targetCount}`);
       if (ordered.length === 0) {
         throw new TRPCError3({
-          code: "INTERNAL_SERVER_ERROR",
+          code: "PRECONDITION_FAILED",
           message: media
             ? "No clips could be verified from the sampled frames and speech. Try a shorter source around the action, or choose clip times manually."
             : "No clear spoken highlights were found. For Moroccan speech, choose Moroccan Darija and transcribe again. For visual moments, retry visual analysis or choose clip times manually."
@@ -2562,10 +2581,10 @@ Rules: return exactly 3 highlights sorted from strongest to weakest. Every endTi
         visualWarning: visualWarning || undefined,
         analysisNote: visualWarning || (media ? "Uses sampled video frames and speech. Fast action or audio-only musical changes can be missed; preview the selected clips." : ""),
         contentType: typeof parsed.contentType === "string" ? parsed.contentType.slice(0, 80) : "interview",
-        reelTitle: parsed.reelTitle?.trim() || (rankingMode ? `RANK ${rank}` : ordered[0].title),
+        reelTitle: (typeof parsed.reelTitle === "string" && parsed.reelTitle.trim()) || (rankingMode ? `RANK ${rank}` : ordered[0].title),
         modelUsed,
         modelSubstituted: false,
-        metadata: response.metadata
+        metadata: response?.metadata
       };
     } catch (err) {
       if (err instanceof TRPCError3) throw err;

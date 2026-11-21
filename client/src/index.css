@@ -309,8 +309,9 @@ button:active:not(:disabled) {
 }
 
 @keyframes clip-maker-logo-lift {
-  0%, 100% { transform: translateY(0) rotate(-4deg); }
-  50% { transform: translateY(-5px) rotate(4deg); }
+  0%, 100% { transform: translateY(0) rotate(0); }
+  40% { transform: translateY(-4px) rotate(-7deg); }
+  65% { transform: translateY(0) rotate(3deg); }
 }
 
 @keyframes clip-maker-progress-sweep {
