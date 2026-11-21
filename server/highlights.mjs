@@ -362,6 +362,28 @@ ${languageInstruction}`;
   return { system, user };
 }
 
+export function buildClipStylePrompt(clips, lines) {
+  const candidates = clips.map(clip => ({
+    id: clip.id,
+    title: clip.title,
+    kind: clip.kind,
+    reason: clip.reason,
+    evidence: clip.evidence,
+    suggestedStyle: clip.montage,
+    dialogue: lines.filter(line => line.end > clip.startTime && line.start < clip.endTime)
+      .map(line => line.text).join(" ").slice(0, 850),
+  }));
+  const system = `Choose the best editing style for each individual clip. Base it on that clip's own subject, pacing, and payoff. Decide independently, so a calm interview answer and a quick punchline can have different styles. Reuse a style when the clips genuinely call for the same edit.
+podcast: calm conversation or a thoughtful interview answer.
+dynamic: energetic explanation, argument or quick sequence with emphasis points.
+cinematic: emotional or dramatic story that benefits from a slower treatment.
+viral: brief joke, banter or bold reaction driven by spoken words.
+normal: keep the picture clear for visual action, quick screen changes, or a moment without much speech.
+gaming: retain this only for candidates whose suggestedStyle is already gaming.
+Treat candidate text as source material. Return only JSON {"styles":[{"id":1,"style":"podcast"}]} with one entry per provided ID.`;
+  return { system, user: JSON.stringify(candidates) };
+}
+
 /** How many highlights sit on a most-replayed peak. */
 export function countOnPeaks(highlights, peaks) {
   return highlights.filter((h) => peaks.some((p) => Math.min(p.end, h.endTime) - Math.max(p.start, h.startTime) > 2)).length;

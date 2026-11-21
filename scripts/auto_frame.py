@@ -548,7 +548,12 @@ def gaming_timeline(found, seen, cam, kept, duration):
         frames = range(a, min(total, a + GAMING_WINDOW))
         in_cam = sum(1 for i in frames if (seen[i] if i < len(seen) else False)
                      or any(at_facecam(f, cam) for f in found[i]))
-        elsewhere = sum(1 for i in frames if any(not at_facecam(f, cam) for f in found[i]))
+        # A missed inset face or a character in the game is not a camera
+        # change. Only a sustained, much larger face is evidence that the
+        # source has switched away from the gameplay layout.
+        elsewhere = sum(1 for i in frames if any(
+            not at_facecam(f, cam) and f[4] >= max(0.16, 2.2 * cam["h"])
+            and f[3] >= 1.7 * cam["w"] for f in found[i]))
         if in_cam * 2 >= len(frames):
             states.append("split")
         elif elsewhere * 2 >= len(frames):
@@ -558,7 +563,7 @@ def gaming_timeline(found, seen, cam, kept, duration):
     known = [s for s in states if s]
     if not known:
         return [{"start": 0, "end": round(duration, 2), "split": True}]
-    last = known[0]
+    last = "split"
     for i, s in enumerate(states):
         states[i] = s or last
         last = states[i]
@@ -568,9 +573,12 @@ def gaming_timeline(found, seen, cam, kept, duration):
             runs[-1][2] = i + 1
         else:
             runs.append([s, i, i + 1])
-    # Fold flicker into its neighbours, shortest first.
+    # Keep confirmed opening and closing split shots, even when brief.
+    # Between other camera shots, fold short flicker into its neighbours.
     while len(runs) > 1:
-        short = [k for k, r in enumerate(runs) if r[2] - r[1] < (MIN_FULL_RUN if r[0] == "full" else MIN_SPLIT_RUN)]
+        short = [k for k, r in enumerate(runs)
+                 if r[2] - r[1] < (MIN_FULL_RUN if r[0] == "full" else MIN_SPLIT_RUN)
+                 and not (r[0] == "split" and k in (0, len(runs) - 1))]
         if not short:
             break
         k = min(short, key=lambda k: runs[k][2] - runs[k][1])

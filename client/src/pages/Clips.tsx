@@ -26,6 +26,7 @@ import {
   formatTime,
 } from "@/lib/videoSource";
 import { downloadMedia } from "@/lib/download";
+import { CAPTION_LANGUAGES } from "@/lib/captionLanguages";
 import {
   Film, Download, Clock, TrendingUp, Loader2, Play, CheckCircle2,
   AlertCircle, Zap, X, Maximize2, Scissors, Save, ExternalLink, CloudDownload, Trash2, Mic, Captions,
@@ -152,6 +153,8 @@ function ClipEditorModal({
   });
   // Whether subtitles get burned into the export.
   const [captionsOn, setCaptionsOn] = useState(clip.captionsEnabled ?? true);
+  const [captionLanguageOverride, setCaptionLanguageOverride] = useState<string>();
+  const [spokenLanguage, setSpokenLanguage] = useState("auto");
   // Video scale (how much of the 9:16 frame the video fills) and bar colour.
   const [videoScale, setVideoScale] = useState(clip.scale ?? 1);
   const [barColor, setBarColor] = useState(clip.barColor ?? "#000000");
@@ -258,13 +261,15 @@ function ClipEditorModal({
       await utils.subtitles.get.invalidate({ clipId: clip.id });
       // Transcribing on demand turns subtitles back on for the video.
       await utils.videos.list.invalidate();
-      toast.success(`Whisper transcribed ${res.wordCount} timed words. Re-render to burn them in.`);
+      toast.success(`Transcribed ${res.wordCount} timed words. Re-render to burn them in.`);
     },
     onError: err => toast.error(err.message),
   });
 
   // Saved caption style, so the reframe view shows what will be burned in.
   const { data: savedSubtitle } = trpc.subtitles.get.useQuery({ clipId: clip.id });
+  const savedCaptionLanguage = (savedSubtitle?.style as { captionLanguage?: string } | undefined)?.captionLanguage ?? "auto";
+  const captionLanguage = captionLanguageOverride ?? savedCaptionLanguage;
   const captionStyle: SubtitleStyle = {
     ...DEFAULT_SUBTITLE_STYLE,
     ...((savedSubtitle?.style as Partial<SubtitleStyle> | null) ?? {}),
@@ -404,11 +409,12 @@ function ClipEditorModal({
   /* With no style chosen, the export uses Facecam + Gameplay when the clip
    * shows a facecam, so the preview asks for the automatic plan as well. */
   const splitStyle = layout?.style === "gaming" ? "gaming" : layout?.style === "dual" ? "dual" : undefined;
-  const { data: splitPlan } = trpc.videos.previewFraming.useQuery(
+  const { data: splitPlan, isPending: splitPending } = trpc.videos.previewFraming.useQuery(
     { id: video?.id ?? 0, startTime: previewRange.start, endTime: previewRange.end, ...(splitStyle ? { style: splitStyle } : {}) },
     { enabled: (!!splitStyle || !layout) && !!video && hostedStatus === "ready" && validRange, staleTime: Infinity },
   );
   const answer = splitPlan as { gaming?: GamingSplit; segments?: PlanSegment[]; autoGaming?: { gaming: GamingSplit; segments: PlanSegment[] } } | undefined;
+  const waitingForGaming = splitStyle === "gaming" && hostedStatus === "ready" && validRange && splitPending;
   const autoGaming = !layout ? answer?.autoGaming : undefined;
   const shownStyle = autoGaming ? "gaming" : layout?.style ?? "normal";
   const plan = autoGaming ? autoGaming.segments
@@ -517,16 +523,18 @@ function ClipEditorModal({
     });
 
     // Persist edited words back as absolute source times.
-    if (timelineWords || Object.keys(captionPositions).length > 0) {
+    const wordsChanged = !!timelineWords || Object.keys(captionPositions).length > 0;
+    if (wordsChanged || captionLanguage !== savedCaptionLanguage) {
       await saveSubtitles.mutateAsync({
         clipId: clip.id,
-        style: captionStyle,
-        words: effectiveWords.map((w, index) => ({
+        style: { ...captionStyle, captionLanguage },
+        invalidateRender: true,
+        words: wordsChanged ? effectiveWords.map((w, index) => ({
           ...w,
           start: w.start + clipStartAbs,
           end: w.end + clipStartAbs,
           ...captionPositions[index],
-        })),
+        })) : undefined,
       });
     }
   };
@@ -576,7 +584,12 @@ function ClipEditorModal({
         <div className="grid gap-5 md:grid-cols-[320px_1fr]">
           {/* Live player — 9:16 */}
           <div className="mx-auto w-full" style={{ maxWidth: "320px" }}>
-            {hostedStatus === "ready" && hostedUrl ? (
+            {waitingForGaming ? (
+              <div role="status" className="grid aspect-[9/16] place-content-center rounded-2xl bg-black text-center text-sm text-white">
+                <Loader2 aria-hidden="true" className="mx-auto mb-2 size-5 motion-safe:animate-spin" />
+                Preparing facecam and gameplay…
+              </div>
+            ) : hostedStatus === "ready" && hostedUrl ? (
               <>
                 {/* The exported result at full size. */}
                 <CropView
@@ -994,8 +1007,27 @@ function ClipEditorModal({
                 `force` is set because pressing this button is an explicit
                 request, which is also what re-enables subtitles for a video
                 that was imported with them switched off. */}
+            {captionsOn && <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <label className="text-xs font-semibold">
+                Caption language
+                <select aria-label="Caption language" value={captionLanguage} onChange={event => setCaptionLanguageOverride(event.target.value)}
+                  className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                  <option value="auto">Same as video</option>
+                  {CAPTION_LANGUAGES.map(option => <option key={option.code} value={option.code}>{option.label}</option>)}
+                </select>
+              </label>
+              <label className="text-xs font-semibold">
+                Spoken language for re-transcription
+                <select aria-label="Spoken language for re-transcription" value={spokenLanguage} onChange={event => setSpokenLanguage(event.target.value)}
+                  className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                  <option value="auto">Same as video</option>
+                  {CAPTION_LANGUAGES.map(option => <option key={option.code} value={option.code}>{option.label}</option>)}
+                </select>
+              </label>
+              {captionLanguage !== "auto" && <p className="text-xs text-muted-foreground sm:col-span-2">The preview shows the original captions. Translation is applied at export.</p>}
+            </div>}
             {captionsOn && <button
-              onClick={() => transcribeClip.mutate({ id: clip.id, force: true })}
+              onClick={() => transcribeClip.mutate({ id: clip.id, force: true, language: spokenLanguage === "auto" ? undefined : spokenLanguage })}
               disabled={hostedStatus !== "ready" || transcribeClip.isPending}
               className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-bold transition-all hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
               style={{ background: "rgba(221, 125, 113, 0.1)", color: "var(--coral)" }}

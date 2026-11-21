@@ -10,13 +10,14 @@ import SubtitleOverlay, {
 import { captionAt, groupCaptionWords, type CaptionPresetId } from "@shared/captions.mjs";
 import { MAX_ANALYSIS_RANGE_SECONDS, MAX_FULL_VIDEO_SECONDS, parseAnalysisTime } from "@shared/analysis-range.mjs";
 import {
-  AI_VIDEO_STYLES, VIDEO_STYLES, montageCaptionStyle,
+  AI_VIDEO_STYLES, VIDEO_STYLES, montageCaptionStyle, punchIns,
   type GamingSplit, type OwnableCaptionField, type VideoLayout, type VideoStyleId,
 } from "@shared/video-styles.mjs";
 import VideoStylePicker from "@/components/VideoStylePicker";
 import RangePicker from "@/components/RangePicker";
 import { downloadUrl, parseYouTubeId, youTubeThumbnail } from "@/lib/videoSource";
 import { downloadMedia } from "@/lib/download";
+import { CAPTION_LANGUAGES } from "@/lib/captionLanguages";
 import { trpc } from "@/lib/trpc";
 import { useSourceTranscription, type AnalysisRange, type SourceTranscriptionStage } from "@/hooks/useSourceTranscription";
 import { toast } from "sonner";
@@ -51,9 +52,15 @@ type SubStyle = {
   highlightColor: string; position: "top"|"center"|"bottom"; outline: boolean;
   /** Free position as a percentage of the frame; overrides `position`. */
   posX?: number; posY?: number;
+  captionLanguage?: string;
   /** Settings chosen by hand, which each clip's video style leaves alone. */
   own?: OwnableCaptionField[];
 };
+type ClipSettings = { style: SubStyle; captionsOn: boolean; layout?: VideoLayout };
+const DEFAULT_CLIP_SUBTITLES: SubStyle = { ...DEFAULT_SUBTITLE_STYLE, preset: "karaoke", own: [] };
+function defaultClipSettings(captionsOn: boolean): ClipSettings {
+  return { style: DEFAULT_CLIP_SUBTITLES, captionsOn };
+}
 
 /** What highlight detection found for a video, and the title language it wrote in. */
 type Detected = { highlights: Highlight[]; reelTitle: string; language: string; visualWarning?: string; contentType?: string; requestedType?: string };
@@ -61,8 +68,13 @@ type UploadSource = { title: string; subtitlesOn: boolean };
 
 /** The video style a clip is exported in: the one chosen for the video, else the AI's pick for that clip. */
 function clipVideoStyle(clip: Highlight, layout: VideoLayout | null): VideoStyleId {
-  if (layout?.style) return layout.style;
-  return clip.montage && (AI_VIDEO_STYLES as string[]).includes(clip.montage) ? clip.montage as VideoStyleId : "normal";
+  return clipVideoLayout(clip, layout)?.style ?? "normal";
+}
+
+function clipVideoLayout(clip: Highlight, layout: VideoLayout | null): VideoLayout | null {
+  if (layout) return layout;
+  return clip.montage && (AI_VIDEO_STYLES as readonly string[]).includes(clip.montage)
+    ? { style: clip.montage as VideoStyleId } : null;
 }
 
 /**
@@ -73,14 +85,7 @@ function clipVideoStyle(clip: Highlight, layout: VideoLayout | null): VideoStyle
 const FONTS = CAPTION_FONTS;
 const TEXT_COLORS = ["#FFFFFF","#FFE600","#39FF14","#00B4FF","#FF2D78"];
 const HL_COLORS   = ["#FFE600","#39FF14","#00B4FF","#FF2D78"];
-const LANGUAGES = [
-  { code: "auto", label: "Auto-detect" }, { code: "ar-ma", label: "Moroccan Darija" },
-  { code: "en", label: "English" }, { code: "es", label: "Spanish" },
-  { code: "fr", label: "French"  }, { code: "de", label: "German"  },
-  { code: "pt", label: "Portuguese" }, { code: "ja", label: "Japanese" },
-  { code: "zh", label: "Chinese" }, { code: "ar", label: "Arabic"  },
-  { code: "hi", label: "Hindi"   }, { code: "ko", label: "Korean"  },
-];
+const LANGUAGES = [{ code: "auto", label: "Auto-detect" }, ...CAPTION_LANGUAGES];
 
 /** m:ss, or h:mm:ss from an hour on (a long stream showed "150:00"). */
 function fmt(s: number) {
@@ -455,7 +460,7 @@ function StepInput({ apiKey, layout, uploadSource, onLayoutChange, onNext }: {
       {/* Video style, chosen once for every clip made from this video */}
       <div className="glass rounded-2xl p-4 mb-5">
         <p className="text-sm font-bold text-foreground">Video style</p>
-        <p className="text-xs text-muted-foreground mb-3">How your clips will look. Applies to every clip from this video.</p>
+        <p className="text-xs text-muted-foreground mb-3">Choose Auto for a style tailored to each clip, or pick one style for all clips.</p>
         <VideoStylePicker value={layout} onChange={onLayoutChange} allowAuto />
       </div>
 
@@ -904,6 +909,7 @@ function StepHighlights({
   /** Everything the detector needs, including whichever signals this source had. */
   const detectInput = {
     transcript, model, apiKey, videoDuration, titleLanguage, contentType, analysisRange, videoId: videoId ?? undefined,
+    autoStyle: layout == null,
     /* The names people search for are in the video's title, rarely in what is said. */
     sourceTitle: (sourceTitle || videoTitle).slice(0, 200) || undefined,
     channel: channel.slice(0, 200) || undefined,
@@ -1102,51 +1108,36 @@ function useClipPreviewImport(
 
 // ─── Step 3: Subtitles ────────────────────────────────────────────────────────
 function StepSubtitles({
-  clips, videoId, layout, captionsOn, onCaptionsChange, onNext,
+  clips, videoId, layout, defaultCaptionsOn, settings, onSettingsChange, onNext,
 }: {
   clips: Highlight[];
   videoId: number | null;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
   layout: VideoLayout | null;
-  /** Whether captions get burned into the exports. */
-  captionsOn: boolean;
-  onCaptionsChange: (on: boolean) => void;
-  onNext: (style: SubStyle) => void;
+  defaultCaptionsOn: boolean;
+  settings: Record<number, ClipSettings>;
+  onSettingsChange: (id: number, update: (current: ClipSettings) => ClipSettings) => void;
+  onNext: () => void;
 }) {
-  const [font, setFont] = useState(DEFAULT_SUBTITLE_STYLE.font);
-  const [preset, setPreset] = useState<CaptionPresetId>("karaoke");
-  // Pixels on the 1080-wide export canvas, so the preview and the burned-in
-  // captions are the same size.
-  const [fontSize, setFontSize] = useState(DEFAULT_SUBTITLE_STYLE.fontSize);
-  const [color, setColor] = useState(DEFAULT_SUBTITLE_STYLE.color);
-  const [hlColor, setHlColor] = useState(DEFAULT_SUBTITLE_STYLE.highlightColor);
-  const [position, setPosition] = useState<"top"|"center"|"bottom">(DEFAULT_SUBTITLE_STYLE.position);
-  const [outline, setOutline] = useState(DEFAULT_SUBTITLE_STYLE.outline);
   // Which selected clip the preview is showing.
   const [previewIdx, setPreviewIdx] = useState(0);
-  /**
-   * Caption position as a percentage of the frame. Null means the preset above
-   * is in use; dragging the caption on screen switches to a free position.
-   *
-   * The caption style is shared by every clip.
-   */
-  const [freePos, setFreePos] = useState<{ posX: number; posY: number } | null>(null);
-  /*
-   * Settings changed here by hand. A clip's video style picks its own design,
-   * size or colours (Viral Captions makes them big, Clean Podcast small), and
-   * used to override whatever was chosen here, so moving the size slider did
-   * nothing on such a clip. What is changed here now wins, in the preview and
-   * in the export.
-   */
-  const [own, setOwn] = useState<OwnableCaptionField[]>([]);
-  const choose = (field: OwnableCaptionField) => setOwn(prev => prev.includes(field) ? prev : [...prev, field]);
-  const style: SubStyle = {
-    preset, font, fontSize, color, highlightColor: hlColor, position, outline,
-    ...(freePos ?? {}),
-    own,
-  };
-
   const clip = clips[previewIdx] ?? clips[0];
+  const current = (clip && settings[clip.id]) || defaultClipSettings(defaultCaptionsOn);
+  const { style, captionsOn } = current;
+  const activeLayout = current.layout ?? layout;
+  const update = (apply: (value: ClipSettings) => ClipSettings) => {
+    if (clip) onSettingsChange(clip.id, apply);
+  };
+  const changeStyle = (patch: Partial<SubStyle>, field?: OwnableCaptionField) => {
+    update(value => ({
+      ...value, style: {
+        ...value.style, ...patch,
+        own: field ? [...new Set([...(value.style.own ?? []), field])] : value.style.own,
+      },
+    }));
+  };
+  const { font } = style;
+  const freePos = style.posX != null && style.posY != null ? { posX: style.posX, posY: style.posY } : null;
   const utils = trpc.useUtils();
 
   /*
@@ -1217,17 +1208,17 @@ function StepSubtitles({
   }, [videoId, clips]);
 
   /* The video style this clip will be exported in, imitated by the preview. */
-  const clipStyle = clip ? clipVideoStyle(clip, layout) : "normal";
-  const { data: library } = trpc.videos.list.useQuery(undefined, { enabled: layout?.backgroundVideoId != null });
-  const backgroundUrl = layout?.backgroundVideoId != null
-    ? ((library as { id: number; hostedUrl?: string | null }[] | undefined)?.find(v => v.id === layout.backgroundVideoId)?.hostedUrl ?? null)
+  const clipStyle = clip ? clipVideoStyle(clip, activeLayout) : "normal";
+  const { data: library } = trpc.videos.list.useQuery(undefined, { enabled: activeLayout?.backgroundVideoId != null });
+  const backgroundUrl = activeLayout?.backgroundVideoId != null
+    ? ((library as { id: number; hostedUrl?: string | null }[] | undefined)?.find(v => v.id === activeLayout.backgroundVideoId)?.hostedUrl ?? null)
     : null;
 
   /* The framing the export will use: the server follows the speaker's face,
    * and for Dual Speaker also says which shots have two people in them.
    * Asked for once the clip's part of the video is imported, so the preview
    * shows the same picture as the finished clip rather than the plain centre. */
-  const { data: autoFraming } = trpc.videos.previewFraming.useQuery(
+  const { data: autoFraming, isPending: framingPending } = trpc.videos.previewFraming.useQuery(
     {
       id: videoId ?? 0, startTime: clip?.startTime ?? 0, endTime: clip?.endTime ?? 0,
       ...(clipStyle === "dual" || clipStyle === "gaming" ? { style: clipStyle } : {}),
@@ -1237,12 +1228,13 @@ function StepSubtitles({
   /* A game stream with a facecam and no style chosen is exported as
    * Facecam + Gameplay; preview it that way too. */
   const framingAnswer = autoFraming as { gaming?: GamingSplit; segments?: PlanSegment[]; autoGaming?: { gaming: GamingSplit; segments: PlanSegment[] } } | undefined;
-  const autoGaming = clipStyle === "normal" && !layout ? framingAnswer?.autoGaming : undefined;
-  const shownClipStyle: VideoStyleId = autoGaming ? "gaming" : clipStyle;
+  const autoGaming = clip && !clipVideoLayout(clip, activeLayout) ? framingAnswer?.autoGaming : undefined;
+  const waitingForGaming = clipStyle === "gaming" && hostedStatus === "ready" && framingPending;
+  const shownClipStyle: VideoStyleId = autoGaming ? "gaming" : clipStyle === "gaming" && framingAnswer && !framingAnswer.gaming ? "normal" : clipStyle;
   const shownStyle = montageCaptionStyle(shownClipStyle, style) as SubStyle;
   /** Playback position in the clip, in steps coarse enough not to re-render every frame. */
-  const [previewTime, setPreviewTime] = useState(0);
-  useEffect(() => { setPreviewTime(0); }, [clip?.id]);
+  const [previewPosition, setPreviewPosition] = useState<{ clipId: number; time: number }>();
+  const previewTime = previewPosition?.clipId === clip?.id ? previewPosition?.time ?? 0 : 0;
   const plan = useMemo(
     () => (autoGaming?.segments ?? framingAnswer?.segments ?? []),
     [autoGaming, framingAnswer],
@@ -1272,6 +1264,9 @@ function StepSubtitles({
     () => clip ? wordsInClip(video?.transcriptWords, clip) : [],
     [video?.transcriptWords, clip],
   );
+  const punches = useMemo(() => shownClipStyle === "dynamic" && clip
+    ? punchIns(captionsOn ? clipWords : [], clip.endTime - clip.startTime) : [],
+  [shownClipStyle, clip, captionsOn, clipWords]);
   const timed = clipWords.length > 0;
   const caption = (() => {
     if (!timed) {
@@ -1291,15 +1286,14 @@ function StepSubtitles({
    * the sliders start there and move it from there. */
   const anchor = captionAnchor(shownStyle);
   const place = (axis: "x" | "y", value: number) => {
-    setFreePos({ posX: axis === "x" ? value : anchor.x, posY: axis === "y" ? value : anchor.y });
-    choose("position");
+    changeStyle({ posX: axis === "x" ? value : anchor.x, posY: axis === "y" ? value : anchor.y }, "position");
   };
   const captionLayer = captionsOn && caption ? (
     <SubtitleOverlay
       words={caption.words}
       activeIndex={caption.activeIndex}
       style={captionStyle}
-      onPositionChange={pos => { setFreePos(pos); choose("position"); }}
+      onPositionChange={pos => changeStyle(pos, "position")}
     />
   ) : null;
   const thumbnail = (() => {
@@ -1310,32 +1304,56 @@ function StepSubtitles({
     <div className="animate-slide-up">
       <div className="mb-6">
         <h2 className="text-2xl font-black text-foreground mb-1" style={{ fontFamily: "Montserrat, sans-serif" }}>Style Your Subtitles</h2>
-        <p className="text-sm text-muted-foreground">Customize captions for {clips.length} selected clip{clips.length !== 1 ? "s" : ""}.</p>
+        <p className="text-sm text-muted-foreground">Caption and video settings apply to the selected clip.</p>
+        {clips.length > 1 && (
+          <div className="mt-3 flex flex-wrap gap-1.5" role="group" aria-label="Choose clip to edit">
+            {clips.map((entry, i) => (
+              <button type="button" key={entry.id} onClick={() => setPreviewIdx(i)}
+                aria-pressed={i === previewIdx} title={entry.title}
+                className={`rounded-lg px-3 py-1.5 text-xs font-bold ${i === previewIdx ? "bg-primary text-primary-foreground" : "bg-secondary text-secondary-foreground"}`}>
+                #{i + 1}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       <div className="grid lg:grid-cols-2 gap-6">
         <div className="space-y-4">
+          {clip && (
+            <details className="glass rounded-2xl p-4" key={clip.id}>
+              <summary className="cursor-pointer text-sm font-semibold">Video style · {VIDEO_STYLES[clipStyle].label}</summary>
+              <div className="mt-3">
+                <VideoStylePicker value={clipVideoLayout(clip, activeLayout)} excludeVideoId={videoId}
+                  onChange={next => update(value => ({ ...value, layout: next ?? undefined }))} />
+                {current.layout && (
+                  <button type="button" onClick={() => update(value => ({ ...value, layout: undefined }))}
+                    className="mt-2 text-xs font-semibold text-primary underline underline-offset-4">Reset video style</button>
+                )}
+              </div>
+            </details>
+          )}
           <div className="glass rounded-2xl p-5 space-y-4">
             <div className="flex items-center gap-2"><Type className="w-4 h-4" style={{ color: "var(--cobalt)" }} /><span className="text-sm font-semibold">Typography</span></div>
             {/* Each control shows what the preview shows for this clip, which
                 its video style may have picked, and a change made here wins. */}
             <div>
               <label className="text-xs text-muted-foreground mb-2 block">Design</label>
-              <CaptionPresetPicker value={shownStyle.preset} onChange={p => { setPreset(p); choose("preset"); }} />
+              <CaptionPresetPicker value={shownStyle.preset} onChange={preset => changeStyle({ preset }, "preset")} />
             </div>
             <div>
               <label className="text-xs text-muted-foreground mb-2 block">Font Family <span className="opacity-70">(Arabic text always uses Tajawal or Almarai)</span></label>
-              <div className="flex flex-wrap gap-2">{FONTS.map(f => <button key={f} onClick={() => setFont(f)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${font === f ? "text-white" : "text-muted-foreground hover:text-foreground bg-secondary/60"}`} style={font === f ? { background: "var(--cobalt)" } : {}}>{f}</button>)}</div>
+              <div className="flex flex-wrap gap-2">{FONTS.map(f => <button key={f} onClick={() => changeStyle({ font: f })} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${font === f ? "text-white" : "text-muted-foreground hover:text-foreground bg-secondary/60"}`} style={font === f ? { background: "var(--cobalt)" } : {}}>{f}</button>)}</div>
             </div>
             <div>
               <label className="text-xs text-muted-foreground mb-2 block">Font Size: <span className="text-foreground font-semibold">{shownStyle.fontSize}px</span></label>
               <input type="range" min={MIN_FONT_SIZE} max={MAX_FONT_SIZE} step={2} value={shownStyle.fontSize}
-                onChange={e => { setFontSize(Number(e.target.value)); choose("fontSize"); }} className="w-full accent-primary" />
+                aria-label="Caption font size" onChange={e => changeStyle({ fontSize: Number(e.target.value) }, "fontSize")} className="w-full accent-primary" />
             </div>
           </div>
           <div className="glass rounded-2xl p-5 space-y-4">
             <div className="flex items-center gap-2"><Palette className="w-4 h-4" style={{ color: "var(--coral)" }} /><span className="text-sm font-semibold">Colors</span></div>
-            <div><label className="text-xs text-muted-foreground mb-2 block">Text Color</label><div className="flex gap-2">{TEXT_COLORS.map(c => <button key={c} aria-label={`Text colour ${c}`} onClick={() => { setColor(c); choose("color"); }} className={`w-7 h-7 rounded-full border-2 transition-all ${shownStyle.color === c ? "scale-110 border-white" : "border-transparent hover:scale-105"}`} style={{ background: c }} />)}</div></div>
-            <div><label className="text-xs text-muted-foreground mb-2 block">Highlight Color</label><div className="flex gap-2">{HL_COLORS.map(c => <button key={c} aria-label={`Highlight colour ${c}`} onClick={() => { setHlColor(c); choose("highlightColor"); }} className={`w-7 h-7 rounded-full border-2 transition-all ${shownStyle.highlightColor === c ? "scale-110 border-white" : "border-transparent hover:scale-105"}`} style={{ background: c }} />)}</div></div>
+            <div><label className="text-xs text-muted-foreground mb-2 block">Text Color</label><div className="flex gap-2">{TEXT_COLORS.map(c => <button key={c} aria-label={`Text colour ${c}`} onClick={() => changeStyle({ color: c }, "color")} className={`w-7 h-7 rounded-full border-2 transition-all ${shownStyle.color === c ? "scale-110 border-white" : "border-transparent hover:scale-105"}`} style={{ background: c }} />)}</div></div>
+            <div><label className="text-xs text-muted-foreground mb-2 block">Highlight Color</label><div className="flex gap-2">{HL_COLORS.map(c => <button key={c} aria-label={`Highlight colour ${c}`} onClick={() => changeStyle({ highlightColor: c }, "highlightColor")} className={`w-7 h-7 rounded-full border-2 transition-all ${shownStyle.highlightColor === c ? "scale-110 border-white" : "border-transparent hover:scale-105"}`} style={{ background: c }} />)}</div></div>
           </div>
           <div className="glass rounded-2xl p-5 space-y-4">
             <div>
@@ -1350,7 +1368,7 @@ function StepSubtitles({
               <div className="flex gap-2">
                 {(["top","center","bottom"] as const).map(p => (
                   <button key={p}
-                    onClick={() => { setPosition(p); setFreePos(null); choose("position"); }}
+                    onClick={() => changeStyle({ position: p, posX: undefined, posY: undefined }, "position")}
                     className={`flex-1 py-2 rounded-lg text-xs font-semibold capitalize transition-all ${shownStyle.position === p && !freePos ? "text-white" : "text-muted-foreground bg-secondary/60 hover:text-foreground"}`}
                     style={shownStyle.position === p && !freePos ? { background: "var(--cobalt)" } : {}}>
                     {p}
@@ -1387,7 +1405,7 @@ function StepSubtitles({
                   : "Use the sliders, or drag the caption in the preview, to place it exactly."}
               </p>
             </div>
-            <div className="flex items-center justify-between"><label className="text-xs text-muted-foreground">Text Outline</label><button role="switch" aria-checked={shownStyle.outline} aria-label="Text outline" onClick={() => { setOutline(!shownStyle.outline); choose("outline"); }} className="w-10 h-5 rounded-full transition-all relative" style={{ background: shownStyle.outline ? "var(--cobalt)" : "var(--secondary)" }}><div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${shownStyle.outline ? "left-5" : "left-0.5"}`} /></button></div>
+            <div className="flex items-center justify-between"><label className="text-xs text-muted-foreground">Text Outline</label><button role="switch" aria-checked={shownStyle.outline} aria-label="Text outline" onClick={() => changeStyle({ outline: !shownStyle.outline }, "outline")} className="w-10 h-5 rounded-full transition-all relative" style={{ background: shownStyle.outline ? "var(--cobalt)" : "var(--secondary)" }}><div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${shownStyle.outline ? "left-5" : "left-0.5"}`} /></button></div>
           </div>
 
           {/* Master switch: export with captions burned in, or clean. */}
@@ -1398,15 +1416,15 @@ function StepSubtitles({
                 <div>
                   <p className="text-sm font-semibold text-foreground leading-tight">Burn in subtitles</p>
                   <p className="text-[11px] text-muted-foreground">
-                    {captionsOn ? "Captions baked into every clip" : "Clean clips, no text"}
+                    {captionsOn ? "Captions will appear on this clip" : "This clip will export without captions"}
                   </p>
                 </div>
               </div>
               <button
                 role="switch"
                 aria-checked={captionsOn}
-                aria-label="Burn subtitles into exported clips"
-                onClick={() => onCaptionsChange(!captionsOn)}
+                aria-label="Burn subtitles into this clip"
+                onClick={() => update(value => ({ ...value, captionsOn: !value.captionsOn }))}
                 className="w-11 h-6 rounded-full transition-colors relative shrink-0"
                 style={{ background: captionsOn ? "var(--cobalt)" : "var(--secondary)" }}
               >
@@ -1414,6 +1432,20 @@ function StepSubtitles({
                   style={{ left: captionsOn ? "1.375rem" : "0.125rem" }} />
               </button>
             </div>
+            {captionsOn && (
+              <label className="mt-3 block text-xs font-semibold">
+                Caption language
+                <select aria-label="Caption language" value={style.captionLanguage ?? "auto"} onChange={event =>
+                  changeStyle({ captionLanguage: event.target.value === "auto" ? undefined : event.target.value })}
+                  className="mt-1 block w-full rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                  <option value="auto">Same as video</option>
+                  {CAPTION_LANGUAGES.map(option => (
+                    <option key={option.code} value={option.code}>{option.label}</option>
+                  ))}
+                </select>
+                {style.captionLanguage && <span className="mt-1 block font-normal text-muted-foreground">Translation is applied at export.</span>}
+              </label>
+            )}
           </div>
         </div>
         <div className="glass rounded-2xl overflow-hidden self-start">
@@ -1424,40 +1456,27 @@ function StepSubtitles({
             </span>
           </div>
           <div className="p-4 flex flex-col items-center gap-3">
-            {/* Clip switcher, when more than one is selected. */}
-            {clips.length > 1 && (
-              <div className="flex flex-wrap justify-center gap-1.5">
-                {clips.map((c, i) => {
-                  const ready = !!sections?.[i];
-                  return (
-                    <button key={c.id} onClick={() => setPreviewIdx(i)}
-                      title={ready ? "Ready to preview" : "Still importing this part of the video"}
-                      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all ${i === previewIdx ? "text-white" : "text-muted-foreground bg-secondary/60 hover:text-foreground"}`}
-                      style={i === previewIdx ? { background: "var(--cobalt)" } : {}}>
-                      #{i + 1}
-                      <span aria-hidden="true" className={`w-1.5 h-1.5 rounded-full ${ready ? "" : "animate-pulse"}`}
-                        style={{ background: ready ? "var(--mint)" : "var(--amber)" }} />
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-
-            {hostedStatus === "ready" && hostedUrl ? (
+            {hostedStatus === "ready" && hostedUrl && !waitingForGaming ? (
               /*
                * No `onChange`, so the frame cannot be panned here: the export
                * follows the speaker by itself. The caption IS draggable,
                * because where it sits is part of the look being styled.
                */
               <CropView
+                key={clip?.id}
                 src={hostedUrl}
                 framing={previewFraming}
                 startTime={(clip?.startTime ?? 0) - hostedOffset}
                 endTime={(clip?.endTime ?? 0) - hostedOffset}
                 className="w-full shadow-2xl"
                 style={{ maxWidth: "300px" }}
-                look={{ style: shownClipStyle, backgroundUrl, dual: pair, hasDual: plan.some(seg => seg.dual || seg.split), gaming }}
-                onTime={t => setPreviewTime(Math.max(0, Math.round((t + hostedOffset - (clip?.startTime ?? 0)) * 20) / 20))}
+                look={{ style: shownClipStyle, backgroundUrl, punch: punches.some(([a, b]) => previewTime >= a && previewTime < b),
+                  dual: pair, hasDual: plan.some(seg => seg.dual || seg.split), gaming }}
+                onTime={t => {
+                  if (!clip) return;
+                  const time = Math.max(0, Math.round((t + hostedOffset - clip.startTime) * 20) / 20);
+                  setPreviewPosition(previous => previous?.clipId === clip.id && previous.time === time ? previous : { clipId: clip.id, time });
+                }}
                 onPlayingChange={setPlaying}
               >
                 {captionLayer}
@@ -1479,7 +1498,7 @@ function StepSubtitles({
                   ) : (
                     <>
                       <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-                      <span>Getting clip #{previewIdx + 1} ready{video?.hostProgress ? `… ${video.hostProgress}%` : "…"}</span>
+                      <span>{waitingForGaming ? "Preparing facecam and gameplay…" : `Getting clip #${previewIdx + 1} ready${video?.hostProgress ? `… ${video.hostProgress}%` : "…"}`}</span>
                     </>
                   )}
                 </div>
@@ -1495,11 +1514,13 @@ function StepSubtitles({
 
             <p className="text-xs text-muted-foreground text-center">
               {clip ? <>Clip #{previewIdx + 1} · {fmt(clip.startTime)}–{fmt(clip.endTime)}<br /></> : null}
-              {captionsOn && (timed
-                ? "Press play: the captions follow the speech, exactly as they will be burned in."
-                : caption
-                  ? "This transcript has no word timings, so each line is shown whole."
-                  : "There is no transcript for this clip, so it gets no captions.")}
+              {captionsOn && (!caption && !timed
+                ? "If this clip has speech, captions will be generated at export."
+                : style.captionLanguage
+                  ? "This preview shows the original captions."
+                  : timed
+                    ? "Press play to check the caption timing."
+                    : "This transcript has no word timings, so each line is shown whole.")}
             </p>
 
             {/* Make the import state explicit rather than leaving a bare
@@ -1518,7 +1539,7 @@ function StepSubtitles({
           </div>
         </div>
       </div>
-      <button onClick={() => onNext(style)} className="mt-6 w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm transition-all hover:opacity-90 glow-green" style={{ background: "linear-gradient(135deg, var(--mint), oklch(0.65 0.20 165))", color: "black" }}>
+      <button onClick={onNext} className="mt-6 w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm transition-all hover:opacity-90 glow-green" style={{ background: "linear-gradient(135deg, var(--mint), oklch(0.65 0.20 165))", color: "black" }}>
         <Save className="w-4 h-4" /> Save & Export Clips <ArrowRight className="w-4 h-4" />
       </button>
     </div>
@@ -1579,8 +1600,8 @@ function plainError(err: unknown, fallback: string) {
  * follows the speaker and transcribes as part of the render, so there is
  * nothing to prepare by hand in between.
  */
-function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, reelTitle, videoUrl, captionsOn, renderLog, apiKey, model, titleLanguage }: {
-  clips: Highlight[]; style: SubStyle; videoTitle: string; reelTitle: string;
+function StepExport({ clips, settings, layout, videoId, videoTitle, sourceTitle, reelTitle, videoUrl, defaultCaptionsOn, renderLog, apiKey, model, titleLanguage }: {
+  clips: Highlight[]; settings: Record<number, ClipSettings>; videoTitle: string; reelTitle: string;
   /** The source's own title, for AI hooks that name its people. */
   sourceTitle: string;
   /** Video style chosen in the first step; null uses the AI's pick per clip. */
@@ -1588,7 +1609,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
   videoId: number | null;
   videoUrl: string;
   /** Burn captions into the exports. */
-  captionsOn: boolean;
+  defaultCaptionsOn: boolean;
   /**
    * What each clip was last rendered with, kept by the page so it survives
    * leaving this step. A clip is rendered again only when that has changed.
@@ -1622,7 +1643,11 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
   const [failed, setFailed] = useState<Record<number, string>>({});
 
   /** Everything that changes how a clip looks, to tell when a re-render is due. */
-  const signature = JSON.stringify([captionsOn, captionsOn ? style : null, layout]);
+  const settingsFor = (clip: Highlight) => settings[clip.id] ?? defaultClipSettings(defaultCaptionsOn);
+  const renderSignature = (clip: Highlight) => {
+    const { captionsOn, style, layout: override } = settingsFor(clip);
+    return JSON.stringify([captionsOn, captionsOn ? style : null, clipVideoLayout(clip, override ?? layout)]);
+  };
 
   const renderClip = async (h: Highlight, clipId: number) => {
     setRendering(prev => new Set(prev).add(h.id));
@@ -1630,8 +1655,8 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
     try {
       /* Resolves once this clip's part of the video is on the server and the
        * render is under way; the card then follows the clip's status. */
-      await patiently(() => startRender.mutateAsync({ id: clipId, captionsEnabled: captionsOn }));
-      renderLog.current[clipId] = signature;
+      await patiently(() => startRender.mutateAsync({ id: clipId, captionsEnabled: settingsFor(h).captionsOn }));
+      renderLog.current[clipId] = renderSignature(h);
     } catch (err) {
       const message = plainError(err, "Could not start the render");
       setFailed(prev => ({ ...prev, [h.id]: message }));
@@ -1682,11 +1707,8 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
             .sort((x, y) => shared(y, h) - shared(x, h))[0];
           if (found) taken.add(found.id);
           const moved = !!found && (Math.abs((found.startTime ?? 0) - h.startTime) > 0.05 || Math.abs((found.endTime ?? 0) - h.endTime) > 0.05);
-          // The style chosen in the first step, else the one the AI suggested.
-          /* The AI's "normal" saves no style, so the export may still pick
-           * Facecam + Gameplay by itself when the clip shows a facecam. */
-          const wanted: VideoLayout | null = layout
-            ?? (clipVideoStyle(h, null) !== "normal" ? { style: clipVideoStyle(h, null) } : null);
+          const { captionsOn, style, layout: override } = settingsFor(h);
+          const wanted = clipVideoLayout(h, override ?? layout);
           let id = found?.id;
           if (id == null) {
             ({ id } = await patiently(() => createClip.mutateAsync({
@@ -1700,7 +1722,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
           }
           const saved = (found as { layout?: VideoLayout | null } | undefined)?.layout ?? null;
           const styleChanged = wanted != null && (found
-            ? saved?.style !== wanted.style || (saved?.backgroundVideoId ?? null) !== (wanted.backgroundVideoId ?? null)
+            ? saved?.style !== wanted?.style || (saved?.backgroundVideoId ?? null) !== (wanted?.backgroundVideoId ?? null)
             : wanted.backgroundVideoId != null);
           const clipRow = id;
           await patiently(() => updateClip.mutateAsync({
@@ -1709,11 +1731,15 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
             // Bring a reused clip onto the newly chosen edges and title.
             ...(moved ? { startTime: h.startTime, endTime: h.endTime, title: h.title } : {}),
           }));
-          if (captionsOn) await patiently(() => saveSubtitles.mutateAsync({ clipId: clipRow, style }));
+          const subtitles = captionsOn
+            ? await patiently(() => saveSubtitles.mutateAsync({ clipId: clipRow, style, invalidateRender: true }))
+            : null;
           setClipIds(prev => ({ ...prev, [h.id]: id }));
 
           const status = found?.status;
-          const upToDate = status === "done" && (renderLog.current[id] ?? signature) === signature && !styleChanged && !moved;
+          const signature = renderSignature(h);
+          const upToDate = status === "done" && (renderLog.current[id] ?? signature) === signature
+            && !styleChanged && !moved && !subtitles?.changed && found?.captionsEnabled === captionsOn;
           if (!upToDate && status !== "rendering") enqueue(h, id);
         } catch (err) {
           const message = plainError(err, "Could not save this clip");
@@ -1784,6 +1810,7 @@ function StepExport({ clips, style, layout, videoId, videoTitle, sourceTitle, re
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px] items-start">
       <div className="grid sm:grid-cols-2 gap-4">
         {clips.map(h => {
+          const { style } = settingsFor(h);
           const clipId = clipIds[h.id];
           const result = exportById.get(clipId);
           const isRendering = busy(h);
@@ -1930,7 +1957,7 @@ export default function CreatePage() {
   const [detected, setDetected] = useState<Detected | null>(null);
   const [reelTitle, setReelTitle] = useState("");
   const [titleLanguage, setTitleLanguage] = useState("auto");
-  const [subStyle, setSubStyle] = useState<SubStyle|null>(null);
+  const [clipSettings, setClipSettings] = useState<Record<number, ClipSettings>>({});
   /** What each clip was last rendered with; see StepExport. */
   const renderLog = useRef<Record<number, string>>({});
   // Whether captions get burned into the exported clips.
@@ -1953,7 +1980,7 @@ export default function CreatePage() {
             // Subtitles off at import means nothing to burn in at export either.
             setCaptionsOn(v.subtitlesOn);
             // A new video: its highlights are looked for afresh.
-            setDetected(null); setSelectedClips([]);
+            setDetected(null); setSelectedClips([]); setClipSettings({});
             setStep(2);
           }} />
         )}
@@ -1964,7 +1991,7 @@ export default function CreatePage() {
             transcriptWords={transcriptWords}
             heatmap={heatmap} chapters={chapters}
             titleLanguage={titleLanguage} onTitleLanguageChange={setTitleLanguage}
-            detected={detected} onDetected={setDetected}
+            detected={detected} onDetected={result => { setDetected(result); setClipSettings({}); }}
             pickedIds={selectedClips.map(c => c.id)}
             onUploadSource={videoUrl ? () => {
               setUploadSource({ title: videoTitle, subtitlesOn: captionsOn });
@@ -1981,13 +2008,16 @@ export default function CreatePage() {
         )}
         {step === 3 && (
           <StepSubtitles clips={selectedClips} videoId={videoId} layout={videoLayout}
-            captionsOn={captionsOn} onCaptionsChange={setCaptionsOn}
-            onNext={style => { setSubStyle(style); setStep(4); }} />
+            defaultCaptionsOn={captionsOn} settings={clipSettings}
+            onSettingsChange={(id, update) => setClipSettings(previous => ({
+              ...previous, [id]: update(previous[id] ?? defaultClipSettings(captionsOn)),
+            }))}
+            onNext={() => setStep(4)} />
         )}
-        {step === 4 && subStyle && (
-          <StepExport clips={selectedClips} style={subStyle} layout={videoLayout} videoId={videoId}
+        {step === 4 && (
+          <StepExport clips={selectedClips} settings={clipSettings} layout={videoLayout} videoId={videoId}
             videoTitle={videoTitle} sourceTitle={sourceTitle} reelTitle={reelTitle} videoUrl={videoUrl}
-            captionsOn={captionsOn} renderLog={renderLog}
+            defaultCaptionsOn={captionsOn} renderLog={renderLog}
             apiKey={apiKey} model={model} titleLanguage={titleLanguage} />
         )}
       </div>

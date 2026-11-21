@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { detectTextLanguage } from "./highlights.mjs";
 
 const CHUNK_SECONDS = 300;
 const PARALLEL = 4;
@@ -42,6 +43,7 @@ const LANGUAGE_CODES = new Map(Object.entries({
   arabic: "ar", chinese: "zh", english: "en", french: "fr", german: "de",
   hindi: "hi", japanese: "ja", korean: "ko", portuguese: "pt", spanish: "es",
 }));
+const isDarijaText = text => detectTextLanguage(text).startsWith("Moroccan Darija");
 
 export class GroqTranscriptionError extends Error {
   constructor(status) {
@@ -135,12 +137,18 @@ export async function groqWords({ audioPath, language = "auto", ffmpeg, workDire
     ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024, signal, killSignal: "SIGKILL" });
     const pieces = (await readdir(directory)).filter((name) => name.endsWith(".flac")).sort();
     if (pieces.length === 0) throw new GroqTranscriptionError();
-    const prompt = [darija ? DARIJA_PROMPT : "", ...keywords].filter(Boolean).join(" ").slice(0, 220);
+    const promptFor = (moroccan) => [moroccan ? DARIJA_PROMPT : "", ...keywords].filter(Boolean).join(" ").slice(0, 220);
+    const prompt = promptFor(darija);
     const options = { apiKey, language: code, prompt, signal, model };
     const first = await transcribePiece(path.join(directory, pieces[0]), options);
     if (first.text && !first.words.length) throw new GroqTranscriptionError();
 
     const results = [first];
+    // The provider reports Arabic for Darija. A confident dialect match gives
+    // the remaining chunks the dialect prompt, without forcing Arabic audio
+    // language on a stream that switches between languages.
+    const autoDarija = language === "auto" && isDarijaText(first.text);
+    const nextOptions = autoDarija ? { ...options, prompt: promptFor(true) } : options;
     let done = 1;
     onProgress?.(done / pieces.length);
     const pending = pieces.slice(1).map((name, i) => ({ name, index: i + 1 }));
@@ -148,9 +156,9 @@ export async function groqWords({ audioPath, language = "auto", ffmpeg, workDire
       for (let job = pending.shift(); job; job = pending.shift()) {
         try {
           const file = path.join(directory, job.name);
-          results[job.index] = await transcribePiece(file, options).catch((error) => {
+          results[job.index] = await transcribePiece(file, nextOptions).catch((error) => {
             if (signal?.aborted || error.status < 500) throw error;
-            return transcribePiece(file, options);
+            return transcribePiece(file, nextOptions);
           });
           if (results[job.index].text && !results[job.index].words.length) throw new GroqTranscriptionError();
         } catch (error) {
@@ -177,8 +185,10 @@ export async function groqWords({ audioPath, language = "auto", ffmpeg, workDire
     });
     const detected = results.find(result => result.words.length && typeof result.language === "string")?.language?.toLowerCase();
     const detectedLanguage = LANGUAGE_CODES.get(detected) ?? (/^[a-z]{2,3}$/.test(detected ?? "") ? detected : undefined);
+    const text = texts.join(" ").trim();
+    const resolvedLanguage = darija || autoDarija || (language === "auto" && detectedLanguage === "ar" && isDarijaText(text)) ? "ar-ma" : code || detectedLanguage;
     console.log(`[HostedSTT] Groq transcribed ${pieces.length} piece(s) with ${model}.`);
-    return { text: texts.join(" ").trim(), words, model, language: darija ? "ar-ma" : code || detectedLanguage };
+    return { text, words, model, language: resolvedLanguage };
   } finally {
     await rm(directory, { recursive: true, force: true }).catch(() => {});
   }
